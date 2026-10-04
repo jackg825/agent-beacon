@@ -2,8 +2,9 @@
 
 Validated on **2026-10-05 (Asia/Taipei)** in the fork checkout, based on upstream
 `5937da1cd812660d256c367374b9752316f51cbc`, branch
-`feat/cloudflare-backend`. No Cloudflare deployment or real collector
-configuration change was performed. Tests use only synthetic event content and
+`feat/cloudflare-backend`. The reviewed change is merged and the isolated TEST
+deployment/remote evidence is recorded in [TEST-DEPLOYMENT.md](TEST-DEPLOYMENT.md).
+No real collector configuration change was performed. Tests use only synthetic event content and
 temporary private storage; generated logs, databases, binaries and screenshots
 remain ignored and outside the staged source.
 
@@ -65,15 +66,16 @@ Set `BEACON_PLAYWRIGHT_MODULE` to its module path and, when needed,
 real Worker-backed helper or `npm run test:browser` for fixture interaction
 coverage. The normal Node suite deliberately does not require browser downloads.
 The CI workflow runs only local tests/dry run and the isolated shipping-hook
-acceptance; it contains no deployment credentials or deployment step. CI has
-not run remotely because this branch has not been pushed.
+acceptance; it contains no deployment credentials or deployment step. Both new
+backend runs and all 18 upstream CI jobs passed remotely before merge; links are
+in [TEST-DEPLOYMENT.md](TEST-DEPLOYMENT.md).
 
 ## Boundaries and remaining work
 
-- **Cloudflare production:** no D1/R2 resources, Worker release, remote persistence
-  redeploy, latency/load/CPU-budget tests, billing/quota decision, backup restore
-  or cloud rollback was performed. Local runtime reconstruction proves local
-  storage persistence, not a deployed-cloud acceptance.
+- **Cloudflare production:** isolated TEST D1/R2 and Worker deployment, real
+  remote acceptance and redeploy persistence passed. No production rollout,
+  latency/load/CPU-budget or quota tests, backup restore or cloud rollback ran.
+  The test retained the existing account plan and subscriptions.
 - **Real Macs:** no MBP/Mac mini telemetry, launchd job, sleep/wake/network-loss
   run, installed collector setting or full OTLP Collector execution was tested.
   The compiled shipping hook consumed synthetic Claude-shaped envelopes; no

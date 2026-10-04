@@ -6,6 +6,8 @@ deployment on 2026-10-05. Use `agent-beacon-cloud-test`,
 The production examples below are a future runbook and require separate approval.
 Use the existing account plan; do not change shared resources or subscriptions.
 Cloud resource usage follows the account's billing and quotas.
+The completed TEST rollout and cloud verification are in
+[TEST-DEPLOYMENT.md](TEST-DEPLOYMENT.md).
 
 ## Isolate the resources first
 

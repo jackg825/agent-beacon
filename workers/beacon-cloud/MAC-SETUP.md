@@ -4,6 +4,25 @@
 forwarder，把新活動送到同一個獨立 Worker；中央服務使用 Cloudflare D1／R2，
 不需要 Mac mini 後端、VPS 或 Cloudflare Tunnel。
 
+已部署的獨立測試網址與驗收結果見 [TEST-DEPLOYMENT.md](TEST-DEPLOYMENT.md)。
+
+## 新 Mac 尚未安裝 collector 時
+
+已有 collector 的 Mac 只先確認狀態，不需要重新安裝。若 `beacon` 不在 PATH，
+先確認既有安裝位置；確定尚未安裝才依上游 macOS 指南安裝 CLI：
+
+```sh
+brew trust asymptote-labs/tap
+brew tap asymptote-labs/tap
+brew install beacon
+env BEACON_ONBOARDING=0 BEACON_MANAGED_INGEST=0 beacon endpoint install --user --dry-run
+```
+
+最後一行依本 fork 的 CLI 介面預覽本機設定／服務改動。確認範圍後才移除
+`--dry-run` 執行安裝；保留兩個環境設定，且不要加 `--connect`。一般互動安裝
+預選官方 Beacon Cloud，使用本框架應採用本機收集模式，再由下述 forwarder
+連接自建 Worker。這些是待操作指南，本次未執行安裝或更改任何 agent 設定。
+
 ## 每台 Mac 各準備一份私有設定
 
 先用 `beacon endpoint status` 確認原有 collector 正常。這份說明不會更動 collector

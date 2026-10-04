@@ -1,9 +1,66 @@
-# Cloudflare predeployment inventory
+# Cloudflare isolation inventory
+
+## Authorized isolated test deployment — 2026-10-05
+
+Fresh authenticated GET-only snapshots were taken before deployment and after
+the same-source redeployment. Private snapshots and the detailed comparison are
+in ignored `.local/` files with mode 0600 beneath a 0700 directory; they contain
+no authentication token. Local credential retrieval disabled Wrangler debug
+logs and metrics. This inventory did not mutate any Cloudflare resource.
+
+The only new registry entries were the authorized test resources:
+
+| Purpose | New isolated name | Worker binding |
+| --- | --- | --- |
+| Worker | `agent-beacon-cloud-test` | N/A |
+| D1 database | `agent-beacon-cloud-test-db` | `DB` |
+| R2 bucket | `agent-beacon-cloud-test-raw` | `RAW` |
+
+| Account-1 resource | Before → after | Comparison |
+| --- | --- | --- |
+| Worker scripts/services | 21 → 22 | Only the test Worker was added |
+| D1 databases | 8 → 9 | Existing metadata unchanged; only the test database was added |
+| R2 buckets | 15 → 16 | Existing metadata unchanged; only the test bucket was added |
+| KV namespaces | 9 → 9 | Unchanged |
+| DNS zones | 7 → 7 | Zone metadata unchanged |
+| Worker routes | 1 → 1 | Existing wildcard route unchanged across all 7 zones |
+| Worker custom domains | 8 → 8 | Unchanged; no domain attached to the test Worker |
+| Visible account-level Access applications | 0 → 0 | API results unchanged |
+| Existing workers.dev subdomain | Available → available | Unchanged; private value omitted |
+| DNS records | HTTP 403 in all 7 zones → HTTP 403 | Contents remain **unverified** |
+
+All 21 existing Workers had complete version and deployment histories captured
+and compared. **Twenty were unchanged. One existing Worker had an earlier
+dashboard-origin change**, with one added version/deployment and changed
+script/service modification metadata. That version was created at
+**01:02:37 Asia/Taipei** and its deployment at **01:02:39**; the API marked the
+source `dash`. The first operation in this project's deployment record was at
+**01:17:12**, about 14 minutes later. These timestamps establish that the observed
+drift preceded this project's cloud writes; the inventory does not identify who
+made the earlier change. No existing Worker was rolled back or modified to erase
+that separate activity. The detailed evidence remains private.
+
+The final test Worker modification was at **01:20:08 Asia/Taipei**. The after
+snapshot at **01:21:34–01:21:39** therefore includes the completed same-source
+redeployment; it recorded three test versions and three test deployments.
+The new R2 bucket's managed public-access API explicitly returned
+**`enabled: false`**, and its custom-domain list was empty. Raw R2 data is not
+publicly exposed through either of those mechanisms.
+
+The comparison verifies resource registries and deployment metadata, not the
+contents of unrelated databases/buckets or inaccessible DNS records. Combined
+with the deployment controller's exact test resource names, selected account,
+and single D1/R2 bindings, the evidence supports isolated test operations.
+Cloud acceptance results are recorded separately in `VALIDATION.md`; this
+inventory does not imply that real MBP/Mac mini collectors were reconfigured.
+
+## Initial read-only inventory — 2026-10-04
 
 Checked on **2026-10-04 (Asia/Taipei)** using the locally authenticated Wrangler
 OAuth session. This was a **read-only inventory**; no Cloudflare resource,
 configuration, DNS record, route, credential, or local collector configuration
-was created or changed. No production deployment has been authorized.
+was created or changed. At this initial check, Cloudflare deployment had not
+yet been authorized. The later authorized test deployment is recorded above.
 
 Account names, account/resource IDs, user emails, existing domain names, tokens,
 and unrelated project names are deliberately excluded from this public file.

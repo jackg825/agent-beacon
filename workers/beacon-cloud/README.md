@@ -6,9 +6,10 @@ local Beacon collectors and each run an explicitly configured JSONL forwarder.
 There is no central Mac/VPS process or Cloudflare Tunnel. This package requires
 no changes to upstream collectors, adapters, local dashboard or local MCP.
 
-**Review state:** independently reviewed and verified locally with workerd and
-synthetic data. The first authorized cloud rollout uses isolated **TEST** resources;
-production rollout and real collector configuration remain separate. Start with
+**Review state:** merged into this fork and deployed to isolated **TEST** Workers,
+D1 and R2. Real cloud synthetic acceptance and redeployment persistence pass;
+see [TEST-DEPLOYMENT.md](TEST-DEPLOYMENT.md). Production rollout and real collector
+configuration remain separate. Start with
 [VALIDATION.md](VALIDATION.md), [WIRE-CONTRACT.md](WIRE-CONTRACT.md) and
 [DEPLOYMENT.md](DEPLOYMENT.md). For two-Mac setup, see [MAC-SETUP.md](MAC-SETUP.md).
 
