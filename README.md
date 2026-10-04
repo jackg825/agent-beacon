@@ -360,6 +360,12 @@ You can also forward the same normalized session history into infrastructure you
 | AWS S3 | Object storage | Vector, CI upload, or cloud-agent snapshots |
 | Google Cloud Storage | Object storage | Vector, CI upload, or cloud-agent snapshots |
 
+This fork also includes an opt-in [Cloudflare Workers backend](workers/beacon-cloud/README.md)
+with D1/R2 storage, a protected cross-device dashboard and read-only remote MCP.
+It is a separate package and forwarder; the local collector and upstream Beacon
+Cloud enrollment remain unchanged. See its validation and deployment notes for
+the verified local behavior and remaining production checks.
+
 ---
 
 ## Architecture
