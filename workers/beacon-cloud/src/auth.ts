@@ -1,6 +1,6 @@
 import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { Device, Env, HttpError } from './types';
-import { mcpAuthorized, mcpOAuthEnabled } from './mcp-auth';
+import { mcpAuthorizationResult, mcpOAuthEnabled } from './mcp-auth';
 
 export async function digest(value: string | Uint8Array): Promise<string> {
   const bytes = typeof value === 'string' ? new TextEncoder().encode(value) : value;
@@ -42,7 +42,10 @@ export async function verifyAccess(token: string, team: string, audience: string
 export async function readAuth(request: Request, env: Env, mcp = false): Promise<void> {
   if (mcp) {
     if (mcpOAuthEnabled(env)) {
-      if (await mcpAuthorized(request,env)) return;
+      const result = await mcpAuthorizationResult(request,env);
+      if (result === 'authorized') return;
+      if (result === 'insufficient_scope') throw new HttpError(403,'Insufficient MCP scope','insufficient_scope');
+      throw new HttpError(401,'Invalid MCP token','invalid_token');
     } else if (await equalSecret(bearer(request), env.MCP_TOKEN)) return;
   } else {
     const assertion = request.headers.get('Cf-Access-Jwt-Assertion');

@@ -13,7 +13,8 @@ export interface Env {
 export type RecordData = Record<string, unknown>;
 export interface Device { id: string; name: string; token_hash: string; revoked: number }
 export class HttpError extends Error {
-  constructor(public status: number, message: string) { super(message); }
+  constructor(public status: number, message: string,
+    public authError?: 'invalid_token' | 'insufficient_scope') { super(message); }
 }
 export function json(data: unknown, status = 200): Response {
   return Response.json(data, { status });

@@ -51,7 +51,8 @@ node forwarder/forwarder.mjs /ABSOLUTE/PRIVATE/PATH/config.json
 ```
 
 `--once` reads currently available complete lines, queues them and attempts to
-drain the outbox. The long-running form repeats and retries with capped
+drain the outbox after validating the device's authenticated health response.
+The long-running form repeats and retries with capped
 exponential delay during failures. SIGINT/SIGTERM allow it to finish the current
 pass, then release the lock. Installation as a launchd/systemd service is not
 performed or verified by this implementation.
@@ -74,8 +75,35 @@ Each immutable queue file is written, synced and atomically renamed before
 its source offset is checkpointed. Checkpoints are atomically replaced and
 synced. A crash between these operations may re-read an event; server duplicate
 protection by device, stream and `event.id` prevents duplicate indexed events.
-A successful response is acknowledged by deleting and syncing the queue file.
+Before reading sources for the first time, authenticated `/v1/ingest/health`
+must return the device ID. The checkpoint is bound to that ID and the Worker
+origin before any outbox or source-offset changes. A fresh first start while
+offline defers reading and initialization; with runtime `readFrom: "end"`, the
+connection boundary is its first successful authentication. An already bound
+state directory can continue queueing locally while health is unreachable,
+but cannot send until the current credential is verified as the same device.
+Rotating a token for the same device preserves its checkpoints and queue.
+
+A successful HTTP status alone is insufficient. The shipper validates a bounded
+JSON acknowledgement's `accepted` count and content-addressed `batch_id`, then
+deletes and syncs the queue file. HTML login pages, malformed or oversized JSON,
+wrong batch IDs/counts, and uncertain responses leave the batch on disk.
 An uncertain acknowledgement resends the identical batch.
+
+Changing the Worker origin or authenticated device ID under an existing
+`stateDir` fails with `ENDPOINT_NAMESPACE_MISMATCH` or `DEVICE_NAMESPACE_MISMATCH`
+before sending. Keep a separate state directory for each destination/device;
+do not redirect another device's pending outbox by changing its config/token.
+Before intentionally moving destinations, drain the original outbox into its
+original destination and provision a new state directory for the new one.
+
+Older checkpoints from the initial, unbound implementation fail with
+`UNBOUND_EXISTING_STATE`, even when their outbox is empty. Do not delete or edit
+their checkpoint/outbox to make startup succeed: there is no automatic migration
+because they cannot prove which destination/device owns retained data. Preserve
+the old directory for explicit recovery; start a new reviewed configuration with
+a new private `stateDir`. Historical replays require an intentional
+`readFrom: "beginning"` choice and cannot recover files already rotated away.
 
 Physical device/inode identity follows rename rotation. Stored file prefixes
 and offsets detect ordinary copytruncate and reused inodes; the new generation
@@ -154,7 +182,7 @@ go -C ../../cli/beacon-hooks test ./...
 go -C ../../collector-builder/exporter/beaconjsonexporter test ./...
 ```
 
-The synthetic shipper suite passed 21 tests; the compiled hook/workerd acceptance
+The synthetic shipper suite passed 27 tests; the compiled hook/workerd acceptance
 passed 1 test. Go's module suites passed all packages that contain tests.
 
 No paid sandbox run, live deployment, real Mac collector/service installation,

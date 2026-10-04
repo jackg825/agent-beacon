@@ -47,8 +47,8 @@ export default {
       // Logs and responses never contain request bodies, token values, or D1 error SQL.
       const known=error instanceof HttpError;
       response=json({error:known?error.message:'Service unavailable; retry with the same batch'},known?error.status:503);
-      if (known && error.status===401) response.headers.set('WWW-Authenticate',
-        new URL(request.url).pathname==='/mcp' ? mcpChallenge(env) : 'Basic realm="Agent Beacon", charset="UTF-8"');
+      if (known && (error.status===401 || error.authError==='insufficient_scope')) response.headers.set('WWW-Authenticate',
+        new URL(request.url).pathname==='/mcp' ? mcpChallenge(env,error.authError) : 'Basic realm="Agent Beacon", charset="UTF-8"');
       if (!known) response.headers.set('Retry-After','5');
     }
     const headers=new Headers(response.headers);

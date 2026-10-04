@@ -2,6 +2,7 @@ import { createRemoteJWKSet, jwtVerify, type JWTVerifyGetKey } from 'jose';
 import type { Env } from './types';
 
 const requiredScope = 'beacon:read';
+export type McpAuthorizationResult = 'authorized' | 'invalid_token' | 'insufficient_scope';
 interface OAuthConfig { issuer: string; jwksUrl: string; resource: string; metadataUrl: string }
 let remoteKeys: { url: string; resolver: JWTVerifyGetKey } | undefined;
 
@@ -44,35 +45,43 @@ function resolverFor(url: string): JWTVerifyGetKey {
 }
 
 /** Injection supplies signing keys, never a bypass of signature or claim validation. */
-export function createMcpAuthorization(keyResolver?: JWTVerifyGetKey) {
-  return async (request: Request, env: Env): Promise<boolean> => {
+export function createMcpAuthorizationResult(keyResolver?: JWTVerifyGetKey) {
+  return async (request: Request, env: Env): Promise<McpAuthorizationResult> => {
     const settings = config(env);
-    if (!settings) return false;
+    if (!settings) return 'invalid_token';
     const header = request.headers.get('Authorization');
-    if (!header || header.length > 16 * 1024) return false;
+    if (!header || header.length > 16 * 1024) return 'invalid_token';
     const match = /^Bearer ([A-Za-z0-9._~-]+)$/i.exec(header);
-    if (!match) return false;
+    if (!match) return 'invalid_token';
     try {
       const { payload } = await jwtVerify(match[1], keyResolver || resolverFor(settings.jwksUrl), {
         algorithms: ['RS256', 'ES256'], issuer: settings.issuer, audience: settings.resource,
         requiredClaims: ['exp', 'iat', 'sub'],
       });
       const now = Math.floor(Date.now() / 1000);
-      if (typeof payload.sub !== 'string' || !payload.sub.trim() || payload.sub.length > 512) return false;
-      if (typeof payload.iat !== 'number' || !Number.isInteger(payload.iat) || payload.iat < 0 || payload.iat > now) return false;
-      if (typeof payload.exp !== 'number' || !Number.isInteger(payload.exp) || payload.exp <= payload.iat) return false;
+      if (typeof payload.sub !== 'string' || !payload.sub.trim() || payload.sub.length > 512) return 'invalid_token';
+      if (typeof payload.iat !== 'number' || !Number.isInteger(payload.iat) || payload.iat < 0 || payload.iat > now) return 'invalid_token';
+      if (typeof payload.exp !== 'number' || !Number.isInteger(payload.exp) || payload.exp <= payload.iat) return 'invalid_token';
       // This resource never accepts tokens also issued for a different audience.
       const audiences = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
-      if (audiences.length !== 1 || audiences[0] !== settings.resource) return false;
-      if (typeof payload.scope !== 'string' || !payload.scope.split(' ').includes(requiredScope)) return false;
-      return true;
+      if (audiences.length !== 1 || audiences[0] !== settings.resource) return 'invalid_token';
+      // Only a fully valid resource token can produce a scope challenge. Invalid
+      // signatures, audiences and claims remain authentication failures (401).
+      if (typeof payload.scope !== 'string' || !payload.scope.split(' ').includes(requiredScope)) return 'insufficient_scope';
+      return 'authorized';
     } catch {
       // Invalid signatures, expired tokens, misconfiguration, and unavailable JWKS fail closed.
-      return false;
+      return 'invalid_token';
     }
   };
 }
 
+export function createMcpAuthorization(keyResolver?: JWTVerifyGetKey) {
+  const authorize = createMcpAuthorizationResult(keyResolver);
+  return async (request: Request, env: Env): Promise<boolean> => (await authorize(request, env)) === 'authorized';
+}
+
+export const mcpAuthorizationResult = createMcpAuthorizationResult();
 export const mcpAuthorized = createMcpAuthorization();
 
 /** Metadata only advertises an explicitly configured, valid external authorization server. */
@@ -85,9 +94,10 @@ export function mcpMetadata(env: Env): Response {
   }, { headers: { 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*' } });
 }
 
-export function mcpChallenge(env: Env): string {
+export function mcpChallenge(env: Env, error?: 'invalid_token' | 'insufficient_scope'): string {
   const settings = config(env);
+  const errorParameter = error ? 'error="' + error + '", ' : '';
   return settings
-    ? 'Bearer resource_metadata="' + settings.metadataUrl + '", scope="' + requiredScope + '"'
-    : 'Bearer realm="beacon-mcp"';
+    ? 'Bearer ' + errorParameter + 'resource_metadata="' + settings.metadataUrl + '", scope="' + requiredScope + '"'
+    : 'Bearer ' + errorParameter + 'realm="beacon-mcp"';
 }

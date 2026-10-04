@@ -6,11 +6,11 @@ local Beacon collectors and each run an explicitly configured JSONL forwarder.
 There is no central Mac/VPS process or Cloudflare Tunnel. This package requires
 no changes to upstream collectors, adapters, local dashboard or local MCP.
 
-**Review state:** implemented and verified locally with workerd and synthetic
-data. No production Cloudflare resource has been created or deployed, and no
-real collector configuration has been changed. Start with
+**Review state:** independently reviewed and verified locally with workerd and
+synthetic data. The first authorized cloud rollout uses isolated **TEST** resources;
+production rollout and real collector configuration remain separate. Start with
 [VALIDATION.md](VALIDATION.md), [WIRE-CONTRACT.md](WIRE-CONTRACT.md) and
-[DEPLOYMENT.md](DEPLOYMENT.md).
+[DEPLOYMENT.md](DEPLOYMENT.md). For two-Mac setup, see [MAC-SETUP.md](MAC-SETUP.md).
 
 ## What is implemented
 
@@ -24,7 +24,7 @@ real collector configuration has been changed. Start with
 | Projects | SSH/HTTPS Git remote normalization, `.git` suffix and default ports; path-only records use explicit mappings or a device-local namespace |
 | Dashboard | Protected session list, device/project/harness filters and paginated event timeline; raw content only enters DOM text nodes |
 | Remote MCP | Official TypeScript SDK, current per-request protocol and legacy Streamable HTTP; four read-only tools |
-| Local forwarding | Private durable outbox/checkpoint, bounded retry, numbered rotation, partial lines, explicit start point and queue cap |
+| Local forwarding | Private durable outbox/checkpoint bound to authenticated Worker/device, exact batch acknowledgement, bounded retry/rotation, explicit start point and queue cap |
 
 No account OAuth/device-enrollment APIs from proprietary Beacon Cloud are
 emulated. `beacon endpoint connect --dashboard-url` is therefore not a setup

@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
+import { createServer } from 'node:http';
 import { Forwarder, runOnce, loadConfig, prepareEvent } from './forwarder.mjs';
 
 // All telemetry, paths and credentials below are synthetic and local to t's directory.
@@ -14,6 +16,14 @@ function event(id, extra = {}) {
 }
 
 const jsonl = (events) => events.map((value) => `${JSON.stringify(value)}\n`).join('');
+const hash = value => createHash('sha256').update(value).digest('hex');
+const responseJSON = value => new Response(JSON.stringify(value), { status: 200, headers: { 'Content-Type': 'application/json' } });
+const healthResponse = (device = 'synthetic-device') => responseJSON({ status: 'ok', device_id: device });
+const withHealth = (handler, device = 'synthetic-device') => async (url, options) => url.endsWith('/health') ? healthResponse(device) : handler(url, options);
+const acknowledgement = (url, options, device = 'synthetic-device') => responseJSON({
+  batch_id: hash(JSON.stringify([device, url.endsWith('/inventory') ? 'inventory' : 'runtime', hash(options.body)])),
+  accepted: options.body.trim().split('\n').length, inserted: options.body.trim().split('\n').length, duplicate: false,
+});
 
 async function fixture(t, override = {}) {
   const root = await fs.mkdtemp(join(tmpdir(), 'beacon-forwarder-test-'));
@@ -26,7 +36,7 @@ async function fixture(t, override = {}) {
     stateDir: join(root, 'state'), tokenFile,
     streams: { runtime: { path: runtime, readFrom: 'beginning' } }, ...override };
   const requests = [];
-  const fetchImpl = async (url, options) => { requests.push({ url, ...options }); return new Response('{}', { status: 200 }); };
+  const fetchImpl = withHealth(async (url, options) => { requests.push({ url, ...options }); return acknowledgement(url, options); });
   return { root, runtime, inventory, tokenFile, config, requests, fetchImpl };
 }
 
@@ -48,7 +58,7 @@ test('ships unchanged upstream schema with token auth; preserves nested event.id
 test('connection outage persists outbox and retries after process restart without rereading source', async (t) => {
   const f = await fixture(t);
   await fs.writeFile(f.runtime, jsonl([event('offline-event')]));
-  let result = await runOnce(f.config, { fetchImpl: async () => { throw new Error('do not log secrets'); } });
+  let result = await runOnce(f.config, { fetchImpl: withHealth(async () => { throw new Error('do not log secrets'); }) });
   assert.equal(result.blocked, 'NETWORK_UNAVAILABLE');
   assert.equal(result.pendingBatches, 1);
   const queueName = (await fs.readdir(join(f.config.stateDir, 'outbox')))[0];
@@ -66,7 +76,7 @@ test('uncertain acknowledgement resends the exact same event identity and body',
   const f = await fixture(t);
   await fs.writeFile(f.runtime, jsonl([event('retry-event')]));
   let acceptedBody;
-  await runOnce(f.config, { fetchImpl: async (_url, request) => { acceptedBody = request.body; throw new Error('socket closed after commit'); } });
+  await runOnce(f.config, { fetchImpl: withHealth(async (_url, request) => { acceptedBody = request.body; throw new Error('socket closed after commit'); }) });
   await runOnce(f.config, { fetchImpl: f.fetchImpl });
   assert.equal(f.requests[0].body, acceptedBody);
 });
@@ -74,7 +84,7 @@ test('uncertain acknowledgement resends the exact same event identity and body',
 test('checkpoint crash recovery reuses existing durable batch and never advances without a queue', async (t) => {
   const f = await fixture(t);
   await fs.writeFile(f.runtime, jsonl([event('crash-event')]));
-  await runOnce(f.config, { fetchImpl: async () => { throw new Error('offline'); } });
+  await runOnce(f.config, { fetchImpl: withHealth(async () => { throw new Error('offline'); }) });
   const statePath = join(f.config.stateDir, 'checkpoint.json');
   const state = JSON.parse(await fs.readFile(statePath, 'utf8'));
   Object.values(state.streams.runtime.files)[0].offset = 0;
@@ -221,7 +231,7 @@ test('HTTP authentication/validation/server failures keep queued events and reda
   for (const status of [401, 403, 413, 422, 429, 503]) {
     const f = await fixture(t);
     await fs.writeFile(f.runtime, jsonl([event(`failed-${status}`)]));
-    const result = await runOnce(f.config, { fetchImpl: async () => new Response('private server body', { status }) });
+    const result = await runOnce(f.config, { fetchImpl: withHealth(async () => new Response('private server body', { status })) });
     assert.equal(result.blocked, `HTTP_${status}`);
     assert.equal(result.pendingBatches, 1);
     assert.equal(JSON.stringify(result).includes('private'), false);
@@ -268,4 +278,109 @@ test('config path is accepted for the local producer to workerd e2e harness', as
   await fs.writeFile(configPath, JSON.stringify(f.config));
   await fs.writeFile(f.runtime, jsonl([event('from-config-path')]));
   assert.equal((await runOnce(configPath, { fetchImpl: f.fetchImpl })).sent, 1);
+});
+
+test('successful HTTP without a bounded exact Worker acknowledgement never deletes queued telemetry', async (t) => {
+  const f = await fixture(t);
+  await fs.writeFile(f.runtime, jsonl([event('ack-checked')]));
+  const invalid = [
+    () => new Response('<html>login page</html>', { status: 200 }),
+    () => responseJSON({}),
+    () => responseJSON({ batch_id: 'wrong-batch', accepted: 1 }),
+    (url, options) => {
+      const expected = hash(JSON.stringify(['synthetic-device', 'runtime', hash(options.body)]));
+      return responseJSON({ batch_id: expected, accepted: 0 });
+    },
+    () => responseJSON({ body: 'x'.repeat(6000) }),
+  ];
+  for (const handler of invalid) {
+    const result = await runOnce(f.config, { fetchImpl: withHealth(handler) });
+    assert.equal(result.sent, 0);
+    assert.equal(result.blocked, 'INVALID_INGEST_ACK');
+    assert.equal(result.pendingBatches, 1);
+  }
+  assert.equal((await runOnce(f.config, { fetchImpl: f.fetchImpl })).sent, 1);
+});
+
+test('fresh offline startup defers sources until authenticated destination binding is durable', async (t) => {
+  const f = await fixture(t);
+  await fs.writeFile(f.runtime, jsonl([event('fresh-offline')]));
+  const failed = await runOnce(f.config, { fetchImpl: async () => { throw new Error('offline'); } });
+  assert.deepEqual(failed, { queued: 0, full: false, sent: 0, blocked: 'NETWORK_UNAVAILABLE', pendingBatches: 0 });
+  await assert.rejects(fs.access(join(f.config.stateDir, 'checkpoint.json')), { code: 'ENOENT' });
+  assert.equal((await runOnce(f.config, { fetchImpl: f.fetchImpl })).sent, 1);
+  const state = JSON.parse(await fs.readFile(join(f.config.stateDir, 'checkpoint.json'), 'utf8'));
+  assert.deepEqual(state.destination, { endpoint: f.config.endpoint, deviceId: 'synthetic-device' });
+});
+
+test('bound offline startup queues locally and verifies same-device token rotation before later drain', async (t) => {
+  const f = await fixture(t);
+  await fs.writeFile(f.runtime, jsonl([event('before-offline')]));
+  await runOnce(f.config, { fetchImpl: f.fetchImpl });
+  await fs.appendFile(f.runtime, jsonl([event('while-offline')]));
+  await fs.writeFile(f.tokenFile, 'synthetic-new-same-device-token');
+  const offline = await runOnce(f.config, { fetchImpl: async () => { throw new Error('health unreachable'); } });
+  assert.deepEqual(offline, { queued: 1, full: false, sent: 0, blocked: 'NETWORK_UNAVAILABLE', pendingBatches: 1 });
+  assert.equal(f.requests.length, 1);
+  const resumed = await runOnce(f.config, { fetchImpl: f.fetchImpl });
+  assert.equal(resumed.sent, 1);
+  assert.equal(f.requests[1].headers.Authorization, 'Bearer synthetic-new-same-device-token');
+});
+
+test('endpoint and device namespace changes reject before sending or advancing bound source checkpoints', async (t) => {
+  const f = await fixture(t);
+  await fs.writeFile(f.runtime, jsonl([event('private-original-destination')]));
+  await runOnce(f.config, { fetchImpl: withHealth(async () => { throw new Error('upload uncertain'); }) });
+  const checkpointPath = join(f.config.stateDir, 'checkpoint.json');
+  const prior = await fs.readFile(checkpointPath, 'utf8');
+  let calls = 0;
+  await assert.rejects(runOnce({ ...f.config, endpoint: 'http://localhost:9999' }, { fetchImpl: async () => { calls++; return healthResponse(); } }),
+    { message: 'ENDPOINT_NAMESPACE_MISMATCH' });
+  assert.equal(calls, 0);
+  await fs.appendFile(f.runtime, jsonl([event('new-source-event')]));
+  await assert.rejects(runOnce(f.config, { fetchImpl: withHealth(async () => { calls++; return responseJSON({}); }, 'different-device') }),
+    { message: 'DEVICE_NAMESPACE_MISMATCH' });
+  assert.equal(calls, 0);
+  assert.equal(await fs.readFile(checkpointPath, 'utf8'), prior);
+  assert.equal((await fs.readdir(join(f.config.stateDir, 'outbox'))).length, 1);
+});
+
+test('legacy unbound source checkpoints fail closed instead of adopting a destination', async (t) => {
+  for (const keepOutbox of [true, false]) {
+    const f = await fixture(t);
+    await fs.writeFile(f.runtime, jsonl([event('legacy-private-source')]));
+    await runOnce(f.config, { fetchImpl: keepOutbox ? withHealth(async () => { throw new Error('offline'); }) : f.fetchImpl });
+    const checkpointPath = join(f.config.stateDir, 'checkpoint.json');
+    const state = JSON.parse(await fs.readFile(checkpointPath, 'utf8'));
+    delete state.destination;
+    await fs.writeFile(checkpointPath, JSON.stringify(state));
+    let called = false;
+    await assert.rejects(runOnce(f.config, { fetchImpl: async () => { called = true; return healthResponse(); } }), { message: 'UNBOUND_EXISTING_STATE' });
+    assert.equal(called, false);
+    assert.equal((await fs.readdir(join(f.config.stateDir, 'outbox'))).length, keepOutbox ? 1 : 0);
+  }
+});
+
+test('native HTTP redirects never forward the bearer credential to another destination', async (t) => {
+  const f = await fixture(t);
+  await fs.writeFile(f.runtime, jsonl([event('redirect-protected')]));
+  let redirectedCalls = 0;
+  const target = createServer((_request, response) => { redirectedCalls++; response.end('not the Worker'); });
+  await new Promise(done => target.listen(0, '127.0.0.1', done));
+  t.after(() => new Promise(done => target.close(done)));
+  const targetURL = `http://127.0.0.1:${target.address().port}/elsewhere`;
+  const origin = createServer((request, response) => {
+    request.resume();
+    if (request.url === '/v1/ingest/health') {
+      response.writeHead(200, { 'Content-Type': 'application/json' });
+      response.end(JSON.stringify({ status: 'ok', device_id: 'synthetic-device' }));
+    } else { response.writeHead(307, { Location: targetURL }); response.end(); }
+  });
+  await new Promise(done => origin.listen(0, '127.0.0.1', done));
+  t.after(() => new Promise(done => origin.close(done)));
+  f.config.endpoint = `http://127.0.0.1:${origin.address().port}`;
+  const result = await runOnce(f.config);
+  assert.equal(result.blocked, 'NETWORK_UNAVAILABLE');
+  assert.equal(result.pendingBatches, 1);
+  assert.equal(redirectedCalls, 0);
 });

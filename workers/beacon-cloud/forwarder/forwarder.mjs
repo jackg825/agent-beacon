@@ -27,6 +27,25 @@ async function atomicJSON(path, value) {
   await syncDir(dirname(path));
 }
 
+async function boundedJSON(response) {
+  if ((response.headers.get('Content-Type') ?? '').split(';')[0].trim().toLowerCase() !== 'application/json' || !response.body) {
+    await response.body?.cancel(); throw fail('INVALID_SERVER_RESPONSE');
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > 5000) { await reader.cancel(); throw fail('INVALID_SERVER_RESPONSE'); }
+      chunks.push(Buffer.from(value));
+    }
+    return JSON.parse(decoder.decode(Buffer.concat(chunks)));
+  } finally { reader.releaseLock(); }
+}
+
 function positive(value, fallback, maximum, name) {
   const number = value ?? fallback;
   if (!Number.isSafeInteger(number) || number < 1 || number > maximum) throw fail(`INVALID_${name}`);
@@ -133,6 +152,14 @@ export class Forwarder {
       try { state = JSON.parse(await fs.readFile(join(config.stateDir, 'checkpoint.json'), 'utf8')); }
       catch (error) { if (error.code !== 'ENOENT') throw fail('INVALID_CHECKPOINT'); state = { version: 1, streams: {} }; }
       if (state.version !== 1 || !isObject(state.streams)) throw fail('INVALID_CHECKPOINT');
+      if (state.destination) {
+        if (!isObject(state.destination) || typeof state.destination.endpoint !== 'string' ||
+          typeof state.destination.deviceId !== 'string' || !state.destination.deviceId || state.destination.deviceId.length > 512) throw fail('INVALID_CHECKPOINT');
+        if (state.destination.endpoint !== config.endpoint) throw fail('ENDPOINT_NAMESPACE_MISMATCH');
+      } else if (Object.keys(state.streams).length || (await fs.readdir(join(config.stateDir, 'outbox'))).some(name => /^[a-f0-9]{64}\.json$/.test(name))) {
+        // Older unbound checkpoints cannot prove where queued private telemetry belongs.
+        throw fail('UNBOUND_EXISTING_STATE');
+      }
       return new Forwarder(config, state, lock, options);
     } catch (error) { await lock.close(); await fs.rm(lockPath, { force: true }); throw error; }
   }
@@ -169,14 +196,40 @@ export class Forwarder {
     return token;
   }
 
-  async drain() {
+  async authenticate() {
+    this.verifiedDeviceId = null;
+    const token = await this.readToken();
+    let response;
+    try {
+      response = await this.fetch(`${this.config.endpoint}/v1/ingest/health`, {
+        method: 'GET', redirect: 'error', headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(this.config.timeoutMs),
+      });
+    } catch { return { blocked: 'NETWORK_UNAVAILABLE' }; }
+    if (!response.ok) { await response.body?.cancel(); return { blocked: `HTTP_${response.status}` }; }
+    let health;
+    try { health = await boundedJSON(response); } catch { return { blocked: 'INVALID_HEALTH_RESPONSE' }; }
+    if (response.status !== 200 || !isObject(health) || health.status !== 'ok' ||
+      typeof health.device_id !== 'string' || !health.device_id || health.device_id.length > 512 || /\s/.test(health.device_id)) {
+      return { blocked: 'INVALID_HEALTH_RESPONSE' };
+    }
+    if (this.state.destination && this.state.destination.deviceId !== health.device_id) throw fail('DEVICE_NAMESPACE_MISMATCH');
+    if (!this.state.destination) {
+      this.state.destination = { endpoint: this.config.endpoint, deviceId: health.device_id };
+      await this.save(); // Bind before observing sources, writing queues, or advancing checkpoints.
+    }
+    this.verifiedDeviceId = health.device_id;
+    return { token, blocked: null };
+  }
+
+  async drain(token) {
+    if (!this.state.destination || this.verifiedDeviceId !== this.state.destination.deviceId || !token) throw fail('DEVICE_IDENTITY_NOT_VERIFIED');
     let sent = 0;
     const files = await this.queueFiles();
     if (!files.length) return { sent, blocked: null };
-    const token = await this.readToken();
     for (const name of files) {
       const record = JSON.parse(await fs.readFile(join(this.outbox, name), 'utf8'));
-      if (record.version !== 1 || !['runtime', 'inventory'].includes(record.stream) || typeof record.body !== 'string' || hash(record.body) !== record.digest) throw fail('CORRUPT_OUTBOX');
+      if (record.version !== 1 || !['runtime', 'inventory'].includes(record.stream) || typeof record.body !== 'string' ||
+        !Number.isSafeInteger(record.eventCount) || record.eventCount < 1 || record.eventCount > 100 || hash(record.body) !== record.digest) throw fail('CORRUPT_OUTBOX');
       let response;
       try {
         response = await this.fetch(`${this.config.endpoint}/v1/ingest/${record.stream}`, {
@@ -189,7 +242,13 @@ export class Forwarder {
         await response.body?.cancel();
         return { sent, blocked: `HTTP_${response.status}` };
       }
-      await response.body?.cancel();
+      let acknowledgement;
+      try { acknowledgement = await boundedJSON(response); } catch { return { sent, blocked: 'INVALID_INGEST_ACK' }; }
+      const expectedBatchId = hash(JSON.stringify([this.state.destination.deviceId, record.stream, record.digest]));
+      if (response.status !== 200 || !isObject(acknowledgement) || acknowledgement.batch_id !== expectedBatchId ||
+        !Number.isSafeInteger(acknowledgement.accepted) || acknowledgement.accepted !== record.eventCount) {
+        return { sent, blocked: 'INVALID_INGEST_ACK' };
+      }
       await fs.rm(join(this.outbox, name));
       await syncDir(this.outbox);
       sent += record.eventCount;
@@ -284,8 +343,12 @@ export class Forwarder {
   }
 
   async runOnce() {
+    const authenticated = await this.authenticate();
+    if (!this.state.destination) return { queued: 0, full: false, sent: 0, blocked: authenticated.blocked, pendingBatches: (await this.queueFiles()).length };
     const scanned = await this.scan();
-    const drained = await this.drain();
+    // A previously bound source may spool offline, but no body leaves disk until
+    // the current token has been verified as the same device at the same origin.
+    const drained = authenticated.blocked ? { sent: 0, blocked: authenticated.blocked } : await this.drain(authenticated.token);
     return { ...scanned, ...drained, pendingBatches: (await this.queueFiles()).length };
   }
 }

@@ -1,9 +1,11 @@
 # Deployment and recovery preparation
 
-**No deployment is authorized or performed.** The commands below are an operator
-runbook for a later approved deployment, not commands executed in this change.
-Only local validation/dry-run and the read-only [inventory](INVENTORY.md) ran.
-Cloud usage can incur charges; choose a plan and quotas before approving rollout.
+**Rollout scope:** the owner authorized review, merge and an isolated **TEST**
+deployment on 2026-10-05. Use `agent-beacon-cloud-test`,
+`agent-beacon-cloud-test-db` and `agent-beacon-cloud-test-raw` for that rollout.
+The production examples below are a future runbook and require separate approval.
+Use the existing account plan; do not change shared resources or subscriptions.
+Cloud resource usage follows the account's billing and quotas.
 
 ## Isolate the resources first
 
@@ -116,7 +118,26 @@ cannot select another namespace, exact/regrouped retries count once, same native
 session on two devices stays separate, equivalent remotes share a project, and
 dashboard/MCP return the same stored evidence. Restart the forwarder and redeploy
 the Worker, then requery the same sessions and R2 payloads. Verify provider login
-separately if enabling Access/OAuth. These remote checks have **not** run.
+separately if enabling Access/OAuth.
+
+The opt-in remote acceptance script targets only the exact
+`agent-beacon-cloud-test.<subdomain>.workers.dev` hostname. It reads a private
+0600 JSON credential file containing distinct `READ_TOKEN`, `MCP_TOKEN` and
+`devices.mbp` / `devices.mini` pairs of `id` and `token`. Use synthetic devices,
+never installed collector logs. Keep the file, generated state and results in
+ignored private `.local/` storage. It invokes unchanged shipping hooks in an
+isolated temporary home and sanitizes generated host/path fields before upload.
+
+```sh
+npm run test:remote -- --endpoint https://agent-beacon-cloud-test.REPLACE_WITH_SUBDOMAIN.workers.dev
+# Redeploy the same Worker with the same D1/R2 bindings, then read the same evidence:
+npm run test:remote -- --endpoint https://agent-beacon-cloud-test.REPLACE_WITH_SUBDOMAIN.workers.dev --mode verify
+```
+
+The first command persists a private synthetic seed marker; retries reuse the
+same evidence. `verify` does not reseed. Optional Playwright environment variables
+from [VALIDATION.md](VALIDATION.md) enable authenticated direct HTTPS browser
+acceptance. Print only pass labels/counts; do not print credentials or raw responses.
 
 ## Recovery and rollback
 

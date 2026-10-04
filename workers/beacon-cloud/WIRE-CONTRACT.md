@@ -51,6 +51,20 @@ supports bounded gzip requests. A non-2xx response or uncertain network outcome
 leaves the exact batch in the outbox for retry. A successful response means the
 Worker acknowledged ingestion; a subsequent retry must be harmless.
 
+The forwarder first verifies authenticated `GET /v1/ingest/health` and binds
+its checkpoints/outbox to the returned device ID and Worker origin. A previously
+bound source can spool locally offline, but cannot upload with an unverified
+replacement credential. A fresh state waits for its first successful health
+check before initialization. Same-device token rotation retains its namespace;
+different-device tokens or different Worker origins fail closed.
+
+Ingest acknowledgement must be a bounded JSON response with the exact event
+count in `accepted` and expected `batch_id`. The batch ID is
+`sha256(JSON.stringify([device_id, stream, sha256(outgoing_utf8_ndjson_bytes)]))`,
+which matches the Worker's stable-JSON hashing of this array of strings.
+Generic HTTP 2xx, HTML, malformed JSON and mismatched acknowledgements never
+clear the outbox. Both health and ingest reject redirects.
+
 The device's authoritative identity comes from its bearer token, never from
 `endpoint.hostname` or payload assertions. The Worker scopes duplicate event
 IDs by authenticated device and stream; it scopes sessions by device, harness,

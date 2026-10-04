@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT } from 'jose';
-import { createMcpAuthorization, mcpChallenge, mcpMetadata, mcpOAuthEnabled } from '../src/mcp-auth';
+import { createMcpAuthorization, createMcpAuthorizationResult, mcpChallenge, mcpMetadata, mcpOAuthEnabled } from '../src/mcp-auth';
 import type { Env } from '../src/types';
 
 const issuer = 'https://auth.synthetic.invalid';
@@ -13,6 +13,7 @@ const ec = await generateKeyPair('ES256');
 const rsaJwk = { ...await exportJWK(rsa.publicKey), kid: 'synthetic-rsa', alg: 'RS256' };
 const ecJwk = { ...await exportJWK(ec.publicKey), kid: 'synthetic-ec', alg: 'ES256' };
 const authorized = createMcpAuthorization(createLocalJWKSet({ keys: [rsaJwk, ecJwk] }));
+const authorizationResult = createMcpAuthorizationResult(createLocalJWKSet({ keys: [rsaJwk, ecJwk] }));
 
 async function token(overrides: Record<string, unknown> = {}, algorithm = 'RS256') {
   const payload = { iss: issuer, aud: resource, sub: 'synthetic-reviewer', iat: now - 1, exp: now + 300, scope: 'beacon:read', ...overrides };
@@ -64,4 +65,24 @@ test('PRM metadata and 401 challenge identify the exact resource and external au
   assert.deepEqual(await response.json(), { resource, authorization_servers: [issuer], scopes_supported: ['beacon:read'], bearer_methods_supported: ['header'] });
   assert.equal(response.headers.get('Access-Control-Allow-Origin'), '*');
   assert.equal(mcpChallenge(env), 'Bearer resource_metadata="https://beacon.synthetic.invalid/.well-known/oauth-protected-resource/mcp", scope="beacon:read"');
+});
+
+test('only valid JWTs with insufficient scope produce the OAuth 403 challenge', async () => {
+  assert.equal(await authorizationResult(request(await token()), env), 'authorized');
+  for (const scope of ['beacon:write', '', undefined]) {
+    assert.equal(await authorizationResult(request(await token({ scope })), env), 'insufficient_scope');
+  }
+  for (const overrides of [
+    { scope: 'beacon:write', exp: now - 1 },
+    { scope: 'beacon:write', iss: 'https://other.synthetic.invalid' },
+    { scope: 'beacon:write', aud: 'https://other.synthetic.invalid/mcp' },
+    { scope: 'beacon:write', iat: now + 60 },
+    { scope: 'beacon:write', sub: '' },
+  ]) {
+    assert.equal(await authorizationResult(request(await token(overrides)), env), 'invalid_token');
+  }
+  const signed = await token({ scope: 'beacon:write' });
+  assert.equal(await authorizationResult(request(signed.slice(0, -8) + 'invalidX'), env), 'invalid_token');
+  assert.equal(await authorizationResult(new Request(resource), env), 'invalid_token');
+  assert.equal(mcpChallenge(env, 'insufficient_scope'), 'Bearer error="insufficient_scope", resource_metadata="https://beacon.synthetic.invalid/.well-known/oauth-protected-resource/mcp", scope="beacon:read"');
 });
