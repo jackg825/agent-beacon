@@ -25,6 +25,20 @@ env BEACON_ONBOARDING=0 BEACON_MANAGED_INGEST=0 beacon endpoint install --user -
 
 ## 每台 Mac 各準備一份私有設定
 
+準備實機試用時，先在有 Cloudflare 管理權限的機器建立兩份裝置金鑰：
+
+```sh
+cd workers/beacon-cloud
+npm run device:prepare -- mbp "MBP"
+npm run device:prepare -- mac-mini "Mac mini"
+# 對各指令顯示的 PREPARED_DIRECTORY 分別執行；SQL 只包含 token digest：
+npx wrangler d1 execute agent-beacon-cloud-test-db --remote --config .local/wrangler.test.jsonc --file PREPARED_DIRECTORY/enroll.sql
+```
+
+將各目錄的 `device-token` 私下交給對應 Mac；Mac mini 只需要自己的上傳金鑰，
+不需要 Cloudflare 管理憑證。這些是實機試用前的待操作步驟，本輪只登錄了合成
+測試裝置；不要把合成測試金鑰用於兩台實機。
+
 先用 `beacon endpoint status` 確認原有 collector 正常。這份說明不會更動 collector
 設定，也不使用 `beacon endpoint connect --dashboard-url ...`；那個指令需要官方
 OAuth／enrollment API，不能用來連接這個 Worker。
