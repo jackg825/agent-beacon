@@ -1,0 +1,26 @@
+{
+  "endpoint": "https://YOUR-ISOLATED-WORKER.YOUR-SUBDOMAIN.workers.dev",
+  "tokenFile": "/ABSOLUTE/PRIVATE/PATH/device-token.txt",
+  "stateDir": "/ABSOLUTE/PRIVATE/PATH/beacon-cloud-forwarder",
+  "streams": {
+    "runtime": {
+      "path": "/ABSOLUTE/PATH/.beacon/endpoint/logs/runtime.jsonl",
+      "readFrom": "end"
+    },
+    "inventory": {
+      "path": "/ABSOLUTE/PATH/.beacon/endpoint/logs/inventory_state.jsonl",
+      "readFrom": "beginning"
+    }
+  },
+  "projectMappings": [
+    {
+      "path": "/ABSOLUTE/PATH/TO/CHECKOUT",
+      "remote": "https://github.com/EXAMPLE-OWNER/EXAMPLE-REPOSITORY.git"
+    }
+  ],
+  "pollIntervalMs": 2000,
+  "maxQueueBytes": 536870912,
+  "maxBatchEvents": 100,
+  "maxBatchBytes": 1048576,
+  "timeoutMs": 30000
+}

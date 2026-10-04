@@ -1,0 +1,35 @@
+name: Beacon Cloudflare backend
+on:
+  pull_request:
+    paths: ['workers/beacon-cloud/**', '.github/workflows/beacon-cloud.yml', '.gitignore']
+  push:
+    branches: [main, feat/cloudflare-backend]
+    paths: ['workers/beacon-cloud/**', '.github/workflows/beacon-cloud.yml', '.gitignore']
+permissions:
+  contents: read
+jobs:
+  local-worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: workers/beacon-cloud
+    env:
+      WRANGLER_SEND_METRICS: 'false'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: workers/beacon-cloud/package-lock.json
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: cli/beacon-hooks/go.mod
+          cache: false
+      - run: npm run test:collector
+      - run: npm run deploy:dry-run
+# Deliberately no deployment job, cloud credentials, paid sandbox, or collector changes.

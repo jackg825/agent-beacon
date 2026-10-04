@@ -8,6 +8,11 @@
 *.swo
 .env
 .env.*
+.dev.vars
+.dev.vars.*
+.wrangler/
+workers/beacon-cloud/.local/
+workers/beacon-cloud/.test-state/
 
 # JavaScript dependencies and build outputs
 node_modules/
