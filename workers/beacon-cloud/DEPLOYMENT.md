@@ -61,7 +61,7 @@ inspecting Cloudflare credentials locally, disable Wrangler debug logging
 ## Migration, secrets and device provisioning
 
 Use the same explicit production config for every remote command. Apply the
-initial migration only to the newly created D1 database:
+pending additive migrations only to this project's explicitly selected D1 database:
 
 ```sh
 npx wrangler d1 migrations apply agent-beacon-cloud-db --remote --config .local/wrangler.production.jsonc
@@ -69,10 +69,20 @@ npx wrangler deploy --config .local/wrangler.production.jsonc
 # Configure different, random 32-byte-or-longer read secrets via interactive prompts.
 npx wrangler secret put READ_TOKEN --config .local/wrangler.production.jsonc
 npx wrangler secret put MCP_TOKEN --config .local/wrangler.production.jsonc
+# Optional central workflow writes: independently generated reviewer secret.
+npx wrangler secret put REVIEW_TOKEN --config .local/wrangler.production.jsonc
 ```
 
 Deployment before read secrets produces a protected but unusable dashboard/MCP,
 not an open read endpoint. No devices can upload until their digests are inserted.
+The 0.2 feature branch also requires migrations `0002` and `0003`. They add
+central workflow tables/triggers without changing raw history. Back up the
+selected D1 database first; use the existing isolated TEST config for a future
+TEST upgrade, never a shared database or production example by accident.
+Omitting `REVIEW_TOKEN` leaves all workflow writes denied. Never reuse read,
+MCP or device secrets for this role. A code rollback leaves the additive tables
+and audit history intact; do not drop them as a rollback step. The migration,
+backup and restore procedure is in [CONTEXT-WORKFLOWS.md](CONTEXT-WORKFLOWS.md).
 Access-only deployments omit `READ_TOKEN` and configure the exact
 `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD` pair for a separately approved application;
 the Worker independently checks signature/issuer/audience/expiry. Do not change

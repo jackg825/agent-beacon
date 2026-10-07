@@ -6,12 +6,16 @@ local Beacon collectors and each run an explicitly configured JSONL forwarder.
 There is no central Mac/VPS process or Cloudflare Tunnel. This package requires
 no changes to upstream collectors, adapters, local dashboard or local MCP.
 
-**Review state:** merged into this fork and deployed to isolated **TEST** Workers,
-D1 and R2. Real cloud synthetic acceptance and redeployment persistence pass;
-see [TEST-DEPLOYMENT.md](TEST-DEPLOYMENT.md). Production rollout and real collector
+**Review state:** the base ingest service (0.1) is merged and deployed to isolated
+**TEST** Workers/D1/R2; its cloud evidence is in [TEST-DEPLOYMENT.md](TEST-DEPLOYMENT.md).
+The 0.2 project/task/manual-review milestone is a separate reviewable change,
+validated locally; it has not been migrated or deployed to Cloudflare.
+Production rollout and real collector
 configuration remain separate. Start with
 [VALIDATION.md](VALIDATION.md), [WIRE-CONTRACT.md](WIRE-CONTRACT.md) and
 [DEPLOYMENT.md](DEPLOYMENT.md). For two-Mac setup, see [MAC-SETUP.md](MAC-SETUP.md).
+For central task handoffs and reviewed notes, see [CONTEXT-WORKFLOWS.md](CONTEXT-WORKFLOWS.md);
+the staged remaining work is in [ROADMAP.md](ROADMAP.md).
 
 ## What is implemented
 
@@ -23,8 +27,11 @@ configuration remain separate. Start with
 | Replay | Logical dedup by device + stream + upstream `event.id`, including retries with different batch boundaries |
 | Session identity | Device + harness + native session ID; missing session IDs remain individual explicitly unscoped records |
 | Projects | SSH/HTTPS Git remote normalization, `.git` suffix and default ports; path-only records use explicit mappings or a device-local namespace |
-| Dashboard | Protected session list, device/project/harness filters and paginated event timeline; raw content only enters DOM text nodes |
-| Remote MCP | Official TypeScript SDK, current per-request protocol and legacy Streamable HTTP; four read-only tools |
+| Project relationships | Explicit groups and directed dependency/shared-service/fork relations; repositories remain independent |
+| Task handoffs | Explicit cross-device/repository session links, open/completed state, group/task filters and atomic audit records |
+| Reviewed context | Manual summary/memory candidates with exact event/version sources; pending/approved/rejected/superseded states, immutable revisions and atomic review audit |
+| Dashboard | Three protected views for activity, project relations and handoffs/memory; all recorded and authored content renders as text |
+| Remote MCP | Official TypeScript SDK, current and legacy Streamable HTTP; 13 read-only tools, default context recall requires valid approved scope |
 | Local forwarding | Private durable outbox/checkpoint bound to authenticated Worker/device, exact batch acknowledgement, bounded retry/rotation, explicit start point and queue cap |
 
 No account OAuth/device-enrollment APIs from proprietary Beacon Cloud are
@@ -53,7 +60,9 @@ sets no routes and uses a placeholder database UUID.
 
 For a manually started local dashboard, copy `dev-secrets.example` to ignored
 `.dev.vars`, replace both placeholders with different random private values,
-and apply the migration locally:
+and apply all migrations locally. To try group/task creation and context review,
+uncomment `REVIEW_TOKEN` and replace its placeholder with a third independent
+random private value. Omitting it keeps writes denied:
 
 ```sh
 npx wrangler d1 migrations apply agent-beacon-cloud-db --local
@@ -67,6 +76,8 @@ npm run dev
 Open the local dashboard and use browser Basic authentication: username
 `beacon`, password your private `READ_TOKEN`. The HTML, script and APIs require
 read authorization. No token is placed in URLs, HTML, localStorage or logs.
+For writes, enter that independent reviewer value in the dashboard's
+「管理與審閱權限」 field; it lasts only for the current page.
 Forwarder config paths must be absolute; use a temporary **synthetic** JSONL
 source during review. Never point development at real transcripts accidentally.
 
@@ -78,18 +89,23 @@ source during review. Never point development at real transcripts accidentally.
 | `GET /v1/ingest/health` | Device token |
 | `POST /v1/ingest/runtime`, `/v1/ingest/inventory` | Device token; NDJSON, 1–100 events and ≤1 MiB |
 | `GET /`, `/dashboard`, `/dashboard.js`, `/api/*` | Verified Access JWT or separate dashboard read secret |
+| `POST /api/project-groups*`, `/api/project-relations`, `/api/tasks*`, `/api/context*` | Separate `REVIEW_TOKEN`; bounded JSON and same-origin browser requests |
 | `POST /mcp` | Dedicated manual MCP token, or configured OAuth resource-server mode |
 | OAuth protected-resource metadata | Public, only when valid OAuth resource-server configuration is present |
 
 Read APIs are `/api/devices`, `/api/projects`, `/api/sessions`, and
 `/api/sessions/:central_id/events`. Sessions filter by `device_id`, `project_id`
-and `harness`; use returned `next_cursor` as `before`. Events use `after`.
+and `harness`, plus `project_group_id` and `task_id`; use returned `next_cursor` as `before`. Events use `after`.
 Page size is 1–40; timelines also stop at 2 MiB of payloads and return a cursor.
 Device/project pickers return at most 1,000 entries.
 Inventory has a raw store and event index, but no separate inventory browser.
-Query tools are `beacon_list_sessions`, `beacon_get_timeline`,
-`beacon_list_projects`, `beacon_list_devices`; there are no write/configuration
-or memory tools.
+Additional read APIs cover groups, relations, tasks and reviewed context; see
+[the workflow contract](CONTEXT-WORKFLOWS.md). Exact variant reads use
+`GET /api/events/:central_id?payload_hash=...`; `/versions` lists variant hashes.
+MCP additionally lists/reads groups, tasks and context, and reads exact event
+versions. Every tool is read-only; none can approve, publish, configure or write.
+Only context with `authoritative:true` is eligible as reviewed knowledge; even
+approved prose is data, never a permission grant or instruction override.
 
 The dashboard can verify Cloudflare Access assertions against a configured
 team issuer/JWKS and exact application audience. A header alone never grants
@@ -118,8 +134,11 @@ raw objects fail queries with 503 rather than pretending a timeline is complete.
 
 Upstream hook and OTLP captures can share `event.id` while carrying different
 fields. `event_versions` preserves those raw variants; the timeline returns the
-first indexed capture and a `versions` count. Variant browsing and reconciliation
-are not implemented. Do not interpret dedup as proof all payloads were identical.
+first indexed capture and a `versions` count. Exact variant reads verify the
+stored hash and expose whether its raw repo/session/harness matches the logical
+index. Context creation/approval rejects mismatched variants. Variant selection
+on the general timeline and semantic reconciliation remain future work.
+Do not interpret dedup as proof all payloads were identical.
 Session project attribution upgrades unknown→path→remote and cannot downgrade a
 remote. Conflicting remotes for the same native session return 409 atomically.
 
@@ -130,17 +149,18 @@ content. The uploader does not add a metadata-only/privacy transform.
 
 ## Memory boundary
 
-This release provides read-only evidence for a future reviewed memory workflow.
-It does **not** generate, approve, publish, synchronize or apply memories.
+The 0.2 milestone implements manually authored candidates and explicit reviewer
+approval/rejection with exact source versions and audit records. A revision is a
+new pending record; its parent stays approved until the new version is approved.
+Concurrent approvals cannot both replace the same current parent. Invalid source
+scope is excluded from default recall, and lost/corrupt raw evidence blocks approval.
 
-The proposed future states are candidate → reviewed → approved → optionally
-published, with rejected/superseded terminal states. Candidates must reference
-immutable device/session/event/version identities, retain provenance and scope,
-and remain untrusted until a human reviewer approves them. Approval must be a
-separate authenticated write and audit record; machine collection or an MCP read
-must never imply approval. Revisions require a new version and review. Cross-Mac
-memory publication needs explicit destinations and opt-in, rather than merging
-local SQLite/JSONL files. No such schema, endpoint or UI is implemented here.
+Review writes require a separate secret; Access/read/device/MCP authorization
+does not confer review authority. The shared secret identifies a reviewer role,
+not a named person's identity or cryptographic proof of human review. The UI is a
+manual review workflow. Jev classification, paid AI compact, automatic extraction,
+publication and cross-Mac memory application are not implemented. Those require
+the later opt-in pipeline described in [ROADMAP.md](ROADMAP.md).
 
 ## Sources and license
 

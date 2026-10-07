@@ -1,9 +1,11 @@
-import { checkOrigin, deviceAuth, readAuth } from './auth';
+import { checkOrigin, deviceAuth, readAuth, reviewAuth } from './auth';
 import { dashboardResponse, dashboardScriptResponse } from './dashboard';
 import { ingest } from './ingest';
 import { handleMcp } from './mcp';
 import { mcpChallenge, mcpMetadata } from './mcp-auth';
-import { getTimeline, listDevices, listProjects, listSessions } from './queries';
+import { getEventVersion, listEventVersions, getTimeline, listDevices, listProjects, listSessions } from './queries';
+import { projectRead, projectWrite } from './project-workflows';
+import { contextRead, contextWrite } from './context';
 import { Env, HttpError, json } from './types';
 
 async function route(request: Request, env: Env): Promise<Response> {
@@ -26,6 +28,12 @@ async function route(request: Request, env: Env): Promise<Response> {
     return handleMcp(request,env);
   }
   if (path==='/' || path==='/dashboard' || path==='/dashboard.js' || path.startsWith('/api/')) {
+    if (request.method==='POST' && /^\/api\/(?:project-groups|project-relations|tasks|context)(?:\/|$)/.test(path)) {
+      const actor = await reviewAuth(request, env);
+      const response = await projectWrite(request, env, actor) || await contextWrite(request, env, actor);
+      if (response) return response;
+      throw new HttpError(404, 'Not found');
+    }
     await readAuth(request,env);
     if (request.method!=='GET') throw new HttpError(405,'Read-only endpoint');
     if (path==='/' || path==='/dashboard') return dashboardResponse();
@@ -33,6 +41,10 @@ async function route(request: Request, env: Env): Promise<Response> {
     if (path==='/api/sessions') return json(await listSessions(env,url.searchParams));
     if (path==='/api/projects') return json(await listProjects(env));
     if (path==='/api/devices') return json(await listDevices(env));
+    const workflow = await projectRead(request, env) || await contextRead(request, env);
+    if (workflow) return workflow;
+    const eventMatch=/^\/api\/events\/([a-f0-9]{64})(\/versions)?$/.exec(path);
+    if (eventMatch) return json(await (eventMatch[2] ? listEventVersions(env,eventMatch[1],url.searchParams) : getEventVersion(env,eventMatch[1],url.searchParams)));
     const match=/^\/api\/sessions\/([a-f0-9]{64})\/events$/.exec(path);
     if (match) return json(await getTimeline(env,match[1],url.searchParams));
   }

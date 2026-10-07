@@ -13,6 +13,7 @@
 .wrangler/
 workers/beacon-cloud/.local/
 workers/beacon-cloud/.test-state/
+.qa-runs/
 
 # JavaScript dependencies and build outputs
 node_modules/

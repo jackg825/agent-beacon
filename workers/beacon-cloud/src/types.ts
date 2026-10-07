@@ -3,6 +3,7 @@ export interface Env {
   RAW: R2Bucket;
   READ_TOKEN?: string;
   MCP_TOKEN?: string;
+  REVIEW_TOKEN?: string;
   MCP_OAUTH_ISSUER?: string;
   MCP_OAUTH_JWKS_URL?: string;
   ACCESS_TEAM_DOMAIN?: string;
