@@ -1,5 +1,8 @@
 # Cloudflare TEST acceptance
 
+This records the **0.1 base service**, not the 0.2 project/task/context milestone.
+For the newer local-only validation see [VALIDATION.md](VALIDATION.md).
+
 Completed **2026-10-05 (Asia/Taipei)**. The owner authorized review, merge and a
 test rollout. [PR #1](https://github.com/jackg825/agent-beacon/pull/1) is merged
 into the owner's public fork. Deployed runtime source:

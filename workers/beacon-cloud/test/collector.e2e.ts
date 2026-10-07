@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 import { Miniflare, convertV4MiniflareOptions } from 'miniflare';
+import { applyMigrations } from './migrations';
 // @ts-expect-error Deliberately independent Node-only helper invokes the shipping Go hook binary.
 import { produceBeaconFixture } from './collector-fixture.mjs';
 // @ts-expect-error The opt-in shipper is a standalone Node module.
@@ -38,9 +39,7 @@ test('compiled shipping Beacon hook -> JSONL -> forwarder -> workerd -> D1/R2 ->
     const tokenFile = join(directory, 'device-token');
     await writeFile(tokenFile, deviceToken, { mode: 0o600 });
     let db = await mf.getD1Database('DB');
-    const [tables, trigger] = (await readFile('migrations/0001_initial.sql', 'utf8')).split('CREATE TRIGGER');
-    for (const statement of tables.replace(/--[^\n]*/g, '').split(';').filter(value => value.trim())) await db.prepare(statement).run();
-    await db.prepare('CREATE TRIGGER' + trigger).run();
+    await applyMigrations(db);
     await db.prepare('INSERT INTO devices(id,name,token_hash,created_at) VALUES(?,?,?,?)').bind('synthetic-hook-device', 'Synthetic hook device',
       createHash('sha256').update(deviceToken).digest('hex'), '2026-10-04T00:00:00Z').run();
     const config = { endpoint: 'http://localhost', tokenFile, stateDir: join(directory, 'forwarder-state'), allowLocalHttp: true,

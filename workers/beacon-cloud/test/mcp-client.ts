@@ -16,7 +16,7 @@ export async function verifyMcp(url: string, token: string, sessionId?: string, 
       await client.connect(transport);
       assert.equal(client.getProtocolEra(), modern ? 'modern' : 'legacy');
       const { tools } = await client.listTools();
-      assert.equal(tools.length, 4);
+      assert.equal(tools.length, 13);
       for (const tool of tools) assert.equal(tool.annotations?.readOnlyHint, true);
       const sessions = await client.callTool({ name: 'beacon_list_sessions', arguments: { limit: 40 } });
       const devices = await client.callTool({ name: 'beacon_list_devices', arguments: {} });
