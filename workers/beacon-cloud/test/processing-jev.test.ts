@@ -9,7 +9,7 @@ import { processingMaintenance, processingRead, processingTick } from '../src/pr
 import { effectivePolicy, EffectivePolicy } from '../src/processing-policy';
 import { makeScope } from '../src/processing-planner';
 import type { StageResult } from '../src/processing-stage';
-import type { ProjectedEvent } from '../src/privacy';
+import { projectEvents } from '../src/privacy';
 import { jevStage } from '../src/jev';
 import { Env } from '../src/types';
 import { createEnvFixture, syntheticEvent } from './env-fixture';
@@ -119,11 +119,13 @@ test('each gate condition alone keeps the stage from reserving budget or sending
     const allowed = await effectivePolicy(f.env, event.project_id);
     const scope = await makeScope('task', taskId, event.project_id);
     const jev = fakeJev();
-    const projection: ProjectedEvent[] = [{ action: 'command.executed', kind: 'agent_runtime', timestamp: '2026-10-07T08:00:00.000Z',
-      harness: 'codex_cli', exit_code: 1, command_text: 'npm test' }];
+    // The stage's input exactly as the runner builds it from this job's one source.
+    const sources = [{ payload: command('gate-1', 'npm test', 1, { repo: 'gate', session: 'gate-session' }), timestamp: '2026-10-07T08:00:00.000Z' }];
+    const projection = projectEvents(sources, allowed.summary_fields).events;
     const attempt = (env: Env, options: { policy?: Partial<EffectivePolicy>; owner?: string; remaining?: number; taskTitle?: string | null } = {}) =>
       jevStage({ env, ctx: { now, remaining: () => options.remaining ?? 20_000, usage: () => ({ d1: 0, r2: 0, fetch: 0 }), fetch: jev.fetcher },
         job_id: planned.job_id, attempt: 1, lease_owner: options.owner ?? 'gate-owner', scope, policy: { ...allowed, ...options.policy }, projection,
+        reproject: (fields, assigned) => projectEvents(sources, fields, { assigned }),
         labels: { task_title: options.taskTitle === undefined ? '合成任務 gate' : options.taskTitle, project_name: 'gate' } });
     const expectBlocked = async (name: string, result: Promise<StageResult>, note?: string) => {
       assert.deepEqual(await result, { decision: 'continue', signals: [], ...(note ? { note } : {}) }, name);
@@ -233,6 +235,41 @@ test('the request carries only external fields, redacted, with this project\'s a
     assert.deepEqual(Object.fromEntries(statuses.filter((row) => [first, second].includes(row.id)).map((row) => [row.id, row.status])),
       { [first]: 'approved', [second]: 'approved' });
     assert.equal(statuses.find((row) => row.id === done.result_context_id).status, 'pending');
+  } finally { await f.close(); }
+});
+
+test('a value assigned to a secret key in any part of the request is removed from every other part, before any cut', async () => {
+  const f = await createEnvFixture();
+  try {
+    const fields = ['command_text', 'titles', 'approved_note_text'];
+    // Command output is summarized locally but never sent; a value assigned there is still removed from what is sent.
+    await setPolicy(f.env, workspace, { ...external, summary_fields: [...fields, 'command_output'], external_fields: fields });
+    await setBudget(f.env, { daily_call_limit: 10 });
+    const fromNote = 'NOTEASSIGNED98765', fromEvent = 'EVENTASSIGNED54321', fromTitle = 'TITLEASSIGNED77777', fromOutput = 'OUTPUTASSIGNED4242';
+    await f.ingest([command('cross-1', `echo ${fromNote} ${fromTitle} ${fromOutput}`, 0, { session: 'cross-s', timestamp: '2026-10-07T08:00:01Z' }),
+      command('cross-2', '', 0, { session: 'cross-s', timestamp: '2026-10-07T08:00:02Z',
+        extra: { command: { command: `export API_KEY=${fromEvent}`, exit_code: 0, output: `token=${fromOutput}` } } }),
+      // The note's value sits across this command's 1,200-character cut: only redacting first leaves no prefix.
+      command('cross-3', 'x'.repeat(1180) + ' ' + fromNote + ' ' + 'y'.repeat(100), 0, { session: 'cross-s', timestamp: '2026-10-07T08:00:03Z' })]);
+    const event = (await f.event('cross-1'))!;
+    // Event → title and note; title → event; note → event.
+    const taskId = await newTask(f.env, `合成 ${fromEvent} token=${fromTitle}`, [event.session_id]);
+    const note = await approvedNote(f, 'cross-1', `筆記 ${fromEvent}`, `部署用 api_key=${fromNote} 已設定；舊值 ${fromEvent} 已停用。`, taskId);
+    const planned = (await run(f.env, { task_id: taskId })).scopes[0];
+    const jev = fakeJev();
+    assert.equal((await tick(gated(f.env), noon(), { fetcher: jev.fetcher })).ok, true);
+    assert.equal(jev.calls.length, 1);
+    const [sent] = jev.calls;
+    assert.deepEqual(hasAny(sent.text, [fromNote, fromEvent, fromTitle, fromOutput, fromNote.slice(0, 5)]), []);
+    assert.ok(sent.body.state.events.every((item: any) => !('command_output' in item)));
+    // Everything else is still there, and the notes keep their identity.
+    assert.deepEqual(sent.body.state.events.map((item: any) => item.command_text.slice(0, 18)),
+      ['echo [REDACTED] [R', 'export API_KEY=[RE', 'x'.repeat(18)]);
+    assert.match(sent.body.state.events[2].command_text, /^x{1180} \[REDA\.\.\.\[truncated\]$/);
+    assert.equal(sent.body.state.scope.task_title, '合成 [REDACTED] token=[REDACTED]');
+    assert.deepEqual(sent.body.state.approved_notes.map((item: any) => [item.id, item.title, item.content]),
+      [[note, '筆記 [REDACTED]', '部署用 api_key=[REDACTED] 已設定；舊值 [REDACTED] 已停用。']]);
+    assert.equal((await job(f.env, planned.job_id)).status, 'succeeded');
   } finally { await f.close(); }
 });
 

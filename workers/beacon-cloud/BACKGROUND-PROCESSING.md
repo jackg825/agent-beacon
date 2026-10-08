@@ -189,7 +189,7 @@ Jev（TypeSafe System One）只回答三種問題：新活動是否有已核准�
 - `state.events`：執行時依當時政策建立的遮蔽投影，再收窄到 `external_fields`。中繼資料（動作、類型、時間、harness、結束碼、核准決定、usage 數字）一律包含；`file_path` 不在 `external_fields` 時只送副檔名。
 - `state.approved_notes`：只有 `approved_note_text` 在 `external_fields` 時才送，最多 10 則屬於該範圍專案的現行 authoritative 筆記（任務範圍包含該任務與全專案筆記，依建立時間由新到舊），從不包含其他專案或分享進來的筆記。每則有 ID、種類、遮蔽後最多 2,000 字元的內容與原文 SHA-256；標題只在 `titles` 允許時才送。
 - `state.scope`：範圍類型；`titles` 允許時加上任務標題與專案名稱。
-- 整份 request 先在所有字串中收集「指定給機密 key 的值」，再一起遮蔽，並移除本 Worker 自己的 secrets（包括 `JEV_API_KEY`）。
+- 送出前先從尚未遮蔽的筆記內容與標題、任務標題、專案名稱與事件（包括只在本機整理的欄位）收集「指定給機密 key 的值」；筆記、標題與事件都用這些值和本 Worker 自己的 secrets（包括 `JEV_API_KEY`）遮蔽之後才截斷，所以一處指定的值不會在另一處裸露，也不會在截斷處留下前綴。
 - 超過預算的 `max_input_chars` 時，依上游方式保留開頭與結尾的事件並插入省略標記，必要時再從最舊的筆記開始移除（連同它的矛盾問題）。只會整個移除事件或筆記，不會切斷字串；連一個事件都放不下就不呼叫。
 
 ### 問題與 wire contract

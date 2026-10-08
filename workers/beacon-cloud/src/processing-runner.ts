@@ -4,7 +4,7 @@ import { extractiveGenerator, Generator, GeneratorEvent, validateGenerated } fro
 import { stableJSON } from './identity';
 import { defaultStage } from './jev';
 import type { Allotment, MaintenanceContext } from './maintenance';
-import { cleanLine, projectEvents, workerSecrets } from './privacy';
+import { cleanLine, FieldClass, projectEvents, workerSecrets } from './privacy';
 import { EffectivePolicy, effectivePolicy } from './processing-policy';
 import { JobScope, SelectionStage, StageSignal } from './processing-stage';
 import { versionScope } from './queries';
@@ -185,8 +185,10 @@ async function runClaimed(env: Env, ctx: MaintenanceContext, lease: Lease, optio
   const versions = await exactVersions(env, current.rows);
   const used = current.rows.filter((row) => versions.has(row.event_id));
   const secrets = workerSecrets(env);
-  const projection = projectEvents(used.map((row) => ({ payload: versions.get(row.event_id)!.payload, timestamp: row.timestamp })),
-    policy.summary_fields, { secrets });
+  const sources = used.map((row) => ({ payload: versions.get(row.event_id)!.payload, timestamp: row.timestamp }));
+  const projection = projectEvents(sources, policy.summary_fields, { secrets });
+  const reproject = (fields: readonly FieldClass[], assigned: Iterable<string>) => projectEvents(sources,
+    fields.filter((field) => policy.summary_fields.includes(field)), { secrets, assigned: [...projection.assigned, ...assigned] });
   const events: GeneratorEvent[] = projection.events.map((event, index) => ({ ...event, event_id: used[index].event_id,
     payload_hash: versions.get(used[index].event_id)!.payload_hash, device_id: used[index].device_id, session_id: used[index].session_id }));
   const counts = { event_count: events.length, excluded_count: current.rows.length - events.length,
@@ -199,7 +201,7 @@ async function runClaimed(env: Env, ctx: MaintenanceContext, lease: Lease, optio
   const scope: JobScope = { scope_type: job.scope_type, scope_id: job.scope_id, project_id: job.project_id, task_id: job.task_id,
     scope_key: job.scope_key };
   const decision = await (options.stage ?? defaultStage)({ env, ctx, job_id: job.id, attempt: job.attempts, lease_owner: lease.owner,
-    scope, policy, projection: projection.events, labels: { task_title: current.task_title, project_name: current.project_name } });
+    scope, policy, projection: projection.events, reproject, labels: { task_title: current.task_title, project_name: current.project_name } });
   if (decision.decision === 'skip')
     return await skip(env, lease, decision.skip_reason ?? 'stage_skip', covered, decision.signals, decision.note ?? null) ? 'skipped' : 'lease_lost';
   const titles = policy.summary_fields.includes('titles');

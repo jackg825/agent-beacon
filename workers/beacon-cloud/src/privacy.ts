@@ -240,18 +240,23 @@ function contentValues(payload: unknown, root: string, allowed: ReadonlySet<Fiel
 
 export interface ProjectionInput { payload: unknown; timestamp?: string; projectRoot?: string }
 
+export interface Projection { events: ProjectedEvent[]; truncated: boolean; chars: number;
+  /** Every value removed by exact match: `options.assigned` plus those found in the projected content. */
+  assigned: ReadonlySet<string> }
+
 /**
  * Project payloads under one policy. Every retained string is redacted; values
- * assigned to secret-like keys anywhere in the projection are also removed where
- * they reappear bare in another field or event. Bounded per string and in total.
+ * assigned to secret-like keys anywhere in the projection (and any passed in
+ * `assigned`, e.g. from other parts of an outgoing request) are also removed where
+ * they reappear bare, before any string is cut. Bounded per string and in total.
  */
 export function projectEvents(inputs: readonly ProjectionInput[], fields: readonly FieldClass[],
-  options: { secrets?: readonly string[] } = {}): { events: ProjectedEvent[]; truncated: boolean; chars: number } {
+  options: { secrets?: readonly string[]; assigned?: Iterable<string> } = {}): Projection {
   const allowed = new Set(fields);
   const roots = inputs.map((input) => input.projectRoot ?? str(get(input.payload, 'session', 'working_directory')));
   // Collect from the un-redacted values, and from each string inside a structured one
   // (where escaped quotes would hide `key="value"` from the whole-text pattern).
-  const assigned = new Set<string>();
+  const assigned = new Set<string>(options.assigned ?? []);
   const collect = (text: string) => { for (const item of assignedValues(text)) assigned.add(item); };
   const leaves = inputs.map(() => new Set<string>());
   const raw = inputs.map((input, index) =>
@@ -302,7 +307,7 @@ export function projectEvents(inputs: readonly ProjectionInput[], fields: readon
     }
     return event;
   });
-  return { events, truncated, chars };
+  return { events, truncated, chars, assigned };
 }
 
 /** Single-event projection; prefer projectEvents so bare copies are found across events. */

@@ -1,5 +1,5 @@
 import type { MaintenanceContext } from './maintenance';
-import type { ProjectedEvent } from './privacy';
+import type { FieldClass, Projection, ProjectedEvent } from './privacy';
 import type { EffectivePolicy } from './processing-policy';
 import type { Env } from './types';
 
@@ -17,6 +17,13 @@ export interface StageInput {
   lease_owner: string;
   /** Redacted projection under the policy's summary_fields; an external stage must narrow it to external_fields. */
   projection: ProjectedEvent[];
+  /**
+   * The same sources projected again under `fields` (never beyond summary_fields), also
+   * removing `assigned`: values a stage found assigned to secret keys in other parts of
+   * what it sends (notes, titles). Always redacted, before any cut; the result's
+   * `assigned` is everything removed, for redacting those other parts in turn.
+   */
+  reproject(fields: readonly FieldClass[], assigned: Iterable<string>): Projection;
   /** Raw task title and project name as stored; a stage may use them only under the `titles` class, redacted. */
   labels: { task_title: string | null; project_name: string | null };
 }
