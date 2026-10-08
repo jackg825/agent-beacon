@@ -340,7 +340,8 @@ export type Manifest = {
 };
 
 async function manifestStep(env: Env, ctx: MaintenanceContext, cp: Checkpoint, limits: BackupLimits, owner: string): Promise<Checkpoint | Stop> {
-  if (!room(ctx, limits.allotment, { d1: 3, r2: 1 })) return 'budget';
+  // A two-statement batch, the migrations ledger (present on every wrangler-migrated D1) and the completing update.
+  if (!room(ctx, limits.allotment, { d1: 4, r2: 1 })) return 'budget';
   const [chunkRows, ledger] = await env.DB.batch([
     env.DB.prepare('SELECT seq,kind,key,sha256,bytes,rows FROM backup_chunks WHERE checkpoint_id=? ORDER BY seq').bind(cp.id),
     env.DB.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='d1_migrations'"),
@@ -385,7 +386,9 @@ async function advanceCheckpoint(env: Env, ctx: MaintenanceContext, limits: Back
     }
   } catch (error) {
     if (!(error instanceof BackupFailure)) {
-      await env.DB.prepare('UPDATE backup_checkpoints SET lease_owner=NULL,lease_until=NULL WHERE id=? AND lease_owner=?').bind(cp.id, owner).run().catch(() => {});
+      // The metered binding throws synchronously once the allotment is spent; keep the original error either way.
+      try { await env.DB.prepare('UPDATE backup_checkpoints SET lease_owner=NULL,lease_until=NULL WHERE id=? AND lease_owner=?').bind(cp.id, owner).run(); }
+      catch { /* the lease expires on its own */ }
       throw error;
     }
     await env.DB.prepare(`UPDATE backup_checkpoints SET status='failed',error_code=?,lease_owner=NULL,lease_until=NULL,updated_at=?

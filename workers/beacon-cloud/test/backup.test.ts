@@ -8,7 +8,7 @@ import { chmod, mkdir, mkdtemp, readdir, rm, stat, symlink, writeFile } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BACKUP_BOOKKEEPING } from '../src/operations-shared';
-import { Manifest, backupTask, backupsReviewerRead, backupsWrite, createBackupTask, expireCheckpoint } from '../src/backup';
+import { BACKUP_ALLOTMENT, Manifest, backupTask, backupsReviewerRead, backupsWrite, createBackupTask, expireCheckpoint } from '../src/backup';
 import { revisionsWrite } from '../src/context-revisions';
 import { runMaintenance } from '../src/maintenance';
 import { Env } from '../src/types';
@@ -293,6 +293,52 @@ test('checkpoint progress is leased, bounded and fails with codes', async (t) =>
       assert.equal((idle.result as any).checkpoint, undefined);
     });
   } finally { await fixture.close(); }
+});
+
+test('the manifest step reserves every D1 call it makes, so a tick at the allotment edge stops cleanly', async () => {
+  // Two fixtures in the same state: the first measures how many D1 calls a tick makes before the
+  // manifest step, the second runs the same tick with exactly three calls left at that point.
+  const prepared = async () => {
+    const fixture = await createEnvFixture({ backup: true });
+    // Every wrangler-migrated D1 has the migrations ledger, which the manifest step reads.
+    await fixture.env.DB.batch([fixture.env.DB.prepare('CREATE TABLE d1_migrations(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT UNIQUE,applied_at TEXT)'),
+      fixture.env.DB.prepare("INSERT INTO d1_migrations(name,applied_at) VALUES('0001_initial.sql','2026-10-01T00:00:00Z')")]);
+    await fixture.ingest([syntheticEvent('edge-1')]);
+    for (let index = 0; index < 40 && (await latestCheckpoint(fixture.env))?.phase !== 'raw'; index++) await backupTick(fixture.env, later(15), { maxSteps: 1 });
+    assert.equal((await latestCheckpoint(fixture.env))!.phase, 'raw');
+    return fixture;
+  };
+  const measuring = await prepared(), edge = await prepared();
+  try {
+    let calls = 0, before = -1;
+    const counted = new Proxy(measuring.env.DB, { get(target, property) {
+      if (property === 'batch') return (statements: D1PreparedStatement[]) => {
+        if (before < 0 && statements.length === 2 && /FROM backup_chunks WHERE checkpoint_id=\? ORDER BY seq/.test(String((statements[0] as any).__sql))) before = calls;
+        calls += statements.length; return target.batch(statements);
+      };
+      if (property === 'prepare') return (sql: string) => {
+        const statement = target.prepare(sql) as any;
+        const wrap = (inner: any): any => new Proxy(inner, { get(object, key) {
+          if (key === '__sql') return sql;
+          if (key === 'bind') return (...values: unknown[]) => wrap(object.bind(...values));
+          if (['first', 'all', 'run', 'raw'].includes(String(key))) return (...args: unknown[]) => { calls++; return object[key](...args); };
+          const value = object[key]; return typeof value === 'function' ? value.bind(object) : value;
+        } });
+        return wrap(statement);
+      };
+      const value = Reflect.get(target, property, target); return typeof value === 'function' ? value.bind(target) : value;
+    } });
+    const measured = await backupTick({ ...measuring.env, DB: counted } as Env, later(15));
+    assert.equal((measured.result as any).checkpoint.status, 'completed');
+    assert.ok(before > 0, 'the manifest step ran in the measured tick');
+    const allotment = { ...BACKUP_ALLOTMENT, d1: before + 3 };
+    const report = await runMaintenance({ ...edge.env, MAINTENANCE_TASKS: 'backup' } as Env, { now: later(15), budgetMs: 120_000,
+      tasks: [createBackupTask({ allotment })] });
+    assert.equal(report.backup.ok, true, JSON.stringify(report.backup));
+    const stopped = (await latestCheckpoint(edge.env))!;
+    assert.deepEqual([stopped.status, stopped.phase, stopped.lease_owner], ['running', 'manifest', null]);
+    assert.equal((await completeCheckpoint(edge.env, later(15))).status, 'completed');
+  } finally { await measuring.close(); await edge.close(); }
 });
 
 test('expiry keeps the newest verified checkpoint and any a recent retention run relied on', async () => {
