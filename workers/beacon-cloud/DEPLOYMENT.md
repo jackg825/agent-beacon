@@ -179,9 +179,18 @@ remote command:
      put it on a command line, in `vars`, git, fixtures or logs.
    - Set the `EXTERNAL_PROCESSING_PROJECTS` var to the one synthetic test project ID
      (not `*`); set `JEV_ENDPOINT`/`JEV_MODEL` only when the defaults are wrong.
-   - Reviewer: project policy with `external_allowed:true`, `jev_enabled:true`,
-     `external_fields` limited to `titles` (add `approved_note_text` only for
-     synthetic notes) and `jev_skip_threshold:null`; a small budget through
+   - Reviewer: the workspace row is a ceiling (flags are ANDed and field lists
+     intersected), so raise it first: workspace `external_allowed:true`,
+     `jev_enabled:true` and the test classes in both `summary_fields` and
+     `external_fields`. `EXTERNAL_PROCESSING_PROJECTS` still limits calls to the one
+     test project, and every other project keeps its own narrower row. Then the test
+     project's row with the same flags, `external_fields` limited to `titles` (add
+     `approved_note_text` only for synthetic approved notes) and
+     `jev_skip_threshold:null`. With only `titles` sendable, Jev is asked something
+     only for a task scope (task relevance), so run the test on a `task_id`, or
+     include `approved_note_text` with synthetic approved notes for a project scope.
+     Put the workspace row back to `external_allowed:false`/`jev_enabled:false`
+     afterwards. A small budget through
      `POST /api/processing/budget`, e.g.
      `{"daily_call_limit":5,"daily_token_limit":50000,"daily_usd_ceiling":null,"max_input_chars":20000,"max_output_tokens":256,"timeout_ms":10000}`.
    - Check `external_gate` in `GET /api/processing/policy?project_id=…`, then after

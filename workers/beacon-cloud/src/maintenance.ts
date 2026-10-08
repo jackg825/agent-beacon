@@ -117,6 +117,12 @@ export async function runMaintenance(env: Env, options: { now?: Date; schedule?:
     && (!options.schedule || task.schedule === options.schedule));
   const left: Allotment = { ...INVOCATION_LIMITS };
   const report: MaintenanceReport = {};
+  // A misspelled or not-yet-shipped name would otherwise run nothing without a trace.
+  const known = new Set((options.tasks ?? maintenanceTasks).map(task => task.name));
+  for (const name of [...enabled].sort()) if (!known.has(name) && /^[a-z][a-z0-9_.-]{0,63}$/.test(name))
+    report[name] = { ok: false, duration_ms: 0, usage: { d1: 0, r2: 0, fetch: 0 }, error: 'unknown_task' };
+  if ([...enabled].some(name => !/^[a-z][a-z0-9_.-]{0,63}$/.test(name)))
+    report.invalid_task_name = { ok: false, duration_ms: 0, usage: { d1: 0, r2: 0, fetch: 0 }, error: 'unknown_task' };
   for (const task of tasks) {
     const started = clock();
     const meter = new Meter({ d1: Math.min(task.allotment.d1, left.d1), r2: Math.min(task.allotment.r2, left.r2),

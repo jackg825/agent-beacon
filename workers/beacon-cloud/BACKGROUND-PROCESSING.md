@@ -26,7 +26,7 @@
 ## 逐步開啟
 
 1. 套用 0004 並部署（見上）。這時什麼都不會發生。
-2. 在 Worker vars 加入 `MAINTENANCE_TASKS=processing`。沒有這個名稱，排程不執行任何查詢。
+2. 在 Worker vars 加入 `MAINTENANCE_TASKS=processing`。沒有這個名稱，排程不執行任何查詢；寫錯或尚未提供的名稱不會執行任何東西，排程紀錄會以 `unknown_task` 標出。
 3. 用審閱金鑰設定工作區政策。工作區列是上限，沒有它就等於全部關閉：
 
    ```text
@@ -155,7 +155,7 @@
 
 審閱者可以 `POST /api/processing/jobs/:id/retry`（`failed` → `queued`，嘗試次數歸零）或 `POST /api/processing/jobs/:id/dismiss`（`failed`／`queued` → `dismissed`），可附 `reason`，都會留在 `processing_job_audit`。放棄不會涵蓋事件：相同來源不會再自動處理，有新事件時會規劃包含舊事件的新工作。
 
-已知限制：放棄的工作若已經是 `max_events_per_job` 個來源，最舊的未涵蓋事件不會因新事件而改變，該範圍會停在同一組來源，直到政策改變（例如調整 `max_events_per_job`）。同理，R2 原文永久遺失但 D1 索引仍在的事件，會讓包含它的工作一再失敗。目前沒有「人工確認略過這些事件」的操作；遇到時先用資料健康檢查修復原文，或調整政策。
+已知限制：放棄的工作若已經是 `max_events_per_job` 個來源，最舊的未涵蓋事件不會因新事件而改變，該範圍會停在同一組來源，直到政策改變（例如調整 `max_events_per_job`）。同理，R2 原文永久遺失但 D1 索引仍在的事件，會讓包含它的工作一再失敗。目前沒有「人工確認略過這些事件」的操作，這一版也還沒有資料健康檢查：調整政策只對前一種（已放棄且來源數達上限）有效；原文遺失時，只能從私人備份把 R2 物件放回原處，或把該專案的政策改成 `enabled:false` 暫停整理。
 
 ## 規則式摘要 `beacon.extractive.v1`
 

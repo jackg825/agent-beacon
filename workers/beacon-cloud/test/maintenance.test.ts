@@ -40,7 +40,11 @@ test('nothing runs unless named in MAINTENANCE_TASKS, and schedules select their
   const tasks = [task('processing', async () => { ran.push('processing'); return {}; }),
     task('backup', async () => { ran.push('backup'); return {}; }, 'hourly')];
   assert.deepEqual(await runMaintenance({} as Env, { tasks }), {});
-  assert.deepEqual(await runMaintenance({ MAINTENANCE_TASKS: ' , unknown ' } as Env, { tasks }), {});
+  const unknown = { ok: false, duration_ms: 0, usage: { d1: 0, r2: 0, fetch: 0 }, error: 'unknown_task' };
+  assert.deepEqual(await runMaintenance({ MAINTENANCE_TASKS: ' , unknown ' } as Env, { tasks }), { unknown });
+  // A name that is not even well formed is reported without echoing it.
+  assert.deepEqual(await runMaintenance({ MAINTENANCE_TASKS: 'processing,<script>' } as Env, { tasks, schedule: 'hourly' }),
+    { invalid_task_name: unknown });
   await runMaintenance(all(['processing', 'backup']), { tasks, schedule: 'hourly' });
   await runMaintenance(all(['processing', 'backup']), { tasks, schedule: 'frequent' });
   assert.deepEqual(ran, ['backup', 'processing']);
