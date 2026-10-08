@@ -151,6 +151,8 @@
 
 審閱者可以 `POST /api/processing/jobs/:id/retry`（`failed` → `queued`，嘗試次數歸零）或 `POST /api/processing/jobs/:id/dismiss`（`failed`／`queued` → `dismissed`），可附 `reason`，都會留在 `processing_job_audit`。放棄不會涵蓋事件：相同來源不會再自動處理，有新事件時會規劃包含舊事件的新工作。
 
+已知限制：放棄的工作若已經是 `max_events_per_job` 個來源，最舊的未涵蓋事件不會因新事件而改變，該範圍會停在同一組來源，直到政策改變（例如調整 `max_events_per_job`）。同理，R2 原文永久遺失但 D1 索引仍在的事件，會讓包含它的工作一再失敗。目前沒有「人工確認略過這些事件」的操作；遇到時先用資料健康檢查修復原文，或調整政策。
+
 ## 規則式摘要 `beacon.extractive.v1`
 
 不連網、不使用模型。每次都從原文投影重建，不摘要上一份摘要。

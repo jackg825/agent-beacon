@@ -215,6 +215,8 @@ test('job reads list identifiers, codes and counts only, with filters and keyset
     for (const body of [{}, { task_id: crypto.randomUUID(), project_id: all.jobs[0].project_id }, { task_id: 'x' }, { project_id: 'x' }, { other: 1 }])
       await rejects(processingWrite(post('/api/processing/run', body), f.env, reviewer), 400);
     await rejects(processingWrite(post('/api/processing/run', { task_id: crypto.randomUUID() }), f.env, reviewer), 404);
+    // A task without linked sessions has no scope to plan.
+    assert.deepEqual(await run(f.env, { task_id: await newTask(f.env, 'Synthetic empty task') }), { scopes: [] });
     await rejects(processingWrite(post('/api/processing/run', { project_id: 'e'.repeat(64) }), f.env, reviewer), 404);
     // Budget and usage routes belong to part B; until then they are not served.
     assert.equal(await processingWrite(post('/api/processing/budget', {}), f.env, reviewer), null);

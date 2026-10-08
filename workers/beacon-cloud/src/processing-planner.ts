@@ -169,6 +169,7 @@ export async function planRequest(env: Env, input: { task_id?: string; project_i
   if (task.status !== 'open') throw new HttpError(409, 'Only open tasks are processed');
   const projects = (await env.DB.prepare(`SELECT DISTINCT s.project_id FROM task_sessions ts JOIN sessions s ON s.id=ts.session_id
     WHERE ts.task_id=? ORDER BY s.project_id LIMIT 100`).bind(input.task_id).all<{ project_id: string }>()).results;
+  if (!projects.length) return { scopes: [] as PlanResult[] };
   const policies = await Promise.all(projects.map(({ project_id }) => effectivePolicy(env, project_id)));
   if (!policies.some((policy) => policy.enabled)) throw new HttpError(409, 'Background processing is disabled for this task scope');
   const scopes: PlanResult[] = [];
