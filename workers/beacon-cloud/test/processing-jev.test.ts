@@ -240,6 +240,45 @@ test('the request carries only external fields, redacted, with this project\'s a
   } finally { await f.close(); }
 });
 
+test('a task scope sends the ten newest authoritative notes of its task and project, never another task\'s or a stale one', async () => {
+  const f = await createEnvFixture();
+  try {
+    const fields = ['command_text', 'titles', 'approved_note_text'];
+    await setPolicy(f.env, workspace, { ...external, summary_fields: fields, external_fields: fields });
+    await setBudget(f.env, { daily_call_limit: 10 });
+    await f.ingest([command('scoped-1', 'npm test', 0, { session: 'scoped-s1' }), command('other-1', 'npm test', 0, { session: 'scoped-s2' }),
+      command('left-1', 'npm test', 0, { session: 'scoped-s3' })]);
+    const [one, other, left] = await Promise.all(['scoped-1', 'other-1', 'left-1'].map(async (id) => (await f.event(id))!));
+    const taskOne = await newTask(f.env, '合成任務一', [one.session_id, left.session_id]);
+    const taskTwo = await newTask(f.env, '合成任務二', [other.session_id]);
+    // Notes with fixed creation times, so "newest" is exact.
+    const note = async (event: typeof one, day: number, second: number, title: string, taskId?: string) => {
+      const id = await insertCandidate(f.env, { kind: 'memory', project_id: event.project_id, ...(taskId ? { task_id: taskId } : {}), title,
+        content: `Synthetic note ${title}.`, sources: [{ event_id: event.id, payload_hash: event.payload_hash }] }, reviewer,
+        { now: new Date(Date.UTC(2026, 9, day, 0, 0, second)).toISOString() });
+      await review(f.env, id, 'approve');
+      return id;
+    };
+    const projectWide: string[] = [];
+    for (let index = 0; index < 11; index++) projectWide.push(await note(one, 1, index, `project ${index}`));
+    const ownTask = await note(one, 2, 0, 'task one', taskOne);
+    const otherTask = await note(other, 4, 0, 'task two', taskTwo);
+    const stale = await note(left, 5, 0, 'left task one', taskOne);
+    // The source session leaves task one: that note is no longer authoritative.
+    await f.env.DB.prepare('DELETE FROM task_sessions WHERE task_id=? AND session_id=?').bind(taskOne, left.session_id).run();
+    const planned = (await run(f.env, { task_id: taskOne })).scopes[0];
+    assert.equal(planned.status, 'planned');
+    const jev = fakeJev();
+    assert.equal((await tick(gated(f.env), noon(), { fetcher: jev.fetcher })).ok, true);
+    assert.equal(jev.calls.length, 1);
+    const sent = jev.calls[0].body;
+    const expected = [ownTask, ...projectWide.slice(2).reverse()];
+    assert.deepEqual(sent.state.approved_notes.map((item: any) => item.id), expected);
+    assert.deepEqual(Object.keys(sent.questions).sort(), ['new_information', 'task_related', ...expected.map((id) => 'contradiction:' + id)].sort());
+    assert.deepEqual(hasAny(jev.calls[0].text, [otherTask, stale, projectWide[0], projectWide[1], 'task two', 'left task one']), []);
+  } finally { await f.close(); }
+});
+
 test('a value assigned to a secret key in any part of the request is removed from every other part, before any cut', async () => {
   const f = await createEnvFixture();
   try {
