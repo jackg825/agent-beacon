@@ -179,8 +179,9 @@ export async function usageView(env: Env, day: string) {
   const row = budget.results[0] as BudgetRow | undefined;
   const limits: BudgetValues = row ?? DEFAULT_BUDGET;
   const used = totals.results[0] as { calls: number; counted_tokens: number; reported_cost_usd: number; cost_reports: number } & Record<string, number>;
+  // allows_calls reflects only these limits; the deploy gate and policy are reported by the policy view.
   return { day, budget: { ...limits, configured: !!row, version: row?.version ?? null, updated_at: row?.updated_at ?? null,
-      updated_by: row?.updated_by ?? null, external_enabled: limits.daily_call_limit > 0 && limits.daily_token_limit > 0 },
+      updated_by: row?.updated_by ?? null, allows_calls: limits.daily_call_limit > 0 && limits.daily_token_limit > 0 },
     usage: { ...used, reported_cost_usd: used.cost_reports ? used.reported_cost_usd : null },
     remaining: { calls: Math.max(0, limits.daily_call_limit - used.calls), tokens: Math.max(0, limits.daily_token_limit - used.counted_tokens),
       usd: limits.daily_usd_ceiling === null ? null : Math.max(0, limits.daily_usd_ceiling - used.reported_cost_usd) },

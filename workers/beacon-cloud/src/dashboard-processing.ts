@@ -207,7 +207,7 @@ const script = String.raw`
     const budget = data.budget, used = data.usage, container = byId('processing-usage');
     container.replaceChildren();
     const node = text('div', '', 'card-button');
-    node.append(text('strong', data.day + '（UTC）' + (budget.external_enabled ? '' : ' · 外部呼叫已停用（上限為 0）')));
+    node.append(text('strong', data.day + '（UTC）' + (budget.allows_calls ? '' : ' · 外部呼叫已停用（上限為 0）')));
     node.append(text('span', '呼叫 ' + used.calls + '／' + budget.daily_call_limit + ' · 計入 token ' + used.counted_tokens + '／'
       + budget.daily_token_limit + '（未回報用量時以預估計入）', 'session-meta'));
     node.append(text('span', '供應商回報費用 ' + (used.reported_cost_usd === null ? '未回報' : '$' + used.reported_cost_usd)

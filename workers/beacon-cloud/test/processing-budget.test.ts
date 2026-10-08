@@ -34,11 +34,11 @@ test('budget writes are validated full replacements, versioned and audited; the 
       { ...budget, actor: 'forged' }, (({ timeout_ms, ...rest }) => rest)(budget), null, [], 'budget'])
       assert.throws(() => parseBudget(invalid), (error: unknown) => error instanceof HttpError && error.status === 400, JSON.stringify(invalid));
     const empty = await usage(f.env);
-    assert.deepEqual([empty.budget.configured, empty.budget.daily_call_limit, empty.budget.external_enabled, empty.audit.length], [false, 0, false, 0]);
+    assert.deepEqual([empty.budget.configured, empty.budget.daily_call_limit, empty.budget.allows_calls, empty.audit.length], [false, 0, false, 0]);
     const first = await setBudget(f.env, { daily_call_limit: 2, daily_usd_ceiling: 0.5 });
-    assert.deepEqual([first.budget.version, first.budget.updated_by, first.budget.daily_usd_ceiling, first.budget.external_enabled], [1, reviewer, 0.5, true]);
+    assert.deepEqual([first.budget.version, first.budget.updated_by, first.budget.daily_usd_ceiling, first.budget.allows_calls], [1, reviewer, 0.5, true]);
     const second = await setBudget(f.env, { daily_call_limit: 0 });
-    assert.deepEqual([second.budget.version, second.budget.daily_call_limit, second.budget.external_enabled], [2, 0, false]);
+    assert.deepEqual([second.budget.version, second.budget.daily_call_limit, second.budget.allows_calls], [2, 0, false]);
     assert.deepEqual(second.audit.map((row: any) => [row.version, row.actor]), [[2, reviewer], [1, reviewer]]);
     const stored = await f.env.DB.prepare('SELECT budget FROM processing_budget_audit WHERE version=1').first<{ budget: string }>();
     assert.deepEqual(JSON.parse(stored!.budget), { ...budget, daily_call_limit: 2, daily_usd_ceiling: 0.5 });

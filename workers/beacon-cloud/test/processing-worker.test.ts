@@ -49,7 +49,7 @@ test('bundled Worker: processing routes keep roles separate and a scheduled tick
         assert.equal((await get('/api/processing/usage' + query, tokens.read)).status, 400, query);
       const usage = (await (await get('/api/processing/usage?day=2026-10-08', tokens.read)).json()) as any;
       // No budget row: every limit is zero and nothing can be reserved.
-      assert.equal(usage.budget.configured, false); assert.equal(usage.budget.external_enabled, false);
+      assert.equal(usage.budget.configured, false); assert.equal(usage.budget.allows_calls, false);
       assert.deepEqual([usage.usage.calls, usage.remaining.calls, usage.cost_basis], [0, 0, 'provider_reported']);
     });
 
