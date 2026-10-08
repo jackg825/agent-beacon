@@ -313,6 +313,25 @@ test('rendering keeps the header, titles and entry boundaries unforgeable and th
   assert.match(empty, /目前沒有符合訂閱的已核准筆記/);
 });
 
+test('a memory another project shared renders its provenance; a malformed share marker is refused', () => {
+  const share = randomUUID();
+  const entries = [note('memory', '本專案記憶', 'own content'), note('memory', '共享記憶', 'shared content', { shared_from_project_id: OTHER, share_id: share })];
+  const rendered = renderSnapshot(verifySnapshot(snapshotOf(PROJECT, ['memory'], entries), { project_id: PROJECT, kinds: ['memory'] })).toString('utf8');
+  assert.ok(rendered.includes(`- shared_from_project_id: ${OTHER}\n- share_id: ${share}\n`));
+  assert.equal(rendered.split('shared_from_project_id: ').length - 1, 1, 'only the shared entry names another project');
+  assert.match(rendered, /標有 shared_from_project_id 的長期記憶屬於其他專案/);
+  // Without shared entries the header and every byte stay as before.
+  assert.ok(!renderSnapshot(verifySnapshot(snapshotOf(PROJECT, ['memory'], entries.slice(0, 1)), { project_id: PROJECT, kinds: ['memory'] }))
+    .toString('utf8').includes('shared_from_project_id'));
+  for (const extra of [{ shared_from_project_id: PROJECT, share_id: share }, { shared_from_project_id: OTHER }, { share_id: share },
+    { shared_from_project_id: 'x', share_id: share }, { shared_from_project_id: OTHER, share_id: 'not-a-uuid' }]) {
+    const tampered = [entries[0], note('memory', 'x', 'y', extra)];
+    assert.throws(() => verifySnapshot(snapshotOf(PROJECT, ['memory'], tampered), { project_id: PROJECT, kinds: ['memory'] }), { message: 'INVALID_SNAPSHOT' });
+  }
+  assert.throws(() => verifySnapshot(snapshotOf(PROJECT, ['summary'], [note('summary', 'x', 'y', { shared_from_project_id: OTHER, share_id: share })]),
+    { project_id: PROJECT, kinds: ['summary'] }), { message: 'INVALID_SNAPSHOT' });
+});
+
 test('snapshots that do not verify, widen kinds or come from another project are never rendered', async (t) => {
   const f = await fixture(t);
   const cases = [
