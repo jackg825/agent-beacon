@@ -6,6 +6,11 @@ import { extractiveGenerator, Generator } from '../src/generator';
 import worker from '../src/index';
 import { runMaintenance } from '../src/maintenance';
 import { processingMaintenance, processingRead, processingTick } from '../src/processing';
+import { effectivePolicy, EffectivePolicy } from '../src/processing-policy';
+import { makeScope } from '../src/processing-planner';
+import type { StageResult } from '../src/processing-stage';
+import type { ProjectedEvent } from '../src/privacy';
+import { jevStage } from '../src/jev';
 import { Env } from '../src/types';
 import { createEnvFixture, syntheticEvent } from './env-fixture';
 import { command, count, job, jobs, newTask, review, reviewer, run, setBudget, setPolicy, tick, workspace } from './processing-helpers';
@@ -42,7 +47,7 @@ async function approvedNote(f: Fixture, eventId: string, title: string, content:
 const read = async (env: Env, path: string) => (await processingRead(new Request('http://localhost' + path), env))!.json() as Promise<any>;
 const hasAny = (value: unknown, needles: string[]) => needles.filter((needle) => JSON.stringify(value).includes(needle));
 
-test('an external call is impossible unless the deploy gate, policy, key, endpoint and a reservation all allow it', async () => {
+test('end to end, a tick calls Jev only when every condition holds, also after a policy is revoked and restored', async () => {
   const f = await createEnvFixture();
   try {
     await setPolicy(f.env, workspace, external);
@@ -70,21 +75,13 @@ test('an external call is impossible unless the deploy gate, policy, key, endpoi
     };
     // Every condition holds except a budget: the reservation is refused and nothing is sent.
     await blocked('no-budget', gated(f.env), undefined, 'jev_budget:budget_disabled');
-    await setBudget(f.env, { daily_call_limit: 50 });
+    await setBudget(f.env, { daily_call_limit: 2 });
     const allowed = await scenario('allowed', gated(f.env));
     assert.deepEqual([allowed.fetched, allowed.calls, allowed.row.status, allowed.row.note], [1, 1, 'succeeded', null]);
     assert.deepEqual(Object.keys(jev.calls[0].body.questions), ['task_related']);
     assert.equal(jev.calls[0].body.state.scope.task_title, '合成任務 allowed');
-    await blocked('no-deploy-var', gated(f.env, { EXTERNAL_PROCESSING_PROJECTS: undefined }));
-    await blocked('other-project-listed', gated(f.env, { EXTERNAL_PROCESSING_PROJECTS: 'f'.repeat(64) }));
+    // A project row narrowing the workspace is read from D1 at run time.
     await blocked('project-external-off', gated(f.env), { external_allowed: false });
-    await blocked('project-jev-off', gated(f.env), { jev_enabled: false });
-    await blocked('no-key', gated(f.env, { JEV_API_KEY: undefined }));
-    await blocked('insecure-endpoint', gated(f.env, { JEV_ENDPOINT: 'http://jev.example.invalid/v1/systemone' }));
-    await blocked('nothing-to-ask', gated(f.env), { external_fields: [] });
-    await setPolicy(f.env, workspace, { ...external, external_allowed: false });
-    await blocked('workspace-external-off', gated(f.env));
-    await setPolicy(f.env, workspace, external);
     // Revoked between planning and running: the job ends policy_changed before any call;
     // restoring the identical policy re-queues the same job, which then may call.
     await f.ingest(command('revoked-1', 'npm test', 0, { repo: 'revoked', session: 'revoked-session' }));
@@ -99,15 +96,68 @@ test('an external call is impossible unless the deploy gate, policy, key, endpoi
     await tick(gated(f.env), new Date(clock.getTime() + 120_000), { fetcher: jev.fetcher });
     assert.deepEqual([jev.calls.length - before, (await job(f.env, revoked.job_id)).status], [1, 'succeeded']);
     clock = new Date(clock.getTime() + 180_000);
-    await setBudget(f.env, { daily_call_limit: 0 });
-    await blocked('budget-zero', gated(f.env), undefined, 'jev_budget:budget_disabled');
     // Two calls already counted today: a limit of two refuses the third reservation.
-    await setBudget(f.env, { daily_call_limit: 2 });
     await blocked('day-exhausted', gated(f.env), undefined, 'jev_budget:daily_call_limit');
-    await setBudget(f.env, { daily_call_limit: 50, daily_token_limit: 100 });
-    await blocked('tokens-exhausted', gated(f.env), undefined, 'jev_budget:daily_token_limit');
     assert.equal(jev.calls.length, 2);
     assert.equal(await count(f.env, 'processing_calls'), 2);
+  } finally { await f.close(); }
+});
+
+test('each gate condition alone keeps the stage from reserving budget or sending anything', async () => {
+  const f = await createEnvFixture();
+  try {
+    const fields = { summary_fields: ['command_text', 'titles', 'approved_note_text'], external_fields: ['titles', 'approved_note_text'] };
+    await setPolicy(f.env, workspace, { ...external, ...fields });
+    await setBudget(f.env, { daily_call_limit: 50 });
+    await f.ingest(command('gate-1', 'npm test', 1, { repo: 'gate', session: 'gate-session' }));
+    const event = (await f.event('gate-1'))!;
+    const taskId = await newTask(f.env, '合成任務 gate', [event.session_id]);
+    const planned = (await run(f.env, { task_id: taskId })).scopes[0];
+    const now = noon();
+    await f.env.DB.prepare(`UPDATE processing_jobs SET status='running',attempts=1,lease_owner='gate-owner',lease_until=? WHERE id=?`)
+      .bind(new Date(now.getTime() + 600_000).toISOString(), planned.job_id).run();
+    const allowed = await effectivePolicy(f.env, event.project_id);
+    const scope = await makeScope('task', taskId, event.project_id);
+    const jev = fakeJev();
+    const projection: ProjectedEvent[] = [{ action: 'command.executed', kind: 'agent_runtime', timestamp: '2026-10-07T08:00:00.000Z',
+      harness: 'codex_cli', exit_code: 1, command_text: 'npm test' }];
+    const attempt = (env: Env, options: { policy?: Partial<EffectivePolicy>; owner?: string; remaining?: number; taskTitle?: string | null } = {}) =>
+      jevStage({ env, ctx: { now, remaining: () => options.remaining ?? 20_000, usage: () => ({ d1: 0, r2: 0, fetch: 0 }), fetch: jev.fetcher },
+        job_id: planned.job_id, attempt: 1, lease_owner: options.owner ?? 'gate-owner', scope, policy: { ...allowed, ...options.policy }, projection,
+        labels: { task_title: options.taskTitle === undefined ? '合成任務 gate' : options.taskTitle, project_name: 'gate' } });
+    const expectBlocked = async (name: string, result: Promise<StageResult>, note?: string) => {
+      assert.deepEqual(await result, { decision: 'continue', signals: [], ...(note ? { note } : {}) }, name);
+      assert.deepEqual([jev.calls.length, await count(f.env, 'processing_calls')], [0, 0], name);
+    };
+    await expectBlocked('no deploy var', attempt(gated(f.env, { EXTERNAL_PROCESSING_PROJECTS: undefined })));
+    await expectBlocked('another project listed', attempt(gated(f.env, { EXTERNAL_PROCESSING_PROJECTS: 'f'.repeat(64) })));
+    await expectBlocked('no key', attempt(gated(f.env, { JEV_API_KEY: undefined })));
+    await expectBlocked('empty key', attempt(gated(f.env, { JEV_API_KEY: '' })));
+    await expectBlocked('insecure endpoint', attempt(gated(f.env, { JEV_ENDPOINT: 'http://jev.example.invalid/v1/systemone' })));
+    await expectBlocked('endpoint on this Worker', attempt(gated(f.env, { PUBLIC_URL: 'https://beacon.example.invalid',
+      JEV_ENDPOINT: 'https://beacon.example.invalid/api/jev' })));
+    await expectBlocked('invalid model', attempt(gated(f.env, { JEV_MODEL: 'jev latest' })));
+    await expectBlocked('external not allowed', attempt(gated(f.env), { policy: { external_allowed: false } }));
+    await expectBlocked('jev not enabled', attempt(gated(f.env), { policy: { jev_enabled: false } }));
+    await expectBlocked('processing disabled', attempt(gated(f.env), { policy: { enabled: false } }));
+    await expectBlocked('no external fields', attempt(gated(f.env), { policy: { external_fields: [] } }));
+    // Titles alone need a task title; note text alone needs at least one approved note.
+    await expectBlocked('titles without a task title', attempt(gated(f.env), { policy: { external_fields: ['titles'] }, taskTitle: null }));
+    await expectBlocked('note text without notes', attempt(gated(f.env), { policy: { external_fields: ['approved_note_text'] } }));
+    await expectBlocked('no time left', attempt(gated(f.env), { remaining: 2500 }), 'jev_no_time');
+    await expectBlocked('lease held elsewhere', attempt(gated(f.env), { owner: 'other-owner' }), 'jev_budget:lease_lost');
+    for (const [name, limits, note] of [['zero calls', { daily_call_limit: 0 }, 'jev_budget:budget_disabled'],
+      ['zero tokens', { daily_token_limit: 0 }, 'jev_budget:budget_disabled'], ['token limit below one call', { daily_token_limit: 100 }, 'jev_budget:daily_token_limit'],
+      ['zero USD ceiling', { daily_usd_ceiling: 0 }, 'jev_budget:usd_ceiling']] as const) {
+      await setBudget(f.env, { daily_call_limit: 50, ...limits });
+      await expectBlocked(name, attempt(gated(f.env)), note);
+    }
+    // With every condition met, exactly one request goes out; the job never sends a second.
+    await setBudget(f.env, { daily_call_limit: 50 });
+    assert.deepEqual(await attempt(gated(f.env)), { decision: 'continue', signals: [] });
+    assert.deepEqual(Object.keys(jev.calls[0].body.questions), ['task_related']);
+    assert.deepEqual(await attempt(gated(f.env)), { decision: 'continue', signals: [] });
+    assert.deepEqual([jev.calls.length, await count(f.env, 'processing_calls'), await count(f.env, 'processing_signals')], [1, 1, 1]);
   } finally { await f.close(); }
 });
 
