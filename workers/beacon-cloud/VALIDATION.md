@@ -13,14 +13,15 @@ were used. No installed Beacon logs, collector settings or transcripts were read
 | Check | Current result |
 | --- | --- |
 | `npm run check` | TypeScript passes |
-| `npm test` | **141/141 pass** (105 top-level tests, 36 subtests), zero skipped or cancelled, in two consecutive runs; no intermittent Miniflare `fetch failed` occurred. Phase 2 accounts for 55 top-level tests (privacy, policy, planner/jobs, output, budget, Jev, maintenance and bundled-Worker suites) |
+| `npm test` | **154/154 pass** (118 top-level tests, 36 subtests), zero skipped or cancelled, in two consecutive runs after the review fixes. Phase 2 accounts for 68 top-level tests (privacy, policy, planner/jobs, output, budget, Jev, maintenance and bundled-Worker suites) |
 | Labelled acceptance scenario | `test/processing-output.test.ts`: one synthetic two-Mac task, 7 events → 7 persisted sources; **5/5 labelled items** (failure, fix, approval decision, verification, open lint risk) cited under their expected headings; 6 distinct citations in 511 characters; a fake Jev was asked 4 questions and stored 4 uncalibrated signals; the only contradiction ≥ 0.5 landed on the task note it was about; both notes stayed approved and the candidate stayed pending |
 | `npm run test:workflow-browser` | **2/2 pass** against the actual Worker/D1/R2: the 0.2 workflow, plus a new 背景整理 run — save refused without the reviewer key; workspace policy saved (version 1, `reviewer:` actor); project scope planned (4 sources, queued); Miniflare `scheduled()` frequent tick ran it (`succeeded`, 4 covered, usage D1 33 / R2 7 / fetch 0); the job opens its pending candidate labelled 「自動整理・待審」 (`origin:pipeline`, actor `pipeline:beacon.extractive@1`) while default recall stays empty; 1280/375 px with no horizontal overflow, no page errors and empty browser storage |
 | `npm run test:browser` | **2/2 pass** against the deterministic fixtures |
 | `npm run test:collector` | **1/1 passes** with `GOPROXY=off` (cached modules, no download): shipping hook → JSONL → forwarder → Worker → D1/R2 → query after restart |
 | Official MCP clients | Current and legacy clients discover **15 read-only tools**; the server reports `0.3.0` and its instructions say pending pipeline candidates and uncalibrated evaluator scores are not approved knowledge |
 | Local D1 migrations | `WRANGLER_WRITE_LOGS=false npx wrangler d1 migrations apply agent-beacon-cloud-db --local --persist-to <fresh temp dir>` applies `0001`–`0004` with **14/18/23/59 statements**; Worker fixtures also upgrade a populated `0001` database through `0004` |
-| `npm run deploy:dry-run` | Passes; Worker **1491.32 KiB / gzip 281.76 KiB** (0.2: 1358.20 / 245.39), direct `DB`/`RAW` bindings; no upload |
+| `npm run deploy:dry-run` | Passes; Worker **1494.46 KiB / gzip 282.60 KiB** (0.2: 1358.20 / 245.39), direct `DB`/`RAW` bindings; no upload |
+| Independent review | Six review dimensions with two adversarial verifiers per finding; 9 confirmed and 6 disputed findings were all fixed with tests (PEM/PGP blocks behind a key label, Windows paths in JSON text, cross-part Jev redaction, CJK punctuation after a secret, retry schedule, Jev timeout never shortened, a planner cursor race between overlapping ticks, and missing tests for lease fences, raw caps and stored-signal reuse) |
 
 The suites exercise: inert defaults (no `MAINTENANCE_TASKS` → nothing runs; no
 workspace policy → open tasks plan nothing and `run` returns 409); ingest still
