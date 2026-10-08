@@ -26,6 +26,8 @@ export interface BackupLimits {
   objectMaxBytes: number;
   rawListPage: number;
   rawCopyPerTick: number;
+  /** Raw sources recorded as missing that one tick looks for again. */
+  missingRetryPerTick: number;
   pruneBatch: number;
   /** R2 reads/heads the integrity pass may spend per tick. */
   integrityPerTick: number;
@@ -36,7 +38,8 @@ export interface BackupLimits {
 }
 export const BACKUP_LIMITS: BackupLimits = {
   allotment: BACKUP_ALLOTMENT, chunkBatches: 100, tailBatches: 200, finalMaxRows: 60_000, finalMaxBytes: 24 * 1024 * 1024, objectMaxBytes: 4 * 1024 * 1024,
-  rawListPage: 5000, rawCopyPerTick: 500, pruneBatch: 200, integrityPerTick: 1500, maxSteps: 1000, leaseMs: 20 * 60_000,
+  rawListPage: 5000, rawCopyPerTick: 500, missingRetryPerTick: 50, pruneBatch: 200, integrityPerTick: 1500, maxSteps: 1000,
+  leaseMs: 20 * 60_000,
   settleMs: SETTLE_MS,
 };
 
@@ -81,9 +84,43 @@ function line(table: string, row: Row): string {
 
 // ---- raw copies -----------------------------------------------------------------
 
+type Copy = { batch_id: string; r2_key: string; batch_received_at: string; first_checkpoint_id: string | null; status: 'copied' | 'source_missing';
+  size: number | null; sha256: string | null };
+
+/**
+ * Statements that record copies. A row is rewritten when the copy is new, when its source was
+ * missing before, or when a forwarder replay brought a retention-deleted batch back and it was
+ * copied again; in that last case the earlier copy's listing attributes go to
+ * backup_raw_generations first, so checkpoints that listed it keep their membership.
+ */
+function recordCopies(env: Env, copies: Copy[], now: string): D1PreparedStatement[] {
+  const replayed = `backup_raw_objects.status='copied' AND EXISTS(SELECT 1 FROM retention_run_objects r WHERE r.batch_id=backup_raw_objects.batch_id
+    AND r.created_at>=backup_raw_objects.copied_at)`;
+  return jsonChunks(copies).flatMap(chunk => [
+    env.DB.prepare(`INSERT INTO backup_raw_generations(batch_id,copied_at,batch_received_at,superseded_at)
+      SELECT backup_raw_objects.batch_id,backup_raw_objects.copied_at,backup_raw_objects.batch_received_at,? FROM backup_raw_objects
+      WHERE backup_raw_objects.batch_id IN (SELECT json_extract(value,'$.batch_id') FROM json_each(?) WHERE json_extract(value,'$.status')='copied')
+      AND ${replayed} ON CONFLICT DO NOTHING`).bind(now, chunk),
+    env.DB.prepare(`INSERT INTO backup_raw_objects(batch_id,r2_key,batch_received_at,status,size,sha256,copied_at,first_checkpoint_id,checked_at)
+      SELECT json_extract(value,'$.batch_id'),json_extract(value,'$.r2_key'),json_extract(value,'$.batch_received_at'),json_extract(value,'$.status'),
+      json_extract(value,'$.size'),json_extract(value,'$.sha256'),?,json_extract(value,'$.first_checkpoint_id'),? FROM json_each(?) WHERE true
+      ON CONFLICT(batch_id) DO UPDATE SET status=excluded.status,size=excluded.size,sha256=excluded.sha256,batch_received_at=excluded.batch_received_at,
+      copied_at=excluded.copied_at,deleted_at=NULL,verified_at=NULL WHERE excluded.status='copied' AND (backup_raw_objects.status!='copied' OR ${replayed})`)
+      .bind(now, now, chunk),
+  ]);
+}
+
+/** RAW.get → BACKUP.put with the SHA-256 so R2 verifies the bytes; null when the source is gone. */
+async function copyOne(env: Env, r2Key: string): Promise<{ size: number; sha256: string } | null> {
+  const object = await env.RAW.get(r2Key);
+  if (!object) return null;
+  const bytes = new Uint8Array(await object.arrayBuffer());
+  return { size: bytes.byteLength, sha256: await put(env.BACKUP!, rawCopyKey(r2Key), bytes) };
+}
+
 /** Copy settled raw batches not yet tracked in backup_raw_objects (2 R2 calls each). */
 async function copyRaw(env: Env, ctx: MaintenanceContext, limits: BackupLimits, result: Row) {
-  if (!room(ctx, limits.allotment, { d1: 6, r2: 2 })) return;
+  if (!room(ctx, limits.allotment, { d1: 7, r2: 2 })) return;
   const [stateResult, runningResult] = await env.DB.batch([
     env.DB.prepare('SELECT raw_cursor,revision FROM backup_state WHERE id=1'),
     env.DB.prepare("SELECT id FROM backup_checkpoints WHERE status='running' LIMIT 1"),
@@ -98,35 +135,68 @@ async function copyRaw(env: Env, ctx: MaintenanceContext, limits: BackupLimits, 
   const rows = await env.DB.prepare(`SELECT id,r2_key,received_at FROM batches WHERE received_at<? AND ${range.sql}
     ORDER BY received_at,id LIMIT ?`).bind(iso(ctx.now.getTime() - limits.settleMs), ...range.args, limit)
     .all<{ id: string; r2_key: string; received_at: string }>();
-  const copies: Row[] = [];
+  const copies: Copy[] = [];
   let missing = 0;
   for (const row of rows.results) {
-    if (!room(ctx, limits.allotment, { d1: 5, r2: 2 })) break;
-    const object = await env.RAW.get(row.r2_key);
+    if (!room(ctx, limits.allotment, { d1: 6, r2: 2 })) break;
+    const copy = await copyOne(env, row.r2_key);
     const base = { batch_id: row.id, r2_key: row.r2_key, batch_received_at: row.received_at, first_checkpoint_id: running };
-    if (!object) { missing++; copies.push({ ...base, status: 'source_missing', size: null, sha256: null }); continue; }
-    const bytes = new Uint8Array(await object.arrayBuffer());
-    copies.push({ ...base, status: 'copied', size: bytes.byteLength, sha256: await put(env.BACKUP!, rawCopyKey(row.r2_key), bytes) });
+    if (!copy) { missing++; copies.push({ ...base, status: 'source_missing', size: null, sha256: null }); continue; }
+    copies.push({ ...base, status: 'copied', ...copy });
   }
   if (!copies.length) return;
   const now = iso(ctx.now), last = copies.at(-1)!;
-  const statements = jsonChunks(copies).map(chunk => env.DB.prepare(`INSERT INTO backup_raw_objects(batch_id,r2_key,batch_received_at,status,size,sha256,copied_at,first_checkpoint_id)
-    SELECT json_extract(value,'$.batch_id'),json_extract(value,'$.r2_key'),json_extract(value,'$.batch_received_at'),json_extract(value,'$.status'),
-    json_extract(value,'$.size'),json_extract(value,'$.sha256'),?,json_extract(value,'$.first_checkpoint_id') FROM json_each(?) WHERE true
-    ON CONFLICT(batch_id) DO UPDATE SET status=excluded.status,size=excluded.size,sha256=excluded.sha256,batch_received_at=excluded.batch_received_at,
-    copied_at=excluded.copied_at,deleted_at=NULL WHERE excluded.status='copied' AND (backup_raw_objects.status!='copied'
-    OR EXISTS(SELECT 1 FROM retention_run_objects r WHERE r.batch_id=excluded.batch_id AND r.created_at>=backup_raw_objects.copied_at))`).bind(now, chunk));
+  const statements = recordCopies(env, copies, now);
   statements.push(env.DB.prepare('UPDATE backup_state SET raw_cursor=?,revision=revision+1,updated_at=? WHERE id=1 AND revision=?')
     .bind(JSON.stringify([last.batch_received_at, last.batch_id]), now, state.revision));
   const results = await env.DB.batch(statements);
-  // Copies are idempotent; a lost cursor race only means another invocation got further. A batch a
-  // forwarder replay brought back after retention (or whose source reappeared) is recorded as copied again.
+  // Copies are idempotent; a lost cursor race only means another invocation got further.
   result.raw_copied = copies.length - missing;
   result.raw_source_missing = missing;
   if (results.at(-1)!.meta.changes !== 1) result.raw_cursor_conflict = true;
 }
 
+/**
+ * Look again for raw sources that were missing at copy time, longest-unchecked first: a device
+ * may have resent the same batch (same bytes, same key) or an operator restored the object.
+ */
+async function retryMissing(env: Env, ctx: MaintenanceContext, limits: BackupLimits, result: Row) {
+  if (limits.missingRetryPerTick <= 0 || !room(ctx, limits.allotment, { d1: 4, r2: 2 })) return;
+  // NULL sorts first, then the oldest check; only batches that still exist can be copied.
+  const rows = await env.DB.prepare(`SELECT o.batch_id,o.r2_key,b.received_at FROM backup_raw_objects o JOIN batches b ON b.id=o.batch_id
+    WHERE o.status='source_missing' ORDER BY o.checked_at,o.batch_id LIMIT ?`).bind(limits.missingRetryPerTick)
+    .all<{ batch_id: string; r2_key: string; received_at: string }>();
+  const copies: Copy[] = [], still: string[] = [];
+  for (const row of rows.results) {
+    if (!room(ctx, limits.allotment, { d1: 3, r2: 2 })) break;
+    const copy = await copyOne(env, row.r2_key);
+    if (!copy) { still.push(row.batch_id); continue; }
+    copies.push({ batch_id: row.batch_id, r2_key: row.r2_key, batch_received_at: row.received_at, first_checkpoint_id: null, status: 'copied', ...copy });
+  }
+  if (!copies.length && !still.length) return;
+  const now = iso(ctx.now);
+  await env.DB.batch([...recordCopies(env, copies, now), ...jsonChunks(still).map(chunk => env.DB.prepare(`UPDATE backup_raw_objects SET checked_at=?
+    WHERE status='source_missing' AND batch_id IN (SELECT value FROM json_each(?))`).bind(now, chunk))]);
+  result.raw_missing_recovered = copies.length;
+  result.raw_missing_checked = copies.length + still.length;
+}
+
 // ---- retention follow-up ----------------------------------------------------------
+
+/**
+ * Whether a checkpoint listed the copy of backup_raw_objects row `o`, decided from the current
+ * row and every earlier generation a re-copy replaced. `through`, `listed` and `started` are SQL
+ * expressions for the checkpoint's batches_through, raw_listed_at and started_at (columns or `?`).
+ * A generation is listed when it was copied before the listing and no retention run deleted its
+ * batch between that copy and the checkpoint's start (apply is refused while a checkpoint runs).
+ */
+function listedBy(through: string, listed: string, started: string): string {
+  const notDeleted = (copied: string) => `NOT EXISTS(SELECT 1 FROM retention_run_objects r WHERE r.batch_id=o.batch_id
+    AND r.created_at<${started} AND r.created_at>=${copied})`;
+  return `((o.batch_received_at<=${through} AND o.copied_at<=${listed} AND ${notDeleted('o.copied_at')})
+    OR EXISTS(SELECT 1 FROM backup_raw_generations g WHERE g.batch_id=o.batch_id AND g.batch_received_at<=${through} AND g.copied_at<=${listed}
+      AND ${notDeleted('g.copied_at')}))`;
+}
 
 /** Retry RAW deletes that failed during retention apply and drop BACKUP copies after the grace period. */
 async function pruneRetained(env: Env, ctx: MaintenanceContext, limits: BackupLimits, result: Row) {
@@ -145,22 +215,29 @@ async function pruneRetained(env: Env, ctx: MaintenanceContext, limits: BackupLi
       result.raw_deletes_retried = pending.results.length;
     }
   }
-  if (room(ctx, limits.allotment, { d1: 4, r2: 1 })) {
-    const due = await env.DB.prepare(`SELECT r.run_id,r.batch_id,r.r2_key,r.created_at FROM retention_run_objects r
-      WHERE r.backup_deleted_at IS NULL AND r.backup_delete_after<=? AND ${live} ORDER BY r.backup_delete_after,r.run_id,r.batch_id LIMIT ?`)
-      .bind(now, limits.pruneBatch).all<{ run_id: string; batch_id: string; r2_key: string; created_at: string }>();
+  if (room(ctx, limits.allotment, { d1: 5, r2: 1 })) {
+    // Only the newest run of a batch decides when its shared BACKUP copy goes: a replayed batch
+    // deleted again by a later run keeps its copy until that run's own grace period ends.
+    const due = await env.DB.prepare(`SELECT r.run_id,r.batch_id,r.r2_key FROM retention_run_objects r
+      WHERE r.backup_deleted_at IS NULL AND r.backup_delete_after<=? AND ${live}
+      AND NOT EXISTS(SELECT 1 FROM retention_run_objects n WHERE n.batch_id=r.batch_id
+        AND (n.created_at>r.created_at OR (n.created_at=r.created_at AND n.run_id>r.run_id)))
+      ORDER BY r.backup_delete_after,r.run_id,r.batch_id LIMIT ?`)
+      .bind(now, limits.pruneBatch).all<{ run_id: string; batch_id: string; r2_key: string }>();
     if (due.results.length) {
       await env.BACKUP!.delete(due.results.map(row => rawCopyKey(row.r2_key)));
-      const pairs = JSON.stringify(due.results.map(row => row.run_id + '/' + row.batch_id));
-      const newest = due.results.reduce((value, row) => row.created_at > value ? row.created_at : value, '');
+      const batches = JSON.stringify(due.results.map(row => row.batch_id));
       await env.DB.batch([
-        env.DB.prepare(`UPDATE retention_run_objects SET backup_deleted_at=? WHERE backup_deleted_at IS NULL
-          AND run_id||'/'||batch_id IN (SELECT value FROM json_each(?))`).bind(now, pairs),
-        env.DB.prepare(`UPDATE backup_raw_objects SET status='deleted',deleted_at=? WHERE status!='deleted'
-          AND batch_id IN (SELECT value FROM json_each(?))`).bind(now, JSON.stringify(due.results.map(row => row.batch_id))),
-        // Checkpoints started before the run listed these copies; they can no longer restore those rows' raw lines.
+        // Every checkpoint that listed one of these copies (in any generation) can no longer restore its raw lines.
         env.DB.prepare(`UPDATE backup_checkpoints SET raw_pruned_at=?,updated_at=? WHERE raw_pruned_at IS NULL AND status!='expired'
-          AND started_at<=?`).bind(now, now, newest),
+          AND raw_listed_at IS NOT NULL AND batches_through IS NOT NULL AND EXISTS(SELECT 1 FROM backup_raw_objects o
+          WHERE o.batch_id IN (SELECT value FROM json_each(?)) AND ${listedBy('backup_checkpoints.batches_through', 'backup_checkpoints.raw_listed_at',
+            'backup_checkpoints.started_at')})`).bind(now, now, batches),
+        // The copy is gone for every run of the batch, including runs a later one superseded.
+        env.DB.prepare(`UPDATE retention_run_objects SET backup_deleted_at=? WHERE backup_deleted_at IS NULL
+          AND batch_id IN (SELECT value FROM json_each(?))`).bind(now, batches),
+        env.DB.prepare(`UPDATE backup_raw_objects SET status='deleted',deleted_at=?,verified_at=NULL WHERE status!='deleted'
+          AND batch_id IN (SELECT value FROM json_each(?))`).bind(now, batches),
       ]);
       result.backup_copies_deleted = due.results.length;
     }
@@ -465,9 +542,13 @@ export function createBackupTask(overrides: Partial<BackupLimits> = {}): Mainten
     name: 'backup', schedule: 'hourly', allotment: limits.allotment,
     async run(env, ctx) {
       if (!env.BACKUP) throw new MaintenanceError('backup_not_configured');
+      // Code deployed before migration 0008 was applied: report it rather than a generic failure.
+      if (!await env.DB.prepare("SELECT 1 AS present FROM sqlite_master WHERE type='table' AND name='backup_raw_generations'").first())
+        throw new MaintenanceError('backup_schema_missing');
       const result: Row = {};
       await pruneRetained(env, ctx, limits, result);
       await copyRaw(env, ctx, limits, result);
+      await retryMissing(env, ctx, limits, result);
       await advanceCheckpoint(env, ctx, limits, result);
       await checkIntegrity(env, ctx, limits, result);
       return result;
@@ -508,8 +589,11 @@ async function isMember(env: Env, cp: Checkpoint, key: string): Promise<boolean>
     return !!await env.DB.prepare('SELECT 1 AS member FROM backup_chunks WHERE checkpoint_id=? AND key=?').bind(cp.id, key).first();
   if (key.startsWith('raw/') && RAW_KEY.test(key.slice(4))) {
     if (!cp.raw_listed_at || !cp.batches_through) return false;
-    return !!await env.DB.prepare(`SELECT 1 AS member FROM backup_raw_objects o WHERE o.r2_key=? AND ${RAW_LISTED}`)
-      .bind(key.slice(4), cp.batches_through, cp.raw_listed_at, cp.started_at).first();
+    // Decided from every generation of the copy: a replayed batch copied again after this
+    // checkpoint listed it is still a member, while its object exists.
+    return !!await env.DB.prepare(`SELECT 1 AS member FROM backup_raw_objects o WHERE o.r2_key=? AND o.status='copied' AND ${listedBy('?', '?', '?')}`)
+      .bind(key.slice(4), cp.batches_through, cp.raw_listed_at, cp.started_at, cp.batches_through, cp.raw_listed_at, cp.started_at)
+      .first();
   }
   throw new HttpError(400, 'Invalid backup object key');
 }

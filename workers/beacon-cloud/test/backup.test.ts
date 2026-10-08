@@ -8,13 +8,14 @@ import { chmod, mkdir, mkdtemp, readdir, rm, stat, symlink, writeFile } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BACKUP_BOOKKEEPING } from '../src/operations-shared';
-import { BACKUP_ALLOTMENT, Manifest, backupTask, backupsReviewerRead, backupsWrite, createBackupTask, expireCheckpoint } from '../src/backup';
+import { BACKUP_ALLOTMENT, Checkpoint, Manifest, backupTask, backupsReviewerRead, backupsWrite, createBackupTask, expireCheckpoint } from '../src/backup';
 import { revisionsWrite } from '../src/context-revisions';
+import { dataHealth } from '../src/health';
 import { runMaintenance } from '../src/maintenance';
 import { Env } from '../src/types';
 import { RestoreError, bucketSource, dirSource, httpSource, parseArgs, readReviewToken, reportSha256, restoreCheck, runCli, verifyRequest, workerUrl }
   from '../scripts/restore-check';
-import { createEnvFixture, syntheticEvent } from './env-fixture';
+import { createEnvFixture, migrationsExcept, syntheticEvent } from './env-fixture';
 import { addTrackMigration, backupTick, completeCheckpoint, createContext, drill, get, later, latestCheckpoint, operationsTokens, operationsWorker, post,
   reviewer, verifiedCheckpoint } from './operations-fixture';
 
@@ -77,6 +78,16 @@ test('backup stays inert until the BACKUP binding and the operator opt-in both e
     const refused = backupsWrite(post('/api/backups/run', {}), bare.env, reviewer);
     await assert.rejects(refused, (error: any) => error.status === 409);
   } finally { await bare.close(); await bound.close(); }
+});
+
+test('backup reports a database without migration 0008 by code', async () => {
+  const fixture = await createEnvFixture({ backup: true, migrations: await migrationsExcept('0008', '0009') });
+  try {
+    await fixture.ingest([syntheticEvent('schema-1')]);
+    const report = await runMaintenance({ ...fixture.env, MAINTENANCE_TASKS: 'backup' } as Env, { tasks: [backupTask], now: later(20) });
+    assert.equal(report.backup.error, 'backup_schema_missing');
+    assert.equal((await fixture.env.BACKUP!.list()).objects.length, 0);
+  } finally { await fixture.close(); }
 });
 
 test('a checkpoint chunks rows, snapshots every other table, copies raw batches, passes integrity and restores', async (t) => {
@@ -245,6 +256,35 @@ test('restore check reports drift, missing raw sources and tampering without tru
       assert.equal(after.integrity_error, 'raw_mismatch');
       assert.equal(after.integrity_verified_at, null);
     });
+  } finally { await fixture.close(); }
+});
+
+test('a raw source missing at copy time is copied once it reappears, so the next checkpoint restores it', async () => {
+  const fixture = await createEnvFixture({ backup: true });
+  try {
+    const env = fixture.env, start = later(15).getTime(), day = (n: number) => new Date(start + n * 25 * 3600_000);
+    await fixture.ingest([syntheticEvent('kept-1', { session: 'kept' })]);
+    const record = syntheticEvent('lost-1', { session: 'lost' }), lost = await fixture.ingest([record]);
+    const key = (await env.DB.prepare('SELECT r2_key FROM batches WHERE id=?').bind(lost.batch_id).first<{ r2_key: string }>())!.r2_key;
+    await env.RAW.delete(key);
+    const first = await completeCheckpoint(env, day(0));
+    const status = async () => (await env.DB.prepare('SELECT status,checked_at FROM backup_raw_objects WHERE batch_id=?').bind(lost.batch_id).first<any>());
+    assert.equal((await status()).status, 'source_missing');
+    assert.deepEqual((await drill(env, first)).failures, [{ code: 'raw_not_in_manifest', count: 1 }]);
+    assert.ok((await dataHealth(env)).findings.some(item => item.code === 'backup_raw_source_missing'));
+    // While the source is still gone each tick looks again and records when.
+    const looked = await backupTick(env, day(0));
+    assert.deepEqual([(looked.result as any).raw_missing_checked, (looked.result as any).raw_missing_recovered], [1, 0]);
+    assert.equal((await status()).checked_at, day(0).toISOString());
+    // The device resends the same batch: the same bytes restore the same key, and the index is unchanged.
+    const resent = await fixture.ingest([record]);
+    assert.deepEqual([resent.batch_id, resent.duplicate], [lost.batch_id, true]);
+    const second = await completeCheckpoint(env, day(1));
+    assert.equal((await status()).status, 'copied');
+    assert.equal(second.raw_object_count, 2);
+    const report = await drill(env, second);
+    assert.equal(report.result, 'passed', JSON.stringify(report.failures));
+    assert.ok(!(await dataHealth(env)).findings.some(item => item.code === 'backup_raw_source_missing'));
   } finally { await fixture.close(); }
 });
 

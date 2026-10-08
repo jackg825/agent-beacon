@@ -72,7 +72,7 @@ D1 用量的量級：`health` 每小時最多讀 50 頁 R2 清單（每頁最多
 
 ### 一個 checkpoint 包含什麼
 
-1. **原文複本**：每個已穩定（收到超過 10 分鐘）的批次只複製一次到 `BACKUP` 的 `raw/<原本的 key>`，寫入時附上 SHA-256 讓 R2 驗證；複製紀錄在 D1 `backup_raw_objects`，所有 checkpoint 共用。
+1. **原文複本**：每個已穩定（收到超過 10 分鐘）的批次只複製一次到 `BACKUP` 的 `raw/<原本的 key>`，寫入時附上 SHA-256 讓 R2 驗證；複製紀錄在 D1 `backup_raw_objects`，所有 checkpoint 共用。複製時找不到原文的批次記為 `source_missing`，之後每次排程依「最久沒檢查」的順序再找最多 50 個；裝置重送同一批次（內容相同、key 相同）或原文被放回後，就會補上複本，下一個 checkpoint 便能完整還原。
 2. **分塊匯出**：`batches`、`events`、`event_versions` 依（收到時間, ID）順序，每輪 100 個批次連同它們自己的事件與版本，寫成 `checkpoints/<id>/d1/<序號>.ndjson`。位置以 compare-and-swap 推進，checkpoint 有租約，重疊的排程不會重複寫。
 3. **最終快照**：剩下不到一整輪時，在**同一個 D1 transaction** 裡讀取尾端批次，以及 `sqlite_master` 列出的其他所有 table（排除 `_cf_%`、`sqlite_%`、`d1_migrations`），所以備份滿足外鍵封閉，其他階段新增的 table 自動包含在內。備份自身的帳務 table（`backup_*`、`health_state`）不放進快照，它們描述的是 BACKUP 本身。
 4. **原文清單**：原文複製追上這次匯出的所有批次後，寫出這個 checkpoint 涵蓋的原文清單 `checkpoints/<id>/raw/<序號>.ndjson`。
@@ -97,7 +97,7 @@ POST /api/backups/REPLACE_WITH_CHECKPOINT_UUID/verify  （restore-check 輸出�
 POST /api/backups/REPLACE_WITH_CHECKPOINT_UUID/expire  {}
 ```
 
-- `object` 只提供該 checkpoint manifest 確實列出的 key（manifest、分塊、清單中的原文複本），一律以 `application/octet-stream` 和 `Content-Disposition: attachment` 回傳。
+- `object` 只提供該 checkpoint manifest 確實列出的 key（manifest、分塊、清單中的原文複本），一律以 `application/octet-stream` 和 `Content-Disposition: attachment` 回傳。被 forwarder 重送回來、又重新複製的批次，較早的 checkpoint 仍以它當時列出的那一份複本判斷成員資格，所以寬限期內仍能演練。
 - `run` 只建立 checkpoint，實際工作仍由每小時的 `backup` 任務推進；沒有啟用任務時，它會停在「進行中」。同時只能有一個進行中的 checkpoint。
 - `verify` 記錄還原演練結果。伺服器只能比對回報的列數與 manifest 是否一致；**「已驗證」是審閱者對演練的證明，不是伺服器能檢查的證據**。
 - `expire` 刪除該 checkpoint 的資料庫匯出檔並標記為到期（不可復原）。它拒絕最新的已驗證 checkpoint，以及寬限期內有保存期限執行依靠的 checkpoint。原文複本由所有 checkpoint 共用，不因到期而刪除。
@@ -160,9 +160,9 @@ POST /api/retention/apply      （plan 回傳的 data_class、generated_at、cut
 ### 原文實際保存多久
 
 - 主要 R2 的原文在套用時刪除；BACKUP 中的複本再保留 `BACKUP_RETENTION_GRACE_DAYS`，之後由 `backup` 任務刪除並記錄。**原文最長保存期間是 `keep_days` 加上寬限天數。**
-- 刪除複本時，在該次保存期限之前開始的 checkpoint 會標記 `raw_pruned_at`：它們不再能完整還原那些批次，也不再能作為保存期限的依據。這些舊 checkpoint 的資料庫匯出檔仍含有被刪批次的索引列（不含原文），請用 `expire` 讓它們到期。
+- 刪除複本時，凡是原文清單列過這個複本的 checkpoint（包括批次被重送、重新複製之前那一份）都會標記 `raw_pruned_at`：它們不再能完整還原那些批次，也不再能作為保存期限的依據。這些舊 checkpoint 的資料庫匯出檔仍含有被刪批次的索引列（不含原文），請用 `expire` 讓它們到期。
 - Cloudflare D1 Time Travel 本身也保留一段時間的歷史，不受這裡的設定控制。
-- **forwarder 重送仍保留在 Mac 本機的紀錄時，會把已刪除的批次重新上傳回來**（批次內容相同時會得到相同的批次 ID）。ingest 刻意不讀保存期限的資料，因此不會拒收。資料健康會把同時出現在 `batches` 與刪除紀錄中的批次回報為 `resurrected_batch`；它的原文與備份複本不會被重試刪除。需要時重新產生並套用計畫，並調整本機保留或 forwarder 的起點。
+- **forwarder 重送仍保留在 Mac 本機的紀錄時，會把已刪除的批次重新上傳回來**（批次內容相同時會得到相同的批次 ID）。ingest 刻意不讀保存期限的資料，因此不會拒收。資料健康會把同時出現在 `batches` 與刪除紀錄中的批次回報為 `resurrected_batch`；它的原文與備份複本不會被重試刪除，`backup` 任務也會把它重新複製一次。需要時重新產生並套用計畫，並調整本機保留或 forwarder 的起點。再次刪除時，BACKUP 複本只依**最新一次**刪除的寬限期移除，較早那次刪除的期限不再作數。
 
 ## 回復與限制
 

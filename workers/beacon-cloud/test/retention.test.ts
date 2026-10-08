@@ -15,6 +15,7 @@ import { Env, HttpError } from '../src/types';
 import { httpSource, restoreCheck, verifyRequest } from '../scripts/restore-check';
 import { createEnvFixture, migrationsExcept, syntheticEvent } from './env-fixture';
 import { revisionsWrite } from '../src/context-revisions';
+import { backupsReviewerRead } from '../src/backup';
 import { backupTick, completeCheckpoint, createContext, drill, get, later, latestCheckpoint, operationsTokens,
   operationsWorker, post, reviewer, verifiedCheckpoint } from './operations-fixture';
 import { job, setPolicy as setProcessingPolicy, staged, workspace } from './processing-helpers';
@@ -234,6 +235,54 @@ test('failed RAW deletes are retried, BACKUP copies leave after grace and resurr
       'a checkpoint started after the run never listed the deleted copy');
     const { checkpointView } = await import('../src/backup');
     assert.equal(checkpointView(first).retention_ready, false);
+  } finally { await fixture.close(); }
+});
+
+test('a replayed batch deleted again keeps its BACKUP copy until the later run\'s grace ends, and older manifests still serve it', async () => {
+  const fixture = await createEnvFixture({ backup: true });
+  try {
+    const env = fixture.env;
+    const record = syntheticEvent('again-1', { session: 'again' });
+    await fixture.ingest([record]);
+    await fixture.ingest([syntheticEvent('again-other', { session: 'again-other' })]);
+    const key = 'raw/' + (await batchOf(env, 'again-1')).r2_key;
+    const first = (await verifiedCheckpoint(env, later(15))).checkpoint;
+    await setPolicy(env, 'raw', 1);
+    const t1 = later(2 * 24 * 60);
+    const apply = async (now: Date) => {
+      const plan = (await retentionPlan(env, { now })).plan!;
+      const response = await applyRetention(env, applyBody(plan), reviewer, now);
+      assert.equal(response.status, 201, await response.clone().text());
+      return (await response.json() as any).run;
+    };
+    const r1 = await apply(t1);
+    // A forwarder replay brings the batch back during the grace period and the next tick copies it again.
+    await fixture.ingest([record]);
+    await backupTick(env, new Date(t1.getTime() + DAY));
+    // The checkpoint the first run relied on still lists that copy; the object route keeps serving it.
+    const objectPath = get(`/api/backups/${first.id}/object?` + new URLSearchParams({ key }));
+    assert.equal((await backupsReviewerRead(objectPath, env, reviewer))!.status, 200);
+    // A later checkpoint lists the replayed copy, is attested, and a second run deletes the batch again
+    // after the first run's grace period has already ended.
+    const t3 = new Date(Date.parse(r1.backup_delete_after) + 2 * DAY);
+    const second = (await verifiedCheckpoint(env, t3)).checkpoint;
+    const t4 = new Date(t3.getTime() + 60_000), r2 = await apply(t4);
+    assert.equal(r2.checkpoint_id, second.id);
+    const pruned = await backupTick(env, new Date(t4.getTime() + 3600_000));
+    assert.equal((pruned.result as any).backup_copies_deleted, undefined, 'the first run no longer decides');
+    assert.ok(await env.BACKUP!.head(key), 'the copy waits out the second run\'s grace period');
+    const kept = (await env.DB.prepare('SELECT * FROM backup_checkpoints WHERE id=?').bind(second.id).first<any>());
+    assert.equal(kept.raw_pruned_at, null);
+    assert.equal((await drill(env, kept)).result, 'passed');
+    // After it, the copy goes and every checkpoint that listed it, in either copy generation, is marked.
+    const end = await backupTick(env, new Date(Date.parse(r2.backup_delete_after) + 60_000));
+    assert.equal((end.result as any).backup_copies_deleted, 1);
+    assert.equal(await env.BACKUP!.head(key), null);
+    for (const id of [first.id, second.id])
+      assert.ok((await env.DB.prepare('SELECT raw_pruned_at FROM backup_checkpoints WHERE id=?').bind(id).first<any>()).raw_pruned_at, id);
+    assert.equal(await count(env, "SELECT COUNT(*) AS n FROM retention_run_objects WHERE batch_id=(SELECT batch_id FROM backup_raw_objects WHERE r2_key=?) AND backup_deleted_at IS NULL",
+      key.slice(4)), 0, 'both runs record the deletion');
+    await assert.rejects(backupsReviewerRead(objectPath, env, reviewer), (error: unknown) => error instanceof HttpError && error.status === 404);
   } finally { await fixture.close(); }
 });
 
