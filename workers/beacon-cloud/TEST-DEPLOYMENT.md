@@ -1,7 +1,8 @@
 # Cloudflare TEST acceptance
 
-This records the **0.1 base service**, not the 0.2 project/task/context milestone.
-For the newer local-only validation see [VALIDATION.md](VALIDATION.md).
+This records the **0.1 base service** only, not the 0.2 project/task/context, 0.3
+background-processing or 0.4 Mac sync and data-operations milestones, none of which
+has been deployed. For their local-only validation see [VALIDATION.md](VALIDATION.md).
 
 Completed **2026-10-05 (Asia/Taipei)**. The owner authorized review, merge and a
 test rollout. [PR #1](https://github.com/jackg825/agent-beacon/pull/1) is merged
@@ -83,9 +84,11 @@ an existing collector is installed elsewhere.
 
 Production rollout, real MBP/Mac mini capture/sleep/wake/offline behavior,
 external Access/OAuth login and real Claude sessions remain unverified.
-The test uses manual dashboard/MCP credentials. Memory candidate generation,
-human approval, publication and cross-device memory synchronization are absent.
-Retention/deletion UI, automated R2 cleanup/reindex, scheduled backups, load/CPU
-and quota tests, and actual cloud rollback/restore remain future work.
+The test uses manual dashboard/MCP credentials. The deployed 0.1 version has no
+memory candidates, human approval, publication or cross-device memory sync, and no
+retention, scheduled backups or data health. Later milestones implement several of
+these locally only; none is part of this deployment or its evidence. Automated R2
+cleanup/reindex, load/CPU and quota tests, and actual cloud rollback/restore remain
+future work.
 Recovery instructions are in [DEPLOYMENT.md](DEPLOYMENT.md); Worker code rollback
 does not restore D1/R2 data.

@@ -7,11 +7,12 @@
 // {id:{noul|probability|score,confidence}}, optional usage).
 import { digest } from './auth';
 import { invalidSourceScope } from './context';
+import { contradictionFlagStatements } from './context-revisions';
 import { externalFetch } from './external-fetch';
 import { assignedValues, cleanLine, cleanText, FieldClass, ProjectedEvent, workerSecrets } from './privacy';
 import { CallOutcome, finishCallStatement, readBudget, reserveCall, utcDay } from './processing-budget';
 import { externalGate, jevConfig } from './processing-policy';
-import { isHighSignal, ruleFilter, SelectionStage, StageInput, StageResult, StageSignal } from './processing-stage';
+import { CONTRADICTION_SIGNAL, isHighSignal, ruleFilter, SelectionStage, StageInput, StageResult, StageSignal } from './processing-stage';
 import type { Env } from './types';
 
 export const JEV_RUBRIC_VERSION = 'beacon.cloud.jev.v1';
@@ -19,8 +20,8 @@ export const JEV_QUESTION_TYPE = 'noul';
 export const MAX_JEV_NOTES = 10;
 export const MAX_JEV_NOTE_CHARS = 2000;
 export const MAX_JEV_RESPONSE_BYTES = 1024 * 1024;
-/** A contradiction answer at or above this is a high-signal fact that blocks a skip. */
-export const CONTRADICTION_SIGNAL = 0.5;
+/** A contradiction answer at or above this is a high-signal fact that blocks a skip and flags that entry. */
+export { CONTRADICTION_SIGNAL };
 export const JEV_INSTRUCTIONS = {
   new_information: 'Does the new activity contain information not already captured by the approved notes listed in state?',
   task_related: 'Is the new activity related to the task named in state?',
@@ -238,14 +239,15 @@ export const jevStage: SelectionStage = async (input) => {
         ({ question_id, probability: answer.probability, confidence: answer.confidence, evaluator, model: config.model }));
     }
   }
-  // The outcome and its answers commit together, only while this lease still holds;
-  // otherwise the reservation stays and the sweep records it as outcome_unknown.
+  // The outcome, its answers and the flags they raise commit together, only while this
+  // lease still holds; otherwise the reservation stays and the sweep records it as outcome_unknown.
   await env.DB.batch([
     env.DB.prepare('INSERT INTO processing_job_fence(job_id,lease_owner,attempts) VALUES(?,?,?)').bind(input.job_id, input.lease_owner, input.attempt),
     finishCallStatement(env, reservation.call.id, outcome),
     ...signals.map((signal) => env.DB.prepare(`INSERT INTO processing_signals(job_id,question_id,probability,confidence,evaluator,model,
       calibrated,created_at) VALUES(?,?,?,?,?,?,0,?) ON CONFLICT DO NOTHING`).bind(input.job_id, signal.question_id, signal.probability,
       signal.confidence, signal.evaluator, signal.model, finished)),
+    ...contradictionFlagStatements(env.DB, { job_id: input.job_id, signals, evidence: input.evidence ?? [], now: finished }),
   ]);
   return signals.length ? jevDecision(input, signals) : proceed(note);
 };

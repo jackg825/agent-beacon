@@ -390,12 +390,21 @@ test('acceptance: a labelled two-Mac task cites every failure, fix, verification
     // Advisory only: both notes stay approved and the candidate still waits for review.
     for (const id of [stale, lint]) assert.equal((await getContext(f.env, id)).context.status, 'approved');
     assert.equal(context.status, 'pending');
+    // The answer became one open review flag on the task note it was about, citing exact versions of this job.
+    const flags = (await f.env.DB.prepare('SELECT context_id,origin,kind,job_id,status,evidence FROM context_flags').all<any>()).results;
+    assert.deepEqual(flags.map((row) => [row.context_id, row.origin, row.kind, row.job_id, row.status]), [[stale, 'jev', 'contradiction', done.id, 'open']]);
+    const evidence = JSON.parse(flags[0].evidence) as { event_id: string; payload_hash: string }[];
+    assert.ok(evidence.length >= 1 && evidence.length <= 20);
+    assert.equal(await count(f.env, `processing_job_sources WHERE job_id=? AND event_id IN (SELECT json_extract(value,'$.event_id') FROM json_each(?))`,
+      done.id, flags[0].evidence), evidence.length);
+    assert.deepEqual([(await getContext(f.env, stale)).context.open_flags, (await getContext(f.env, lint)).context.open_flags], [1, 0]);
     // Counts recorded for VALIDATION.md.
     const cited = new Set([...context.content.matchAll(/\[(\d+)\]/g)].map((match) => match[1]));
     console.log(JSON.stringify({ acceptance: { events: done.event_count, sources: context.source_count, cited: cited.size,
       labelled: Object.keys(labelled).length, labelled_cited: Object.keys(found).length, content_chars: context.content.length,
       jev_questions: asked[0].length, jev_signals: detail.signals.length, contradiction_flagged: detail.signals
-        .filter((row: any) => row.question_id.startsWith('contradiction:') && row.probability >= 0.5).map((row: any) => row.context_id === stale ? 'task_note' : 'other') } }));
+        .filter((row: any) => row.question_id.startsWith('contradiction:') && row.probability >= 0.5).map((row: any) => row.context_id === stale ? 'task_note' : 'other'),
+      review_flags: flags.length, flag_evidence: evidence.length } }));
     assert.equal(Object.keys(found).length, 5);
   } finally { await f.close(); }
 });

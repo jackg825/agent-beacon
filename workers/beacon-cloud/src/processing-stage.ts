@@ -26,6 +26,8 @@ export interface StageInput {
   reproject(fields: readonly FieldClass[], assigned: Iterable<string>): Projection;
   /** Raw task title and project name as stored; a stage may use them only under the `titles` class, redacted. */
   labels: { task_title: string | null; project_name: string | null };
+  /** Exact versions a contradiction flag raised from this job's answers cites (≤ 20; see context-revisions.ts). */
+  evidence?: { event_id: string; payload_hash: string }[];
 }
 export interface StageResult {
   decision: 'continue' | 'skip';
@@ -43,6 +45,9 @@ export interface StageResult {
  * signals or skip under the policy threshold; it can never approve, edit or delete.
  */
 export type SelectionStage = (input: StageInput) => Promise<StageResult>;
+
+/** A per-entry contradiction answer at or above this is high-signal and raises a review flag on that entry. */
+export const CONTRADICTION_SIGNAL = 0.5;
 
 /** Actions that by themselves never justify a summary. */
 const lowSignal = new Set(['session.started', 'session.ended', 'session.created', 'session.deleted', 'session.idle',

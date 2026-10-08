@@ -1,5 +1,100 @@
 # Review evidence
 
+## 0.4 Mac sync and data operations — local review
+
+Validated on **2026-10-09 (Asia/Taipei)** in the
+`claude/beacon-cloud-phase3` worktree, which carries the unmerged 0.2 and 0.3
+milestones (jackg825/agent-beacon#3) plus roadmap phase 3 on top of main
+`192d6ca1434c0e2f7e604c384bf1119e3caab3f7`. This milestone has **not** been
+migrated, deployed, scheduled or accepted on Cloudflare: migrations `0005`–`0010`
+were applied only to local databases, no BACKUP bucket exists, no checkpoint or
+restore drill has used cloud data, no Mac has run `forwarder/sync.mjs` against a
+deployed Worker, and only synthetic events, notes, devices and credentials were
+used. No installed Beacon logs, collector settings or transcripts were read.
+
+| Check | Current result |
+| --- | --- |
+| `npm run check` | TypeScript passes |
+| `npm test` | **251/251 pass** (179 top-level tests, 72 subtests), zero skipped or cancelled, in two consecutive runs (39.6 s and 39.4 s). The six phase-3 suites (`sync`, `forwarder/sync`, `backup`, `retention`, `health`, `context-revisions`) hold 60 of the top-level tests; 0.3 had 154 (118 top-level). No intermittent Miniflare `fetch failed` occurred in either run |
+| `npm run test:workflow-browser` | **3/3 pass** against the actual Worker/D1/R2: the 0.2 workflow (whose note detail now also covers a validity window, a flag created and dismissed, a share created and revoked and the revision chain), the 0.3 背景整理 run, and the new Mac 同步/資料維護 run described below |
+| `npm run test:browser` | **2/2 pass** against the deterministic fixtures |
+| Restore drill | `scripts/restore-check.ts` ran as a CLI on a checkpoint the browser run produced: first `--url` against the loopback reviewer object route with `--out`, then offline with `--dir`. Both **passed**: 38 tables, 33 rows, 3 raw objects, triggers 79/79, 12 checks, 0 findings, identical report hashes and `verify_request`. `npm test` also runs the `--dir` CLI in-process on a bundled-Worker checkpoint and makes each consistency check fail on a forged backup |
+| `npm run test:collector` | **1/1 passes** with `GOPROXY=off` (cached modules, no download): shipping hook → JSONL → forwarder → Worker → D1/R2 → query after restart |
+| Official MCP clients | Current and legacy clients discover **17 read-only tools** (new: `beacon_get_context_history`, `beacon_get_data_health`); the server reports `0.4.0` and its instructions say health hints are for a human operator and that no sync, retention or backup tool exists |
+| Local D1 migrations | `WRANGLER_SEND_METRICS=false WRANGLER_WRITE_LOGS=false npx wrangler d1 migrations apply agent-beacon-cloud-db --local --persist-to <fresh temp dir>` applies `0001`–`0010` with **14/18/23/59/15/36/33/10/4/3 statements**; Worker fixtures also upgrade a populated `0001` database through `0010` |
+| `npm run deploy:dry-run` | Passes; Worker **1661.54 KiB / gzip 324.32 KiB** (0.3: 1494.46 / 282.60); the checked-in config binds only `DB` and `RAW` (no `BACKUP`); no upload |
+| Independent review | Tracks S (sync), D (data operations) and R (revisions) were each code-reviewed with adversarial verification and the confirmed findings fixed with regression tests. The 17 `fix(cloud)` commits after the phase-2 merge include re-checking the sync destination folder right before the write, reconciling interrupted sync writes from the destination, refusing retention when a BACKUP copy lacks its checksum, paging the retention plan past permanently blocked batches, treating young index rows as in flight in the list-diff, exporting every activity-sized table in rounds with a bounded final snapshot, keeping BACKUP copies right for replayed batches, a partial revision index that survives `ANALYZE` (`0010`), one page per arm in `include_shared` recall, and a revision-distance history window |
+
+The new browser suite (`test/operations.browser.mjs`) runs the bundled Worker with
+`RAW` and `BACKUP` bound and `MAINTENANCE_TASKS=backup,health`. In Mac 同步, a grant
+is refused in the page without the reviewer key (nothing stored; the device's
+`/v1/sync/snapshot` answers `403`), then created with it (`memory` and `summary`,
+`include_shared`, actor `reviewer:` plus 16 hex digits). Its preview shows 3 approved
+notes, 1 shared from the other project with its source label, and exactly the
+device route's snapshot hash, titles and order; a title with markup renders as text.
+In 資料維護, every finding's count, hint and sample IDs match `/api/health/data`,
+including `device_stale` for a never-uploaded device whose markup name renders as
+text. 「立即備份」 creates a `running` checkpoint; one Miniflare hourly
+`17 * * * *` tick (backup D1 91 / R2 17 / fetch 0, health D1 3 / R2 1) completes it
+with integrity verified and 3 raw copies, listed as 已完成・待演練. The drill's
+`verify_request` pasted into the tab marks it 已驗證. A raw `keep_days` of 1, with
+the batches aged three days, plans 1 batch while the 2 batches notes cite are
+blocked as `referenced_by_context`; apply is refused until the confirmation box is
+checked, then deletes 1 of 3 batches and leaves the device's snapshot hash
+unchanged. Both tabs fit 1280 and 375 px with no horizontal overflow, no page errors
+and empty browser storage.
+
+The Node suites exercise, among others: the snapshot equal to authoritative recall
+with a reproducible hash and a `413` before any content read; subscriptions that are
+reviewer-only, idempotent, bounded at 100, revocable once and trigger-audited; a
+device reading only its own grants' kinds, with one `403` for every missing grant;
+preview/apply binding exact bytes, stale-snapshot, changed-destination and tampered
+plan refusals, rollback refusing user edits, interrupted writes reconciled from the
+destination, a folder swapped for a symlink refused right before the write,
+instruction-file names and agent folders refused, and unforgeable rendering;
+validity windows, `as_of`, bounded history and the revision index after `ANALYZE`;
+reviewer and Jev flags that never touch a note, and shares served only while the
+note stays approved and authoritative; health inert until opted in, the list-diff
+across bounded and overlapping ticks, and findings without content; backups inert
+without the binding and the opt-in, every committed table classified for export,
+rows changed after their round reread, leased and allotment-bounded progress,
+integrity reporting every kind of change and expiry protecting what retention
+relied on; retention deleting only closed batch sets behind a drilled,
+integrity-verified backup, rechecking inside the deleting transaction, failing closed
+on unreadable references, retrying failed R2 deletes, pruning BACKUP copies after
+grace and reporting resurrected batches; and every new route's credential matrix
+through the bundled Worker.
+
+Not verified here:
+
+- Cloud migration of `0005`–`0010` (or `0002`–`0004`), TEST deployment, redeploy
+  persistence and code rollback with the new tables in place.
+- A BACKUP bucket, `backup`/`health` on a real hourly cron (Workers Paid CPU,
+  subrequest and D1 limits, real tick duration and BACKUP usage at larger volumes),
+  and a first scheduled checkpoint.
+- A restore drill from a real TEST BACKUP into an isolated local database; any
+  production recovery from BACKUP or D1 Time Travel. `verified` remains a reviewer
+  attestation the server cannot prove.
+- Raw retention applied to cloud data; summary, candidate and audit retention is
+  report-only by design.
+- A two-Mac sync pilot: real MBP/Mac mini preview, apply and rollback against a
+  deployed Worker, with each device's own key, and revocation observed on a device.
+  The sync tool's suite ran only in temporary directories on this review machine.
+  Sync has no rate limit.
+- Named-user review: every grant, flag, share, retention plan and drill attestation
+  records the shared reviewer credential, not a person.
+- Project-group share targets (deferred), a real Jev endpoint raising flags, and
+  `jev_skip_threshold` calibration. `npm audit` and the upstream CLI/packaging suites
+  were not rerun.
+
+Wrangler ran with `WRANGLER_SEND_METRICS=false`, `WRANGLER_WRITE_LOGS=false`, no
+account configuration and only `--local`/`--dry-run`; it still printed an update
+notice (4.149.0 available), so its version check reached the npm registry. Browser
+screenshots stayed in a private scratch directory. To reproduce, run the commands in
+[Reproduce](#reproduce), then
+`BEACON_PLAYWRIGHT_MODULE=/ABS/PATH/playwright/index.mjs npm run test:workflow-browser`
+and `npm run test:browser`.
+
 ## 0.3 background processing — local review
 
 Validated on **2026-10-09 (Asia/Taipei)** in an isolated worktree of

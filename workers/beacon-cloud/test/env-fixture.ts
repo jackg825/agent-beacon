@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { Miniflare, convertV4MiniflareOptions } from 'miniflare';
 import { ingest } from '../src/ingest';
 import { Device, Env } from '../src/types';
+import { migrationFiles } from '../scripts/migration-sql';
 import { applyMigrations } from './migrations';
 
 /** Synthetic device rows; their token digests never match a real credential. */
@@ -22,31 +23,44 @@ export function syntheticEvent(id: string, options: { session?: string; repo?: s
 }
 
 /**
- * Direct module tests: real workerd D1/R2 bindings with every committed migration
- * applied and two enrolled synthetic devices. No network, no installed Beacon data.
+ * Run a fixture's setup after its Miniflare exists, and dispose it if setup throws. A leaked
+ * instance keeps workerd and the loopback server alive, so the test file's process never
+ * exits and `node --test` waits on it indefinitely instead of reporting the failure.
  */
-export async function createEnvFixture(options: { backup?: boolean; bindings?: Partial<Record<keyof Env, string>> } = {}) {
+export async function disposeOnFailure<T>(close: () => Promise<void>, setup: () => Promise<T>): Promise<T> {
+  try { return await setup(); }
+  catch (error) { await close().catch(() => {}); throw error; }
+}
+
+/**
+ * An explicit older schema: every committed migration except those whose file name starts
+ * with one of `prefixes` (e.g. '0004' for a deployment that never applied Track P).
+ */
+export async function migrationsExcept(...prefixes: string[]) {
+  return (await migrationFiles()).filter(name => !prefixes.some(prefix => name.startsWith(prefix + '_')));
+}
+
+/**
+ * Direct module tests: real workerd D1/R2 bindings with every committed migration
+ * (or exactly `migrations`) applied and two enrolled synthetic devices. No network,
+ * no installed Beacon data.
+ */
+export async function createEnvFixture(options: { backup?: boolean; migrations?: string[]; bindings?: Partial<Record<keyof Env, string>> } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'beacon-env-'));
   const mf = new Miniflare(convertV4MiniflareOptions({ resourcePersistencePath: join(directory, 'storage'), workers: [{
     name: 'env-fixture', modules: true as const, script: 'export default {fetch(){return new Response("synthetic");}}',
     compatibilityDate: '2026-10-01', d1Databases: { DB: 'fixture-index' },
     r2Buckets: options.backup ? { RAW: 'fixture-raw', BACKUP: 'fixture-backup' } : { RAW: 'fixture-raw' },
   }] }));
-  let env: Env;
-  try {
-    env = { DB: await mf.getD1Database('DB'), RAW: await mf.getR2Bucket('RAW'),
+  const close = async () => { await mf.dispose(); await rm(directory, { recursive: true, force: true }); };
+  const env = await disposeOnFailure(close, async () => {
+    const env = { DB: await mf.getD1Database('DB'), RAW: await mf.getR2Bucket('RAW'),
       ...(options.backup ? { BACKUP: await mf.getR2Bucket('BACKUP') } : {}), ...options.bindings } as unknown as Env;
-    await applyMigrations(env.DB);
-    for (const device of Object.values(fixtureDevices)) {
-      await env.DB.prepare('INSERT INTO devices(id,name,token_hash,created_at) VALUES(?,?,?,?)')
-        .bind(device.id, device.name, device.token_hash, '2026-10-08T00:00:00Z').run();
-    }
-  } catch (error) {
-    // A failed setup must not leave workerd running: the test file could never exit.
-    await mf.dispose().catch(() => {});
-    await rm(directory, { recursive: true, force: true });
-    throw error;
-  }
+    await applyMigrations(env.DB, options.migrations);
+    await env.DB.batch(Object.values(fixtureDevices).map(device => env.DB.prepare('INSERT INTO devices(id,name,token_hash,created_at) VALUES(?,?,?,?)')
+      .bind(device.id, device.name, device.token_hash, '2026-10-08T00:00:00Z')));
+    return env;
+  });
   return {
     env, mf, directory,
     /** Ingest records exactly like the HTTP route would, returning its acknowledgement. */
@@ -60,6 +74,6 @@ export async function createEnvFixture(options: { backup?: boolean; bindings?: P
     event(eventId: string) {
       return env.DB.prepare('SELECT * FROM events WHERE event_id=?').bind(eventId).first<Record<string, any>>();
     },
-    async close() { await mf.dispose(); await rm(directory, { recursive: true, force: true }); },
+    close,
   };
 }

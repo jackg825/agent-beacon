@@ -6,6 +6,7 @@ import { mcpChallenge, mcpMetadata } from './mcp-auth';
 import { getEventVersion, listEventVersions, getTimeline, listDevices, listProjects, listSessions } from './queries';
 import { projectRead, projectWrite } from './project-workflows';
 import { contextRead, contextWrite } from './context';
+import { revisionsRead, revisionsWrite } from './context-revisions';
 import { processingRead, processingWrite } from './processing';
 import { syncDeviceRead, syncRead, syncWrite } from './sync';
 import { operationsRead, operationsReviewerRead, operationsWrite } from './operations';
@@ -16,8 +17,8 @@ type Handler = (request: Request, env: Env) => Promise<Response | null>;
 type ActorHandler = (request: Request, env: Env, actor: string) => Promise<Response | null>;
 // Handlers return null for paths they do not own; the first match answers. Sync
 // owns /api/context/snapshot, so it precedes the /api/context/:id detail route.
-const readHandlers: Handler[] = [syncRead, projectRead, contextRead, processingRead, operationsRead];
-const writeHandlers: ActorHandler[] = [projectWrite, contextWrite, processingWrite, syncWrite, operationsWrite];
+const readHandlers: Handler[] = [syncRead, projectRead, contextRead, revisionsRead, processingRead, operationsRead];
+const writeHandlers: ActorHandler[] = [projectWrite, contextWrite, revisionsWrite, processingWrite, syncWrite, operationsWrite];
 const writePaths = /^\/api\/(?:project-groups|project-relations|tasks|context|processing|sync|retention|backups)(?:\/|$)/;
 // Backups hold device token digests, so even reading them needs review authority.
 const reviewerReadPaths = /^\/api\/backups(?:\/|$)/;

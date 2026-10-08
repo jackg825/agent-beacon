@@ -16,6 +16,10 @@ export interface Env {
   /** Shared wall-clock budget for one scheduled invocation, 1000–600000 ms (default 25000). */
   MAINTENANCE_BUDGET_MS?: string;
   BACKUP_INTERVAL_HOURS?: string;
+  /** Raw retention needs a verified, integrity-checked checkpoint at most this many days old (1–90, default 7). */
+  BACKUP_MAX_AGE_DAYS?: string;
+  /** Days a retention-deleted batch's BACKUP copy is kept before the backup task removes it (0–365, default 30). */
+  BACKUP_RETENTION_GRACE_DAYS?: string;
   /**
    * Deploy-time gate for any outbound model call: comma-separated central project IDs or `*`.
    * Absent means no external call happens, whatever the stored processing policy says.

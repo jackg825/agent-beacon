@@ -22,16 +22,18 @@ test('official current MCP client discovers and lists only read-only tools', asy
   try {
     await client.connect(transport);
     assert.equal(client.getProtocolEra(), 'modern');
-    assert.equal(client.getServerVersion()?.version, '0.3.0');
+    assert.equal(client.getServerVersion()?.version, '0.4.0');
     // Clients are told that pipeline candidates and evaluator scores are not approved knowledge.
     assert.match(client.getInstructions() ?? '', /pending candidates the background pipeline generated/);
     assert.match(client.getInstructions() ?? '', /uncalibrated scores/);
+    assert.match(client.getInstructions() ?? '', /never actions for the client/);
     const { tools } = await client.listTools();
     assert.deepEqual(tools.map((tool) => tool.name).sort(), [
       'beacon_get_timeline', 'beacon_list_devices', 'beacon_list_projects', 'beacon_list_sessions',
       'beacon_list_project_groups', 'beacon_get_project_group', 'beacon_list_project_relations',
-      'beacon_list_tasks', 'beacon_get_task', 'beacon_list_context', 'beacon_get_context',
+      'beacon_list_tasks', 'beacon_get_task', 'beacon_list_context', 'beacon_get_context', 'beacon_get_context_history',
       'beacon_get_event', 'beacon_list_event_versions', 'beacon_list_processing_jobs', 'beacon_get_processing_job',
+      'beacon_get_data_health',
     ].sort());
     for (const tool of tools) {
       assert.equal(tool.annotations?.readOnlyHint, true);
@@ -48,7 +50,7 @@ test('official legacy MCP client can initialize and list the same tools', async 
   try {
     await client.connect(transport);
     assert.equal(client.getProtocolEra(), 'legacy');
-    assert.equal((await client.listTools()).tools.length, 15);
+    assert.equal((await client.listTools()).tools.length, 17);
   } finally { await client.close(); }
 });
 

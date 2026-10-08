@@ -13,11 +13,13 @@ const createSchema = z.object({
   supersedes_id: uuid.optional()
 }).strict();
 const reviewSchema = z.object({decision:z.enum(['approve','reject']),reason:z.string().max(2000).optional()}).strict();
-type ContextRow = {
+export type ContextRow = {
   id:string;kind:string;project_id:string;task_id:string|null;title:string;content:string;
   status:string;supersedes_id:string|null;created_at:string;reviewed_at:string|null;
+  valid_from:string|null;valid_until:string|null;open_flags:number;
   source_count:number;sources_valid:number;
   generation_job_id:string|null;generation_processor:string|null;generation_previous_context_id:string|null;
+  share_id?:string|null;shared_from_project_id?:string|null;
 };
 
 // Shared with the Jev stage, which reads only authoritative notes.
@@ -25,22 +27,37 @@ export const invalidSourceScope = `EXISTS(SELECT 1 FROM context_sources s JOIN e
     WHERE s.context_id=c.id AND (e.project_id!=c.project_id OR (c.task_id IS NOT NULL AND NOT EXISTS(
       SELECT 1 FROM task_sessions ts WHERE ts.task_id=c.task_id AND ts.session_id=e.session_id
     ))))`;
-const contextSelect = `SELECT c.id,c.kind,c.project_id,c.task_id,c.title,c.content,c.status,
+/**
+ * Validity window: an entry is valid from its approval until the approval of the
+ * revision that superseded it (at most one child is ever approved). Authority is
+ * separate: an approved entry whose sources left its scope stays in its window but
+ * is not authoritative.
+ */
+export const validUntil = `(SELECT child.reviewed_at FROM context_entries child WHERE child.supersedes_id=c.id
+    AND child.status IN ('approved','superseded') ORDER BY child.reviewed_at LIMIT 1)`;
+export const contextColumns = `c.id,c.kind,c.project_id,c.task_id,c.title,c.content,c.status,
   c.supersedes_id,c.created_at,c.reviewed_at,
+  CASE WHEN c.status IN ('approved','superseded') THEN c.reviewed_at END AS valid_from,${validUntil} AS valid_until,
+  (SELECT COUNT(*) FROM context_flags f WHERE f.context_id=c.id AND f.status='open') AS open_flags,
   (SELECT COUNT(*) FROM context_sources s WHERE s.context_id=c.id) AS source_count,
   NOT ${invalidSourceScope} AS sources_valid,g.job_id AS generation_job_id,g.processor AS generation_processor,
-  g.previous_context_id AS generation_previous_context_id
-  FROM context_entries c LEFT JOIN context_generation g ON g.context_id=c.id`;
+  g.previous_context_id AS generation_previous_context_id`;
+export const contextFrom = 'FROM context_entries c LEFT JOIN context_generation g ON g.context_id=c.id';
+const contextSelect = `SELECT ${contextColumns} ${contextFrom}`;
 
-function view(row:ContextRow) {
-  const {sources_valid,generation_job_id,generation_processor,generation_previous_context_id,...result}=row;
+export function contextView(row:ContextRow) {
+  const {sources_valid,generation_job_id,generation_processor,generation_previous_context_id,share_id,shared_from_project_id,...result}=row;
   // Approval records human review, not a guarantee that the prose is true.
   // If session/project evidence changes, the old derivative is no longer authoritative.
   // Pipeline output is marked as such; it always needed the same explicit review.
-  return {...result,sources_valid:!!sources_valid,authoritative:row.status==='approved' && !!sources_valid,
+  // An open flag asks for another look; it changes neither approval nor authority.
+  return {...result,open_flags:Number(row.open_flags),sources_valid:!!sources_valid,authoritative:row.status==='approved' && !!sources_valid,
     origin:generation_job_id?'pipeline' as const:'manual' as const,
-    generation:generation_job_id?{job_id:generation_job_id,processor:generation_processor,previous_context_id:generation_previous_context_id}:null};
+    generation:generation_job_id?{job_id:generation_job_id,processor:generation_processor,previous_context_id:generation_previous_context_id}:null,
+    // Present only when include_shared asked for it; shared rows name the share and the owning project.
+    ...(share_id!==undefined?{share_id,shared_from_project_id}:{})};
 }
+const view=contextView;
 function parse<T>(schema:z.ZodType<T>,value:unknown):T {
   const result=schema.safeParse(value);
   if (!result.success) throw new HttpError(400,'Invalid context request');
@@ -81,40 +98,112 @@ async function verifyRawSources(env:Env,sources:{event_id:string;payload_hash:st
   }
 }
 
+/** A UTC instant (seconds or milliseconds), normalized to the stored toISOString() form. */
+export function isoInstant(value:string|null,label='as_of'):string {
+  const parsed=value && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,3})?Z$/.test(value)?Date.parse(value):NaN;
+  if (!Number.isFinite(parsed)) throw new HttpError(400,`${label} must be a UTC ISO 8601 time`);
+  return new Date(parsed).toISOString();
+}
+const flagSwitch=z.enum(['0','1']);
+const openFlag=`EXISTS(SELECT 1 FROM context_flags f WHERE f.context_id=c.id AND f.status='open')`;
+
 export async function listContext(env:Env,params:URLSearchParams) {
-  const allowed=new Set(['project_id','task_id','kind','status','before','limit']);
+  const allowed=new Set(['project_id','task_id','kind','status','before','limit','as_of','include_shared','flagged']);
   for (const key of params.keys()) if (!allowed.has(key) || params.getAll(key).length!==1)
     throw new HttpError(400,'Invalid context filter');
   const limit=pageLimit(params),where=['c.sealed=1'],args:unknown[]=[];
+  const asOf=params.has('as_of')?isoInstant(params.get('as_of')):null;
+  const shared=params.has('include_shared') && parse(flagSwitch,params.get('include_shared'))==='1';
+  const flagged=params.has('flagged') && parse(flagSwitch,params.get('flagged'))==='1';
+  if (asOf && params.has('status')) throw new HttpError(400,'as_of selects entries approved at that time; remove status');
+  // Shared entries are always current authoritative memories of another project, so they
+  // join only an approved-only recall of exactly one project, never a task or a past instant.
+  if (shared && (!params.has('project_id') || params.has('task_id') || asOf || (params.has('status') && params.get('status')!=='approved')))
+    throw new HttpError(400,'include_shared needs project_id and approved entries, without task_id or as_of');
   for (const [name,schema] of [['project_id',hash],['task_id',uuid]] as const) {
     if (params.has(name)) {where.push(`c.${name}=?`);args.push(parse(schema,params.get(name)));}
   }
-  if (params.has('kind')) {where.push('c.kind=?');args.push(parse(z.enum(['summary','memory']),params.get('kind')));}
-  const status=parse(z.enum(['pending','approved','rejected','superseded']),params.get('status')??'approved');
-  where.push('c.status=?');args.push(status);
-  // Default recall returns usable approved records. An explicit approved filter
-  // retains invalid-scope derivatives for review, always marked non-authoritative.
-  if (!params.has('status')) where.push(`NOT ${invalidSourceScope}`);
+  const kind=params.has('kind')?parse(z.enum(['summary','memory']),params.get('kind')):null;
+  if (kind) {where.push('c.kind=?');args.push(kind);}
+  if (asOf) {
+    // History: approved at that instant and not yet replaced by an approved revision.
+    // Current source scope is not applied; authoritative still reports today's state.
+    where.push(`c.status IN ('approved','superseded') AND c.reviewed_at<=? AND (${validUntil} IS NULL OR ${validUntil}>?)`);
+    args.push(asOf,asOf);
+  } else {
+    const status=parse(z.enum(['pending','approved','rejected','superseded']),params.get('status')??'approved');
+    where.push('c.status=?');args.push(status);
+    // Default recall returns usable approved records. An explicit approved filter
+    // retains invalid-scope derivatives for review, always marked non-authoritative.
+    if (!params.has('status')) where.push(`NOT ${invalidSourceScope}`);
+  }
+  if (flagged) where.push(openFlag);
+  const page:string[]=[],pageArgs:unknown[]=[];
   if (params.has('before')) {
     const [time,id]=cursor(params.get('before')!);
-    where.push('(c.created_at<? OR (c.created_at=? AND c.id<?))');args.push(time,time,id);
+    page.push('(c.created_at<? OR (c.created_at=? AND c.id<?))');pageArgs.push(time,time,id);
   }
-  const result=await env.DB.prepare(`${contextSelect} WHERE ${where.join(' AND ')}
-    ORDER BY c.created_at DESC,c.id DESC LIMIT ?`).bind(...args,limit+1).all<ContextRow>();
+  let result:D1Result<ContextRow>;
+  if (!shared) {
+    result=await env.DB.prepare(`${contextSelect} WHERE ${[...where,...page].join(' AND ')}
+      ORDER BY c.created_at DESC,c.id DESC LIMIT ?`).bind(...args,...pageArgs,limit+1).all<ContextRow>();
+  } else {
+    // Read-time authority: a share is served only while it is active and the shared
+    // entry is still approved with valid sources. Default recall never includes shares.
+    const sharedWhere=[`sh.target_type='project' AND sh.target_id=? AND sh.revoked_at IS NULL AND c.sealed=1 AND c.status='approved'
+      AND c.kind='memory' AND NOT ${invalidSourceScope}`,...kind?['c.kind=?']:[],...flagged?[openFlag]:[],...page];
+    // Each arm keeps its own order and limit, so the project's entries are read in index order
+    // and stop after one page instead of being computed in full for every page. The shared arm
+    // starts from the project's active shares (CROSS JOIN fixes that order) rather than walking
+    // every approved entry to look for a share.
+    result=await env.DB.prepare(`SELECT * FROM (
+      SELECT * FROM (SELECT ${contextColumns},NULL AS share_id,NULL AS shared_from_project_id ${contextFrom}
+        WHERE ${[...where,...page].join(' AND ')} ORDER BY c.created_at DESC,c.id DESC LIMIT ?)
+      UNION ALL SELECT * FROM (SELECT ${contextColumns},sh.id AS share_id,c.project_id AS shared_from_project_id
+        FROM context_shares sh CROSS JOIN context_entries c ON c.id=sh.context_id LEFT JOIN context_generation g ON g.context_id=c.id
+        WHERE ${sharedWhere.join(' AND ')} ORDER BY c.created_at DESC,c.id DESC LIMIT ?)
+    ) ORDER BY created_at DESC,id DESC LIMIT ?`).bind(...args,...pageArgs,limit+1,params.get('project_id'),...kind?[kind]:[],...pageArgs,limit+1,limit+1)
+      .all<ContextRow>();
+  }
   const rows=result.results.slice(0,limit),last=rows.at(-1);
   return {context:rows.map(view),next_cursor:result.results.length>limit && last?btoa(JSON.stringify([last.created_at,last.id])):null};
+}
+
+/** Flags and shares listed with one entry: open flags first, then the newest. */
+export const DETAIL_ROWS = 50;
+export type FlagRow = { id:string;context_id:string;kind:string;origin:string;job_id:string|null;evidence:string;note:string|null;
+  status:string;created_at:string;created_by:string;resolved_at:string|null;resolved_by:string|null;resolution_reason:string|null };
+export const flagSelect = `SELECT f.id,f.context_id,f.kind,f.origin,f.job_id,f.evidence,f.note,f.status,f.created_at,f.created_by,
+  f.resolved_at,f.resolved_by,f.resolution_reason FROM context_flags f`;
+export function flagView(row:FlagRow) {
+  return {...row,evidence:JSON.parse(row.evidence) as {event_id:string;payload_hash:string}[]};
+}
+export type ShareRow = { id:string;context_id:string;target_type:string;target_id:string;target_name:string|null;created_at:string;
+  created_by:string;revoked_at:string|null;revoked_by:string|null };
+export const shareSelect = `SELECT sh.id,sh.context_id,sh.target_type,sh.target_id,p.name AS target_name,sh.created_at,sh.created_by,
+  sh.revoked_at,sh.revoked_by FROM context_shares sh LEFT JOIN projects p ON p.id=sh.target_id`;
+/** `inactive`: not revoked, but the entry is no longer authoritative, so nothing is served. */
+export function shareView(row:ShareRow,authoritative:boolean) {
+  return {...row,status:row.revoked_at?'revoked' as const:authoritative?'active' as const:'inactive' as const};
 }
 
 export async function getContext(env:Env,id:string) {
   if (!uuid.safeParse(id).success) throw new HttpError(400,'Invalid context id');
   const row=await env.DB.prepare(`${contextSelect} WHERE c.id=? AND c.sealed=1`).bind(id).first<ContextRow>();
   if (!row) throw new HttpError(404,'Context not found');
-  const [sources,audit]=await Promise.all([
+  const [sources,audit,flags,shares]=await Promise.all([
     env.DB.prepare(`SELECT s.event_id,s.payload_hash,e.session_id,e.device_id,e.timestamp
       FROM context_sources s JOIN events e ON e.id=s.event_id WHERE s.context_id=? ORDER BY s.ordinal`).bind(id).all(),
-    env.DB.prepare('SELECT id,actor,action,reason,created_at FROM context_audit WHERE context_id=? ORDER BY created_at,id').bind(id).all()
+    env.DB.prepare('SELECT id,actor,action,reason,created_at FROM context_audit WHERE context_id=? ORDER BY created_at,id').bind(id).all(),
+    env.DB.prepare(`${flagSelect} WHERE f.context_id=? ORDER BY f.status='open' DESC,f.created_at DESC,f.id DESC LIMIT ?`)
+      .bind(id,DETAIL_ROWS+1).all<FlagRow>(),
+    env.DB.prepare(`${shareSelect} WHERE sh.context_id=? ORDER BY sh.revoked_at IS NULL DESC,sh.created_at DESC,sh.id DESC LIMIT ?`)
+      .bind(id,DETAIL_ROWS+1).all<ShareRow>(),
   ]);
-  return {context:{...view(row),sources:sources.results,audit:audit.results}};
+  const entry=view(row);
+  return {context:{...entry,sources:sources.results,audit:audit.results,
+    flags:flags.results.slice(0,DETAIL_ROWS).map(flagView),flags_truncated:flags.results.length>DETAIL_ROWS,
+    shares:shares.results.slice(0,DETAIL_ROWS).map(share=>shareView(share,entry.authoritative)),shares_truncated:shares.results.length>DETAIL_ROWS}};
 }
 
 export type CandidateInput = z.infer<typeof createSchema>;

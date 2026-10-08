@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 import { Miniflare, convertV4MiniflareOptions } from 'miniflare';
+import { disposeOnFailure } from './env-fixture';
 import { applyMigrations } from './migrations';
 
 export const workflowTokens={read:'synthetic-workflow-read-key-00000000000000',review:'synthetic-workflow-review-key-00000000000',
@@ -27,19 +28,23 @@ export async function workflowFixture(bindings:Record<string,string>={}) {
     headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},body:JSON.stringify(data)});
   const upload=(records:unknown[],token=workflowTokens.mbp)=>request('/v1/ingest/runtime',{method:'POST',
     headers:{Authorization:'Bearer '+token,'Content-Type':'application/x-ndjson'},body:records.map(record=>JSON.stringify(record)).join('\n')+'\n'});
-  const db=await mf.getD1Database('DB');
-  // Exercise upgrading a populated initial database, rather than only a fresh schema.
-  await applyMigrations(db,['0001_initial.sql']);
-  for (const [id,name,token] of [['mbp','Synthetic MBP',workflowTokens.mbp],['mini','Synthetic Mac mini',workflowTokens.mini]]) {
-    await db.prepare('INSERT INTO devices(id,name,token_hash,created_at) VALUES(?,?,?,?)')
-      .bind(id,name,hash(token),'2026-10-07T00:00:00Z').run();
-  }
-  const initial=await upload([workflowEvent('initial-event')]);
-  if (!initial.ok) throw new Error('Synthetic seed failed');
-  // Then every later committed migration, as an operator would before deploying new code.
-  await applyMigrations(db,(await readdir('migrations')).filter(name=>/^\d+.*\.sql$/.test(name) && name!=='0001_initial.sql').sort());
+  const close=async()=>{await mf.dispose();await rm(directory,{recursive:true,force:true});};
+  const db=await disposeOnFailure(close,async()=>{
+    const db=await mf.getD1Database('DB');
+    // Exercise upgrading a populated initial database, rather than only a fresh schema.
+    await applyMigrations(db,['0001_initial.sql']);
+    for (const [id,name,token] of [['mbp','Synthetic MBP',workflowTokens.mbp],['mini','Synthetic Mac mini',workflowTokens.mini]]) {
+      await db.prepare('INSERT INTO devices(id,name,token_hash,created_at) VALUES(?,?,?,?)')
+        .bind(id,name,hash(token),'2026-10-07T00:00:00Z').run();
+    }
+    const initial=await upload([workflowEvent('initial-event')]);
+    if (!initial.ok) throw new Error('Synthetic seed failed');
+    // Then every later committed migration, as an operator would before deploying new code.
+    await applyMigrations(db,(await readdir('migrations')).filter(name=>/^\d+.*\.sql$/.test(name) && name!=='0001_initial.sql').sort());
+    return db;
+  });
   return {request,read,write,upload,db,
     runtime:()=>mf,
     async restart(){await mf.dispose();mf=new Miniflare(options);},
-    async close(){await mf.dispose();await rm(directory,{recursive:true,force:true});}};
+    close};
 }
