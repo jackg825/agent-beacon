@@ -8,8 +8,8 @@ import { dataHealth } from '../src/health';
 import { Env, HttpError } from '../src/types';
 import { httpSource, restoreCheck, verifyRequest } from '../scripts/restore-check';
 import { createEnvFixture, syntheticEvent } from './env-fixture';
-import { backupTick, createContext, get, later, latestCheckpoint, operationsTokens, operationsWorker, post, reviewer, verifiedCheckpoint }
-  from './operations-fixture';
+import { backupTick, completeCheckpoint, createContext, drill, get, later, latestCheckpoint, operationsTokens, operationsWorker, post, reviewer,
+  verifiedCheckpoint } from './operations-fixture';
 
 const DAY = 86400_000;
 const status = (code: number) => (error: unknown) => error instanceof HttpError && error.status === code;
@@ -187,14 +187,22 @@ test('failed RAW deletes are retried, BACKUP copies leave after grace and resurr
     // A forwarder replay of the retained local log brings one batch back before the retry.
     await fixture.ingest([record]);
     const resurrected = await batchOf(env, 'grace-1');
-    const retry = await backupTick(env, now);
+    const hourLater = new Date(now.getTime() + 3600_000);
+    const retry = await backupTick(env, hourLater);
     assert.equal((retry.result as any).raw_deletes_retried, 1);
     assert.ok(await env.RAW.head(resurrected.r2_key), 'the live, resurrected batch keeps its raw object');
     assert.equal(await count(env, 'SELECT COUNT(*) AS n FROM retention_run_objects WHERE raw_deleted_at IS NULL'), 1);
     const health = await dataHealth({ ...env, MAINTENANCE_TASKS: 'backup' } as Env, { now });
     assert.deepEqual(health.findings.find(item => item.code === 'resurrected_batch')?.sample_ids, [resurrected.id]);
+    // The replayed batch is copied again, so a checkpoint taken after the run still restores completely.
+    assert.equal((await env.DB.prepare('SELECT copied_at FROM backup_raw_objects WHERE batch_id=?').bind(resurrected.id).first<any>()).copied_at,
+      hourLater.toISOString());
+    const after = await completeCheckpoint(env, hourLater);
+    assert.equal(after.raw_object_count, 1);
+    const report = await drill(env, after);
+    assert.equal(report.result, 'passed', JSON.stringify(report.failures));
     // Before the grace period the BACKUP copies stay; after it, only the non-resurrected copy goes.
-    await backupTick(env, now);
+    await backupTick(env, hourLater);
     assert.equal(await count(env, 'SELECT COUNT(*) AS n FROM retention_run_objects WHERE backup_deleted_at IS NOT NULL'), 0);
     const graceEnd = new Date(Date.parse(run.run.backup_delete_after) + 60_000);
     const pruned = await backupTick(env, graceEnd);
@@ -206,6 +214,8 @@ test('failed RAW deletes are retried, BACKUP copies leave after grace and resurr
     assert.ok((await env.DB.prepare('SELECT raw_pruned_at FROM backup_checkpoints LIMIT 1').first<any>()).raw_pruned_at);
     const first = (await env.DB.prepare('SELECT * FROM backup_checkpoints ORDER BY started_at LIMIT 1').first<any>());
     assert.ok(first.raw_pruned_at, 'checkpoints that listed the deleted copies are marked pruned');
+    assert.equal((await env.DB.prepare('SELECT raw_pruned_at FROM backup_checkpoints WHERE id=?').bind(after.id).first<any>()).raw_pruned_at, null,
+      'a checkpoint started after the run never listed the deleted copy');
     const { checkpointView } = await import('../src/backup');
     assert.equal(checkpointView(first).retention_ready, false);
   } finally { await fixture.close(); }

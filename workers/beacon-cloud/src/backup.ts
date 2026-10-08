@@ -112,11 +112,14 @@ async function copyRaw(env: Env, ctx: MaintenanceContext, limits: BackupLimits, 
   const statements = jsonChunks(copies).map(chunk => env.DB.prepare(`INSERT INTO backup_raw_objects(batch_id,r2_key,batch_received_at,status,size,sha256,copied_at,first_checkpoint_id)
     SELECT json_extract(value,'$.batch_id'),json_extract(value,'$.r2_key'),json_extract(value,'$.batch_received_at'),json_extract(value,'$.status'),
     json_extract(value,'$.size'),json_extract(value,'$.sha256'),?,json_extract(value,'$.first_checkpoint_id') FROM json_each(?) WHERE true
-    ON CONFLICT DO NOTHING`).bind(now, chunk));
+    ON CONFLICT(batch_id) DO UPDATE SET status=excluded.status,size=excluded.size,sha256=excluded.sha256,batch_received_at=excluded.batch_received_at,
+    copied_at=excluded.copied_at,deleted_at=NULL WHERE excluded.status='copied' AND (backup_raw_objects.status!='copied'
+    OR EXISTS(SELECT 1 FROM retention_run_objects r WHERE r.batch_id=excluded.batch_id AND r.created_at>=backup_raw_objects.copied_at))`).bind(now, chunk));
   statements.push(env.DB.prepare('UPDATE backup_state SET raw_cursor=?,revision=revision+1,updated_at=? WHERE id=1 AND revision=?')
     .bind(JSON.stringify([last.batch_received_at, last.batch_id]), now, state.revision));
   const results = await env.DB.batch(statements);
-  // Copies are idempotent; a lost cursor race only means another invocation got further.
+  // Copies are idempotent; a lost cursor race only means another invocation got further. A batch a
+  // forwarder replay brought back after retention (or whose source reappeared) is recorded as copied again.
   result.raw_copied = copies.length - missing;
   result.raw_source_missing = missing;
   if (results.at(-1)!.meta.changes !== 1) result.raw_cursor_conflict = true;
@@ -282,6 +285,14 @@ async function finalStep(env: Env, ctx: MaintenanceContext, cp: Checkpoint, limi
   return next;
 }
 
+/**
+ * Raw copies a checkpoint lists (binds: batches_through, raw_listed_at, started_at). Retention apply is
+ * refused while a checkpoint runs, so a copy is left out exactly when a run before the checkpoint deleted
+ * its batch after the copy was made; a replayed batch is copied again and so listed again.
+ */
+const RAW_LISTED = `o.status='copied' AND o.batch_received_at<=? AND o.copied_at<=?
+  AND NOT EXISTS(SELECT 1 FROM retention_run_objects r WHERE r.batch_id=o.batch_id AND r.created_at<? AND r.created_at>=o.copied_at)`;
+
 /** List the raw copies the checkpoint covers, once raw copying has caught up with every exported batch. */
 async function rawListStep(env: Env, ctx: MaintenanceContext, cp: Checkpoint, limits: BackupLimits, owner: string): Promise<Checkpoint | Stop> {
   if (!room(ctx, limits.allotment, { d1: 5, r2: 1 })) return 'budget';
@@ -293,11 +304,9 @@ async function rawListStep(env: Env, ctx: MaintenanceContext, cp: Checkpoint, li
     if (pending) return 'wait';
   }
   const listedAt = cp.raw_listed_at ?? iso(ctx.now), range = after(parsePair(cp.cursor), 'o.batch_received_at', 'o.batch_id');
-  // Retention apply is refused while a checkpoint runs, so runs before started_at are exactly the ones excluded.
   const page = await env.DB.prepare(`SELECT o.batch_id,o.r2_key,o.size,o.sha256,o.batch_received_at FROM backup_raw_objects o
-    WHERE o.status='copied' AND o.batch_received_at<=? AND o.copied_at<=? AND ${range.sql}
-    AND NOT EXISTS(SELECT 1 FROM retention_run_objects r WHERE r.batch_id=o.batch_id AND r.created_at<?)
-    ORDER BY o.batch_received_at,o.batch_id LIMIT ?`).bind(cp.batches_through ?? '', listedAt, ...range.args, cp.started_at, limits.rawListPage)
+    WHERE ${RAW_LISTED} AND ${range.sql} ORDER BY o.batch_received_at,o.batch_id LIMIT ?`)
+    .bind(cp.batches_through ?? '', listedAt, cp.started_at, ...range.args, limits.rawListPage)
     .all<{ batch_id: string; r2_key: string; size: number; sha256: string; batch_received_at: string }>();
   const entries = page.results, done = entries.length < limits.rawListPage, now = iso(ctx.now);
   let seq = cp.chunk_count, chunk: Row | null = null;
@@ -495,9 +504,7 @@ async function isMember(env: Env, cp: Checkpoint, key: string): Promise<boolean>
     return !!await env.DB.prepare('SELECT 1 AS member FROM backup_chunks WHERE checkpoint_id=? AND key=?').bind(cp.id, key).first();
   if (key.startsWith('raw/') && RAW_KEY.test(key.slice(4))) {
     if (!cp.raw_listed_at || !cp.batches_through) return false;
-    return !!await env.DB.prepare(`SELECT 1 AS member FROM backup_raw_objects o WHERE o.r2_key=? AND o.status='copied'
-      AND o.batch_received_at<=? AND o.copied_at<=?
-      AND NOT EXISTS(SELECT 1 FROM retention_run_objects r WHERE r.batch_id=o.batch_id AND r.created_at<?)`)
+    return !!await env.DB.prepare(`SELECT 1 AS member FROM backup_raw_objects o WHERE o.r2_key=? AND ${RAW_LISTED}`)
       .bind(key.slice(4), cp.batches_through, cp.raw_listed_at, cp.started_at).first();
   }
   throw new HttpError(400, 'Invalid backup object key');
