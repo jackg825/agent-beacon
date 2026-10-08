@@ -51,7 +51,7 @@ D1 用量的量級：`health` 每小時讀一頁 R2 清單（最多 1,000 個 ke
 | `ingest_backlog` | warning | 近 24 小時的批次，收到時間比事件時間的中位數晚 1 小時以上 |
 | `context_sources_invalid` | warning | 已核准筆記的來源範圍已改變（`authoritative=false`） |
 | `open_flags` | warning | 有尚未處理的筆記標記（該 table 存在時） |
-| `processing_failed`／`processing_queue_stale` | warning | 背景整理失敗，或佇列超過 6 小時未消化（該 table 存在時） |
+| `processing_failed`／`processing_queue_stale` | warning | 背景整理失敗，或佇列中有工作到期超過 6 小時仍未執行（以 `next_attempt_at` 計，重試的舊工作不算積壓；該 table 存在時） |
 | `backup_stale`／`backup_failed` | warning | 最近完成的備份超過兩倍間隔，或最近一次備份失敗 |
 | `backup_raw_lag` | warning | 收到超過 2 小時仍未複製到 BACKUP 的批次 |
 | `retention_raw_delete_pending` | warning | 保存期限已刪除索引，但 R2 原文刪除尚未完成 |

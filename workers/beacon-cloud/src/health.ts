@@ -79,7 +79,7 @@ const HINTS: Record<string, [Finding['severity'], string]> = {
   context_sources_invalid: ['warning', '已核准筆記的來源範圍已改變，不再是有效依據。請重新審閱原始來源，需要時建立新版本。'],
   open_flags: ['warning', '有尚未處理的筆記標記。請在「交接與記憶」查看並處理。'],
   processing_failed: ['warning', '背景整理工作失敗，需要審閱者重試或略過。'],
-  processing_queue_stale: ['warning', '背景整理佇列超過 6 小時未消化。確認 processing 排程已啟用且未超出預算。'],
+  processing_queue_stale: ['warning', '背景整理佇列有工作到期超過 6 小時仍未執行。確認 processing 排程已啟用且未超出預算。'],
   backup_stale: ['warning', '最近完成的備份已超過預期間隔。確認 backup 排程已啟用、BACKUP bucket 可寫入，並查看 checkpoint 錯誤碼。'],
   backup_failed: ['warning', '最近一次備份失敗。查看 checkpoint 錯誤碼；修正後可由審閱者重新啟動備份。'],
   backup_raw_lag: ['warning', '有超過 2 小時仍未複製到 BACKUP 的原文批次。確認 backup 排程持續執行。'],
@@ -216,12 +216,15 @@ export async function dataHealth(env: Env, options: { now?: Date; exact?: boolea
   let processing: Record<string, unknown> = { available: false };
   if (has('processing_jobs')) {
     try {
-      const rows = await env.DB.prepare(`SELECT status,COUNT(*) AS n,MIN(created_at) AS oldest FROM processing_jobs
-        WHERE status IN ('queued','running','failed') GROUP BY status`).all<{ status: string; n: number; oldest: string }>();
+      // created_at is the plan time and never changes; next_attempt_at is when a queued job became
+      // claimable (plan, backoff, reviewer retry or requeue), so staleness is measured from it.
+      const rows = await env.DB.prepare(`SELECT status,COUNT(*) AS n,MIN(created_at) AS oldest,MIN(next_attempt_at) AS due FROM processing_jobs
+        WHERE status IN ('queued','running','failed') GROUP BY status`).all<{ status: string; n: number; oldest: string; due: string }>();
       const by = Object.fromEntries(rows.results.map(row => [row.status, row]));
-      processing = { available: true, queued: by.queued?.n ?? 0, running: by.running?.n ?? 0, failed: by.failed?.n ?? 0, oldest_queued_at: by.queued?.oldest ?? null };
+      processing = { available: true, queued: by.queued?.n ?? 0, running: by.running?.n ?? 0, failed: by.failed?.n ?? 0,
+        oldest_queued_at: by.queued?.oldest ?? null, oldest_due_at: by.queued?.due ?? null };
       if (by.failed?.n) findings.push(finding('processing_failed', by.failed.n));
-      if (by.queued && now.getTime() - Date.parse(by.queued.oldest) > 6 * HOUR) findings.push(finding('processing_queue_stale', by.queued.n));
+      if (by.queued && now.getTime() - Date.parse(by.queued.due) > 6 * HOUR) findings.push(finding('processing_queue_stale', by.queued.n));
     } catch { processing = { available: true, error: 'query_failed' }; }
   }
   let flags: Record<string, unknown> = { available: false };
