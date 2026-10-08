@@ -153,8 +153,20 @@ export async function retentionPlan(env: Env, options: { now?: Date; maxBatches?
   const assessment = await assess(env, scanned, now), ids = new Set(scanned.map(batch => batch.id));
   const blocked = blockedWithin(ids, assessment.base, assessment.edges);
   const eligible = scanned.filter(batch => !blocked.has(batch.id));
-  // The plan itself must be closed: drop any selected batch that depends on one left out.
-  const selected = new Set(eligible.slice(0, maxBatches).map(batch => batch.id));
+  // The plan itself must be closed: take each eligible batch together with the batches its
+  // events' versions live in, skip a group that does not fit, then drop anything still open.
+  const depends = new Map<string, string[]>(), eligibleIds = new Set(eligible.map(batch => batch.id)), selected = new Set<string>();
+  for (const { home, other } of assessment.edges) depends.set(home, [...depends.get(home) ?? [], other]);
+  for (const batch of eligible) {
+    if (selected.size >= maxBatches) break;
+    const group = new Set<string>(), stack = [batch.id];
+    while (stack.length) {
+      const id = stack.pop()!;
+      if (group.has(id) || selected.has(id)) continue;
+      group.add(id); stack.push(...depends.get(id) ?? []);
+    }
+    if ([...group].every(id => eligibleIds.has(id)) && selected.size + group.size <= maxBatches) for (const id of group) selected.add(id);
+  }
   for (let inner = blockedWithin(selected, assessment.base, assessment.edges); inner.size; inner = blockedWithin(selected, assessment.base, assessment.edges))
     for (const id of inner) selected.delete(id);
   const batchIds = scanned.filter(batch => selected.has(batch.id)).map(batch => batch.id);
