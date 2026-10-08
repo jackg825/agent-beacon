@@ -22,10 +22,11 @@ test('official current MCP client discovers and lists only read-only tools', asy
   try {
     await client.connect(transport);
     assert.equal(client.getProtocolEra(), 'modern');
-    assert.equal(client.getServerVersion()?.version, '0.3.0');
+    assert.equal(client.getServerVersion()?.version, '0.4.0');
     // Clients are told that pipeline candidates and evaluator scores are not approved knowledge.
     assert.match(client.getInstructions() ?? '', /pending candidates the background pipeline generated/);
     assert.match(client.getInstructions() ?? '', /uncalibrated scores/);
+    assert.match(client.getInstructions() ?? '', /never actions for the client/);
     const { tools } = await client.listTools();
     assert.deepEqual(tools.map((tool) => tool.name).sort(), [
       'beacon_get_timeline', 'beacon_list_devices', 'beacon_list_projects', 'beacon_list_sessions',
