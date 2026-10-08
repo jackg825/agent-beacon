@@ -130,7 +130,7 @@ npm run backup:restore-check -- --dir /ABS/PATH/new-directory --checkpoint REPLA
 
 1. 先從伺服器取得 manifest 的 SHA-256，下載並核對 manifest；每個 key 都必須符合固定格式，檔案以 key 的 SHA-256 命名存在私人暫存目錄，不使用 key 當路徑。不使用 `--out` 時，結束後刪除暫存目錄。
 2. 下載並核對每個分塊與原文複本的大小與 SHA-256。不跟隨 redirect。
-3. 在新的 Miniflare D1 套用所有 migration，但**先略過 `CREATE TRIGGER`**；依 `PRAGMA foreign_key_list` 推出的外鍵順序載入資料（同 table 的版本鏈先載入前一版；最終快照重讀的資料列依主鍵取代較早一輪匯出的同一列，找不到那一列時記為 `revision_without_row`），再用同一份 migration 文字建立 trigger，並比對 `sqlite_master` 保存的 trigger SQL 與原文完全一致。任何一個 table 無法載入（例如主鍵重複）記為 `row_load_failed`。這是唯一的載入方式，只用在這個暫存資料庫。
+3. 在新的 Miniflare D1 套用所有 migration，但**先略過 `CREATE TRIGGER`**；依 `PRAGMA foreign_key_list` 推出的外鍵順序載入資料（同 table 的版本鏈先載入前一版；最終快照重讀的資料列依主鍵取代較早一輪匯出的同一列，找不到那一列時記為 `revision_without_row`），再用同一份 migration 文字建立 trigger，並比對 `sqlite_master` 保存的 trigger SQL 與原文完全一致。任何一個 table 無法載入（例如主鍵重複，或某列指向不存在的父列：暫存 D1 在載入時就強制外鍵）記為 `row_load_failed`，之後依賴它的檢查也會跟著失敗。這是唯一的載入方式，只用在這個暫存資料庫。
 4. 檢查：`PRAGMA foreign_key_check` 為空、各 table 列數與 manifest 相同、筆記審閱狀態欄位一致、每份已審閱筆記都有 `review_id` 對應的稽核、每份被取代的筆記都有已核准的新版與 `:supersede` 稽核、密封筆記有 1–20 個來源、裝置數與 token 雜湊數一致，以及**每個事件版本都能從原文那一行重新算出 `payload_hash`**。
 
 輸出是 `{report, report_sha256, verify_request}`，只有數量、錯誤碼和雜湊。`result` 為 `passed` 時，把 `verify_request` 原樣送到 `POST /api/backups/:id/verify`，或貼到 dashboard 的「記錄還原演練結果」。常見失敗碼：`manifest_sha256_mismatch`、`chunk_sha256_mismatch`、`raw_sha256_mismatch`、`invalid_manifest_key`、`unknown_table`（備份含有本機 migration 沒有的 table）、`foreign_key_violation`、`trigger_mismatch`、`raw_not_in_manifest`、`payload_hash_mismatch`、`revision_without_row`、`row_load_failed`。

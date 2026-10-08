@@ -4,7 +4,7 @@ import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { promisify } from 'node:util';
 import { existsSync } from 'node:fs';
-import { chmod, mkdir, mkdtemp, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BACKUP_BOOKKEEPING, BATCH_TABLES, LEDGER_TABLES, REVISED_TABLES, SNAPSHOT_TABLES } from '../src/operations-shared';
@@ -187,6 +187,114 @@ test('a checkpoint chunks rows, snapshots every other table, copies raw batches,
       await assert.rejects(backupsReviewerRead(get(`/api/backups/${checkpoint.id}/object?key=a&key=b`), env, reviewer), (error: any) => error.status === 400);
       await assert.rejects(backupsReviewerRead(get(`/api/backups/not-a-uuid`), env, reviewer), (error: any) => error.status === 400);
     });
+  } finally { await fixture.close(); }
+});
+
+test('each restore-drill consistency check fails on a backup that is internally consistent but wrong', async () => {
+  const fixture = await createEnvFixture({ backup: true });
+  try {
+    const env = fixture.env;
+    const { migrations } = await seed(fixture);
+    const checkpoint = await completeCheckpoint(env, later(15));
+    assert.equal((await drill(env, checkpoint, migrations)).result, 'passed');
+    type Line = { t: string; r: Record<string, any>; revision?: true };
+    type Forged = { manifest: Manifest; lines: Map<string, any[]>; raw: Map<string, string> };
+    const pristine: Forged = { manifest: JSON.parse(await objectText(env, checkpoint.manifest_key!)), lines: new Map(), raw: new Map() };
+    for (const chunk of pristine.manifest.chunks) pristine.lines.set(chunk.key, (await objectText(env, chunk.key)).split('\n').filter(Boolean).map(text => JSON.parse(text)));
+    // Rewrite the objects a mutation touched, with matching sizes and hashes all the way up to the manifest.
+    const forged = async (mutate: (f: Forged) => void | Promise<void>, migrationsDirectory = migrations) => {
+      const f: Forged = structuredClone(pristine);
+      await mutate(f);
+      const overlay = new Map<string, Uint8Array>();
+      for (const [key, text] of f.raw) overlay.set(key, new TextEncoder().encode(text));
+      for (const chunk of f.manifest.chunks) {
+        const list = f.lines.get(chunk.key)!, body = new TextEncoder().encode(list.length ? list.map(item => JSON.stringify(item)).join('\n') + '\n' : '');
+        Object.assign(chunk, { sha256: sha(body), bytes: body.byteLength });
+        overlay.set(chunk.key, body);
+      }
+      const text = JSON.stringify(f.manifest);
+      overlay.set(checkpoint.manifest_key!, new TextEncoder().encode(text));
+      const backing = bucketSource(env.BACKUP!);
+      const source = { get: async (key: string) => overlay.get(key) ?? backing.get(key) };
+      const report = await withDir(workDir => restoreCheck({ checkpointId: checkpoint.id, source, expectedManifestSha256: sha(text), workDir, migrationsDirectory }));
+      return report.failures.map(failure => failure.code).sort();
+    };
+    const rowsOf = (f: Forged) => f.manifest.chunks.filter(chunk => chunk.kind !== 'raw_list')
+      .flatMap(chunk => f.lines.get(chunk.key)!.map((line: Line, index: number) => ({ chunk, line, index })));
+    /** Remove matching rows, keeping every count consistent with what is left. */
+    const remove = (f: Forged, table: string, match: (row: Record<string, any>) => boolean) => {
+      let removed = 0;
+      for (const chunk of f.manifest.chunks.filter(item => item.kind !== 'raw_list')) {
+        const kept = f.lines.get(chunk.key)!.filter((line: Line) => !(line.t === table && !line.revision && match(line.r)));
+        const gone = f.lines.get(chunk.key)!.length - kept.length;
+        if (gone) { f.lines.set(chunk.key, kept); chunk.rows[table] -= gone; removed += gone; }
+      }
+      f.manifest.table_counts[table] -= removed;
+      assert.ok(removed > 0, `nothing to remove from ${table}`);
+    };
+    const edit = (f: Forged, table: string, match: (row: Record<string, any>) => boolean, change: (row: Record<string, any>) => void) => {
+      const found = rowsOf(f).filter(({ line }) => line.t === table && match(line.r));
+      assert.ok(found.length, `nothing to edit in ${table}`);
+      for (const { line } of found) change(line.r);
+    };
+    const superseded = rowsOf(pristine).find(({ line }) => line.t === 'context_entries' && line.r.status === 'superseded')!.line.r;
+    const child = rowsOf(pristine).find(({ line }) => line.t === 'context_entries' && line.r.supersedes_id === superseded.id)!.line.r;
+    const openFlag = rowsOf(pristine).find(({ line }) => line.t === 'context_flags' && line.r.status === 'open')!.line.r;
+    const share = rowsOf(pristine).find(({ line }) => line.t === 'context_shares')!.line.r;
+    const version = rowsOf(pristine).find(({ line }) => line.t === 'event_versions')!.line.r;
+    const batch = rowsOf(pristine).find(({ line }) => line.t === 'batches' && line.r.id === version.batch_id)!.line.r;
+    const editedTriggers = await mkdtemp(join(tmpdir(), 'beacon-migrations-'));
+    try {
+      for (const name of await readdir(migrations)) await writeFile(join(editedTriggers, name), await readFile(join(migrations, name)));
+      // SQLite stores CREATE TRIGGER without IF NOT EXISTS, so this trigger no longer matches its migration text.
+      const file = join(editedTriggers, '0006_data_operations.sql');
+      await writeFile(file, (await readFile(file, 'utf8')).replace('CREATE TRIGGER retention_runs_no_update', 'CREATE TRIGGER IF NOT EXISTS retention_runs_no_update'));
+      const cases: [string[], (f: Forged) => void | Promise<void>, string?][] = [
+        [['payload_hash_mismatch'], async (f) => {
+          // A raw line that no longer re-hashes to its payload_hash, with its copy, list entry and hashes rewritten to match.
+          const key = 'raw/' + batch.r2_key, lines = (await objectText(env, key)).split('\n');
+          lines[version.line_number] = lines[version.line_number].replace('"timestamp"', '"timestamp_forged"');
+          const text = lines.join('\n');
+          f.raw.set(key, text);
+          for (const chunk of f.manifest.chunks.filter(item => item.kind === 'raw_list'))
+            for (const entry of f.lines.get(chunk.key)!) if (entry.key === key) Object.assign(entry, { size: new TextEncoder().encode(text).byteLength, sha256: sha(text) });
+        }],
+        [['raw_line_missing'], (f) => edit(f, 'event_versions', row => row.event_id === version.event_id && row.payload_hash === version.payload_hash,
+          row => { row.line_number = 99; })],
+        // D1 enforces foreign keys while loading, so a dangling row stops its table from loading at all.
+        [['context_flag_evidence_unresolved', 'context_sources_count_invalid', 'row_count_mismatch', 'row_load_failed'],
+          (f) => remove(f, 'batches', row => row.id === batch.id)],
+        [['trigger_mismatch'], () => {}, editedTriggers + '/'],
+        [['row_count_mismatch'], (f) => { f.manifest.table_counts.tasks = (f.manifest.table_counts.tasks ?? 0) + 1; }],
+        [['device_token_digest_mismatch', 'row_count_mismatch'], (f) => { f.manifest.table_counts.devices += 1; }],
+        [['context_review_audit_missing'], (f) => remove(f, 'context_audit', row => row.id === child.review_id)],
+        [['context_supersede_invalid'], (f) => remove(f, 'context_audit', row => row.id === child.review_id + ':supersede')],
+        [['context_sources_count_invalid'], (f) => remove(f, 'context_sources', row => row.context_id === child.id)],
+        [['context_flag_audit_missing'], (f) => remove(f, 'context_flag_audit', row => row.id === openFlag.id + ':create')],
+        [['context_flag_evidence_unresolved'], (f) => edit(f, 'context_flags', row => row.id === openFlag.id,
+          row => { row.evidence = JSON.stringify([{ event_id: 'f'.repeat(64), payload_hash: 'f'.repeat(64) }]); })],
+        [['context_share_audit_missing'], (f) => remove(f, 'context_share_audit', row => row.id === share.id + ':create')],
+        [['chunk_row_count_mismatch'], (f) => { f.manifest.chunks.find(chunk => chunk.kind === 'final')!.rows.devices += 1; }],
+        [['chunk_row_count_mismatch'], (f) => {
+          const chunk = f.manifest.chunks.find(item => item.kind === 'final')!;
+          chunk.revisions = { ...chunk.revisions, devices: (chunk.revisions?.devices ?? 0) + 1 };
+        }],
+        [['raw_object_count_mismatch'], (f) => { f.manifest.raw.objects += 1; }],
+        [['revision_without_row'], (f) => {
+          const chunk = f.manifest.chunks.find(item => item.kind === 'final')!;
+          const session = rowsOf(f).find(({ line }) => line.t === 'sessions')!.line.r;
+          f.lines.get(chunk.key)!.push({ t: 'sessions', r: { ...session, id: 'f'.repeat(64) }, revision: true });
+          chunk.revisions = { ...chunk.revisions, sessions: (chunk.revisions?.sessions ?? 0) + 1 };
+        }],
+        // A duplicate key: the whole table is refused, so the review invariants that depend on it fail too.
+        [['context_review_audit_missing', 'context_supersede_invalid', 'row_count_mismatch', 'row_load_failed'], (f) => {
+          const { chunk, line } = rowsOf(f).find(({ line }) => line.t === 'context_audit')!;
+          f.lines.get(chunk.key)!.push(structuredClone(line));
+          chunk.rows.context_audit += 1; f.manifest.table_counts.context_audit += 1;
+        }],
+      ];
+      for (const [codes, mutate, directory] of cases) assert.deepEqual(await forged(mutate, directory), codes, codes.join());
+    } finally { await rm(editedTriggers, { recursive: true, force: true }); await rm(migrations, { recursive: true, force: true }); }
   } finally { await fixture.close(); }
 });
 
