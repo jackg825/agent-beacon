@@ -13,7 +13,11 @@ test('dashboard shell keeps data private and constrains script and network origi
   assert.match(policy, /connect-src 'self'/);
   assert.match(policy, /frame-ancestors 'none'/);
   assert.match(html, /lang="zh-Hant"/);
-  assert.match(html, /AI 自動 compact 尚未提供/);
+  // The context notice states what background processing does and does not do.
+  assert.match(html, /「自動整理・待審」候選/);
+  assert.match(html, /不使用生成模型/);
+  assert.match(html, /Jev 只留下未校準訊號，不能核准或修改筆記/);
+  assert.doesNotMatch(html, /尚未提供/);
   assert.match(html, /原始事件維持保存/);
 });
 
