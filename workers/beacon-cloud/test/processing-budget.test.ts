@@ -127,21 +127,30 @@ test('stale reservations become outcome_unknown and still count; live leases and
     for (const [id, started] of [[dead, old], [live, old], [reclaimed, old], [recent, '2026-10-09T11:59:00.000Z']])
       reservations.push(await reserveCall(f.env, call(id, { now: started })));
     assert.ok(reservations.every((result) => result.reserved));
-    // The first job's invocation died and its lease lapsed; the third was reclaimed by a later attempt.
-    await f.env.DB.prepare(`UPDATE processing_jobs SET lease_until=? WHERE id=?`).bind('2026-10-09T11:10:00.000Z', dead).run();
+    // The first job's invocation died and its lease lapsed; the third was reclaimed by a later attempt. The
+    // fourth job's lease lapsed too, but its call started 60 s ago: only its age keeps it reserved, since a
+    // call can still be in flight for up to the longest timeout (30 s) plus 60 s after it started.
+    for (const id of [dead, recent]) await f.env.DB.prepare(`UPDATE processing_jobs SET lease_until=? WHERE id=?`).bind('2026-10-09T11:10:00.000Z', id).run();
     await f.env.DB.prepare(`UPDATE processing_jobs SET attempts=2,lease_owner='owner-b' WHERE id=?`).bind(reclaimed).run();
     assert.equal(await sweepStaleReservations(f.env, new Date(now)), 2);
-    const rows = (await f.env.DB.prepare('SELECT job_id,status,error_code FROM processing_calls ORDER BY started_at,job_id').all<any>()).results;
-    const status = Object.fromEntries(rows.map((row) => [row.job_id, [row.status, row.error_code]]));
+    const statuses = async () => Object.fromEntries((await f.env.DB.prepare('SELECT job_id,status,error_code FROM processing_calls').all<any>())
+      .results.map((row) => [row.job_id, [row.status, row.error_code]]));
+    let status = await statuses();
     assert.deepEqual(status[dead], ['outcome_unknown', 'stale_reservation']);
     assert.deepEqual(status[reclaimed], ['outcome_unknown', 'stale_reservation']);
     assert.deepEqual(status[live], ['reserved', null]);
     assert.deepEqual(status[recent], ['reserved', null]);
+    // 89 s after it started it is still left alone; at 90 s and one millisecond it is stale.
+    assert.equal(await sweepStaleReservations(f.env, new Date('2026-10-09T12:00:29.000Z')), 0);
+    assert.equal(await sweepStaleReservations(f.env, new Date('2026-10-09T12:00:30.001Z')), 1);
+    status = await statuses();
+    assert.deepEqual(status[recent], ['outcome_unknown', 'stale_reservation']);
+    assert.deepEqual(status[live], ['reserved', null]);
     // An outcome_unknown call never turns into a success later, and it still uses up the day.
     const [unknown] = reservations as any[];
     assert.equal(await finishCall(f.env, unknown.call.id, { status: 'succeeded', finished_at: now }), false);
     const view = await usage(f.env);
-    assert.deepEqual([view.usage.calls, view.usage.outcome_unknown, view.usage.reserved, view.remaining.calls], [4, 2, 2, 0]);
+    assert.deepEqual([view.usage.calls, view.usage.outcome_unknown, view.usage.reserved, view.remaining.calls], [4, 3, 1, 0]);
     assert.equal(view.usage.counted_tokens, 4 * 1256);
     assert.equal(view.usage.reported_cost_usd, null);
   } finally { await f.close(); }
