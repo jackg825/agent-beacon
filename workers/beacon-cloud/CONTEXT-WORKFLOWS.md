@@ -217,6 +217,8 @@ Dashboard「交接與記憶」的筆記詳情顯示有效期間、修訂鏈、�
 
 `0007_context_revisions.sql` 是 additive migration：新增標記、共享與兩份稽核 tables、trigger 和索引，並在 `device_sync_subscriptions` 加上預設為 0 的 `include_shared` 欄位。Jev 標記的檢查會讀 `0004` 的背景整理 tables，所以要在 `0004`–`0006` 之後套用（`wrangler d1 migrations apply` 本來就依序執行）。ingest 不讀寫這些 tables；舊程式不使用它們，退版時保留不動，不要 drop tables 或刪除稽核紀錄。
 
+`0010_context_supersedes_partial_index.sql` 只把 `context_entries_supersedes` 換成只收錄修訂（`supersedes_id IS NOT NULL`）、並帶 `status` 與 `reviewed_at` 的部分索引。大多數筆記沒有上一版；原本的索引在任何一次 `ANALYZE` 之後會被統計資料判定為無用，有效期間、`as_of` 查詢與修訂鏈就會對每一列掃描整個 table。新索引在有統計資料時仍會被使用（測試在 `ANALYZE` 之後以 `EXPLAIN QUERY PLAN` 確認）。它只重建索引，不改資料。
+
 ## 升級既有 TEST 與回復
 
 以下是待執行的 runbook，本文件沒有替雲端部署或還原作業提供驗收證據。正式 production 仍依 [DEPLOYMENT.md](DEPLOYMENT.md) 的授權與隔離流程；不要把本機通過當成 production 完成。

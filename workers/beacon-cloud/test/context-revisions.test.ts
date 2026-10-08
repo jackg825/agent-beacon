@@ -92,6 +92,40 @@ test('validity windows follow supersession, the history shows the whole chain, a
   } finally { await f.close(); }
 });
 
+test('revision lookups stay on the revision index once statistics exist (EXPLAIN QUERY PLAN after ANALYZE)', async () => {
+  const f = await createEnvFixture();
+  try {
+    await f.ingest(syntheticEvent('plan-1'));
+    const from = await source(f, 'plan-1');
+    const v1 = await note(f.env, from, { title: 'plan v1' }, 'approve');
+    // Many entries and no revision yet, the normal state (the pipeline never sets supersedes_id),
+    // when someone runs a plain ANALYZE; the statistics stay as they are after the first revision.
+    const rows = Array.from({ length: 300 }, (_, index) => ({ id: crypto.randomUUID(), at: new Date(Date.UTC(2026, 9, 1) + index * 1000).toISOString() }));
+    await f.env.DB.prepare(`INSERT INTO context_entries(id,kind,project_id,title,content,created_at) SELECT json_extract(value,'$.id'),'memory',?,
+      'Synthetic plan filler','Synthetic only.',json_extract(value,'$.at') FROM json_each(?)`).bind(from.project_id, JSON.stringify(rows)).run();
+    await f.env.DB.prepare('ANALYZE').run();
+    const v2 = await note(f.env, from, { title: 'plan v2', supersedes: v1 }, 'approve');
+    // Plan exactly the statements the read paths run.
+    const captured: { sql: string; args: unknown[] }[] = [];
+    const recording = { ...f.env, DB: new Proxy(f.env.DB, { get(target, property) {
+      if (property === 'prepare') return (sql: string) => new Proxy(target.prepare(sql), { get(statement, key) {
+        if (key === 'bind') return (...args: unknown[]) => { captured.push({ sql, args }); return statement.bind(...args); };
+        const value = (statement as any)[key]; return typeof value === 'function' ? value.bind(statement) : value;
+      } });
+      const value = Reflect.get(target, property, target); return typeof value === 'function' ? value.bind(target) : value;
+    } }) } as Env;
+    await listContext(recording, new URLSearchParams({ as_of: new Date().toISOString() }));
+    await listContext(recording, new URLSearchParams({ project_id: from.project_id }));
+    await getContext(recording, v2);
+    await contextHistory(recording, v1);
+    const steps: string[] = [];
+    for (const { sql, args } of captured.filter((item) => /context_entries/.test(item.sql)))
+      steps.push(...(await f.env.DB.prepare('EXPLAIN QUERY PLAN ' + sql).bind(...args).all<{ detail: string }>()).results.map((row) => row.detail));
+    assert.ok(steps.some((step) => /SEARCH (child|c) USING (COVERING )?INDEX context_entries_supersedes/.test(step)), steps.join('\n'));
+    for (const step of steps) assert.doesNotMatch(step, /^SCAN (child|c)$/, 'a full scan of context_entries per row');
+  } finally { await f.close(); }
+});
+
 test('reviewer flags need an approved entry and existing evidence, close once with a reason, and never touch the note', async () => {
   const f = await createEnvFixture();
   try {
