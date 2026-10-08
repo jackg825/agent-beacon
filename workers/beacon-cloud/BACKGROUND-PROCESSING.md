@@ -1,16 +1,18 @@
-# 背景整理（第二階段 A 部分）
+# 背景整理（第二階段）
 
-這份文件說明第二階段已實作的背景整理：規則與隱私、持久背景工作，以及不連網的規則式摘要。它**預設完全關閉**；部署這份程式不會改變既有 TEST 的行為，直到 operator 明確開啟排程，且審閱者明確啟用政策。
+這份文件說明第二階段已實作的背景整理：規則與隱私、持久背景工作、不連網的規則式摘要、可選的 Jev 篩選，以及外部呼叫的預算與 ledger。它**預設完全關閉**；部署這份程式不會改變既有 TEST 的行為，直到 operator 明確開啟排程，且審閱者明確啟用政策。外部呼叫另外需要 operator 的部署允許清單與專屬金鑰。
 
-已實作（A 部分）：
+已實作：
 
 - 處理政策：工作區上限、專案收窄、欄位類別、整理時機，每次修改都留稽核。
 - 遮蔽與投影：只把政策允許的欄位類別放進投影，所有字串先遮蔽 credentials 與使用者路徑。
 - 持久背景工作：以來源集合決定工作身分、以「涵蓋」取代時間水位、每個範圍同時只有一份進行中工作、租約與重試、執行前重新檢查政策與範圍。
 - `beacon.extractive.v1`：只根據原始事件投影產生固定四節、每一點都有來源編號的「自動整理・待審」候選。
-- Dashboard「背景整理」分頁、兩個唯讀 MCP 工具。
+- 可選 Jev 篩選：只產生未校準的訊號；只有在部署閘門、政策、金鑰與預算預約都通過時才會呼叫，預設不會略過任何工作。
+- 外部呼叫預算：每日呼叫數、token、供應商回報金額上限，原子預約、結果不明一律計入、同一份工作不重送。
+- Dashboard「背景整理」分頁（政策、工作、預算與今日用量、未校準訊號）、兩個唯讀 MCP 工具。
 
-尚未實作（B 部分，介面已預留）：可選 Jev 篩選、外部呼叫預算與 ledger 的實際邏輯、`/api/processing/budget` 與 `/api/processing/usage`。A 部分**沒有任何對外 fetch**。模型生成延後到記錄好供應商、模型、secret、可送資料範圍與每日金額上限之後才會開始（見下文）。
+仍延後：**模型生成**。要等記錄好供應商、模型、secret 管理、可送資料範圍與每日美元上限之後才會開始（見下文）。目前唯一的外部呼叫是可選的 Jev；secret 一律使用這個服務專屬的值，不借用其他 Cloudflare 專案或應用程式的 secret。
 
 本機合成驗證結果由 [VALIDATION.md](VALIDATION.md) 記錄；這份文件不是雲端部署或真實資料的驗收紀錄。
 
@@ -37,6 +39,7 @@
 4. 需要時對單一專案再收窄，例如只允許中繼資料或關閉某個專案：`{"scope_type":"project","scope_id":"REPLACE_WITH_CENTRAL_PROJECT_SHA256",...}`。
 5. 等下一次排程，或用 `POST /api/processing/run` 立即規劃一個任務或專案。
 6. 在「交接與記憶」切換到「待審・尚未採用」，審閱標示「自動整理・待審」的候選。核准、拒絕與修訂流程和手動筆記相同。
+7. 只有在需要 Jev 訊號時，才依「可選 Jev 篩選」另外開啟；摘要本身不需要任何外部呼叫。
 
 要停止：把工作區 `enabled` 改成 `false`（已排入的工作會在執行前重新檢查並以 `policy_changed` 略過），或從 `MAINTENANCE_TASKS` 移除 `processing`。兩者都不會刪除任何資料。
 
@@ -47,8 +50,8 @@
 | 欄位 | 意思 | 預設／範圍 |
 | --- | --- | --- |
 | `enabled` | 是否規劃這個範圍的工作 | `false` |
-| `external_allowed` | 是否允許內容離開工作區（B 部分才會使用） | `false` |
-| `jev_enabled` | 是否允許 Jev 篩選（B 部分才會使用） | `false` |
+| `external_allowed` | 是否允許 `external_fields` 的內容離開工作區（目前只送往 Jev） | `false` |
+| `jev_enabled` | 是否允許 Jev 篩選 | `false` |
 | `summary_fields` | 本機規則摘要可以使用的欄位類別 | `[]` |
 | `external_fields` | 可以送出工作區的欄位類別，必須是 `summary_fields` 的子集 | `[]` |
 | `min_new_events` | 未涵蓋事件至少幾個才整理 | 20（1–1000） |
@@ -63,7 +66,7 @@
 - 時機（`min_new_events`、`quiet_minutes`）使用專案列；沒有專案列就沿用工作區列。
 - `policy_hash` 是生效政策內容的 SHA-256，不是列的版本號。任何會改變行為的修改都會改變它。
 
-外部呼叫另有部署時的閘門：`EXTERNAL_PROCESSING_PROJECTS`（逗號分隔的中央專案 ID 或 `*`）必須列出該專案、生效政策允許 `external_allowed` 與 `jev_enabled`、`JEV_API_KEY` 存在，而且 B 部分的每日預算預約成功。審閱者的政策只能在 operator 開放的範圍內收窄。A 部分沒有外部呼叫，`GET /api/processing/policy?project_id=` 只顯示這些條件目前是否成立。
+外部呼叫另有部署時的閘門：`EXTERNAL_PROCESSING_PROJECTS`（逗號分隔的中央專案 ID 或 `*`）必須列出該專案、生效政策允許 `external_allowed` 與 `jev_enabled`、`JEV_API_KEY` 存在、端點與模型設定有效，而且每日預算預約成功。前四項是 operator 的部署設定，審閱金鑰改不了；審閱者的政策與預算只能在 operator 開放的範圍內使用。`GET /api/processing/policy?project_id=` 的 `external_gate` 顯示前幾項目前是否成立，預約要到實際呼叫前才會發生。
 
 ## 欄位類別
 
@@ -79,8 +82,8 @@
 | `response_text` | `agent.*` 事件的 `message`、`gen_ai.output.messages` |
 | `file_diff` | `file.diff` |
 | `tool_input` | 工具呼叫參數、`tool.input` |
-| `titles` | 任務標題、筆記標題、專案名稱（摘要標題與 B 部分的 Jev state） |
-| `approved_note_text` | 已核准筆記內容（只給 B 部分的 Jev，A 部分不使用） |
+| `titles` | 任務標題、筆記標題、專案名稱（摘要標題與 Jev state） |
+| `approved_note_text` | 已核准筆記內容（只給 Jev，摘要不使用） |
 | `raw` | `raw` 物件、非 agent 事件的 `message`、錯誤訊息 |
 
 其他欄位（repo 網址、主機名稱、使用者、工作目錄等）一律不放進投影。
@@ -165,16 +168,102 @@
 
 `src/generator.ts` 的 `Generator` 介面是日後模型生成的接點，必須維持相同輸出規則。模型生成**尚未提供**，也沒有任何 `GENERATOR_*` 設定。要開始之前，先記錄選定的供應商、模型、secret 管理、可送出的欄位範圍與每日美元上限，先跑合成資料與受控供應商測試，再另外決定是否允許真實私人內容。使用這個服務專屬的 secret，不借用其他 Cloudflare 專案或應用程式的 secret。
 
+## 可選 Jev 篩選（只產生訊號）
+
+Jev（TypeSafe System One）只回答三種問題：新活動是否有已核准筆記沒有的新資訊、是否與任務相關、是否與某一則已核准筆記矛盾。它不刪原文、沒有審閱權限、不核准也不修改任何筆記；回答以「未校準分數」保存，只供人參考。預設不會因為 Jev 的回答略過任何工作。
+
+### 開啟步驟
+
+1. operator 準備這個服務專屬的 Jev 金鑰，用 `wrangler secret put JEV_API_KEY` 設定。不要借用其他 Cloudflare 專案或應用程式的 secret。
+2. operator 在 Worker vars 設定 `EXTERNAL_PROCESSING_PROJECTS`：允許送出的中央專案 ID（逗號分隔），或 `*`。沒有這個 var，無論政策怎麼設定都不會有外部呼叫。
+3. 需要時設定 `JEV_ENDPOINT`（預設 `https://api.typesafe.ai/v1/systemone`）與 `JEV_MODEL`（預設 `jev-latest`）。端點必須是 https，不能含帳密、query 或 fragment，也不能指向這個 Worker 的 `PUBLIC_URL` 主機；不符合就停用 Jev。
+4. 審閱者在工作區（與專案）政策打開 `external_allowed` 與 `jev_enabled`，並在 `external_fields` 列出可以送出的欄位。至少要有 `titles`（只能問任務相關性）或 `approved_note_text`（才能問新資訊與矛盾）；兩者都沒有時不會呼叫。
+5. 審閱者設定每日預算（見下一節）。沒有預算列或上限為 0 時不會呼叫。
+6. 等下一次排程。工作詳細資料列出 Jev 訊號與外部呼叫紀錄，dashboard「背景整理」顯示今日用量。
+
+要停止：關掉政策的 `jev_enabled` 或 `external_allowed`、把預算上限改成 0，或從 `EXTERNAL_PROCESSING_PROJECTS` 移除專案。已排入的工作執行前會重新檢查政策（`policy_changed`），預約在每次呼叫前才進行，所以下一次呼叫就會停止。
+
+### 送出的內容
+
+- `state.events`：執行時依當時政策建立的遮蔽投影，再收窄到 `external_fields`。中繼資料（動作、類型、時間、harness、結束碼、核准決定、usage 數字）一律包含；`file_path` 不在 `external_fields` 時只送副檔名。
+- `state.approved_notes`：只有 `approved_note_text` 在 `external_fields` 時才送，最多 10 則屬於該範圍專案的現行 authoritative 筆記（任務範圍包含該任務與全專案筆記，依建立時間由新到舊），從不包含其他專案或分享進來的筆記。每則有 ID、種類、遮蔽後最多 2,000 字元的內容與原文 SHA-256；標題只在 `titles` 允許時才送。
+- `state.scope`：範圍類型；`titles` 允許時加上任務標題與專案名稱。
+- 整份 request 先在所有字串中收集「指定給機密 key 的值」，再一起遮蔽，並移除本 Worker 自己的 secrets（包括 `JEV_API_KEY`）。
+- 超過預算的 `max_input_chars` 時，依上游方式保留開頭與結尾的事件並插入省略標記，必要時再從最舊的筆記開始移除（連同它的矛盾問題）。只會整個移除事件或筆記，不會切斷字串；連一個事件都放不下就不呼叫。
+
+### 問題與 wire contract
+
+Request 與上游 `cli/beacon/internal/learning/evaluator.go` 相同：`POST {model, state, questions}`，每個問題是 `{"type":"noul","instructions":…,"criteria":{"true":…,"false":…}}`，header 為 `Authorization: Bearer <JEV_API_KEY>`。回答讀 `answers[id].noul`（其次 `probability`、`score`）與 `confidence`，也接受舊的 `questions`／`results` 陣列；只採用實際問過的問題、只保存數字。供應商回傳的 `model`、說明或任何文字都不保存，訊號的 `model` 是設定的模型名稱。
+
+| 問題 | 何時問 |
+| --- | --- |
+| `new_information` | 有可送出的已核准筆記時 |
+| `task_related` | 任務範圍，且 `titles` 可送出時 |
+| `contradiction:<筆記 ID>` | 每一則送出的筆記各一題 |
+
+### 決定
+
+- 每個回答存進 `processing_signals`（`calibrated=0`），API 與 dashboard 一律標示為未校準分數，不代表正確率。
+- 只有在政策設定了 `jev_skip_threshold`、`new_information` 低於門檻，**而且**來源中沒有高訊號事件（非零結束碼、工具失敗、拒絕、政策強制）、也沒有任何 `contradiction:*` ≥ 0.5 時，工作才會以 `jev_no_new_information` 略過。這種略過會涵蓋來源（門檻是審閱者校準後的明確選擇），原文仍然保留。有高訊號時照常產生候選並記 `jev_skip_overridden`。
+- 門檻預設 `null`，也就是永不略過。設定前先用合成或明確允許的資料記錄校準結果。
+- `contradiction:<筆記 ID>` ≥ 0.5 目前只是那一則筆記的訊號；之後的修訂流程才會把它轉成待確認標記。任何情況都不會修改筆記。
+
+### 失敗不影響整理
+
+Jev 只是參考：呼叫失敗時工作照常用規則摘要完成，並在工作上留一個代碼。
+
+| 工作 `note` | 意思 |
+| --- | --- |
+| `jev_failed` | 呼叫失敗（HTTP 錯誤、轉址、回應過大或格式不符），沒有訊號 |
+| `jev_outcome_unknown` | 逾時或連線中斷，供應商可能已處理；已計入預算 |
+| `jev_previous_outcome_unknown`／`jev_previous_failed` | 同一份工作先前已呼叫過，重試時不再重送 |
+| `jev_budget:<代碼>` | 預約被拒絕：`budget_disabled`、`daily_call_limit`、`daily_token_limit`、`usd_ceiling`、`input_too_large`、`lease_lost` |
+| `jev_input_too_large` | 連一個事件都放不進輸入上限 |
+| `jev_no_time` | 本次排程剩餘時間不足一次呼叫 |
+| `jev_skip_overridden` | 低於門檻，但有高訊號事件或矛盾訊號，照常產生候選 |
+
+## 外部呼叫與預算
+
+### 對外 fetch
+
+所有外部呼叫都經過 `src/external-fetch.ts` 的 `externalFetch`，並使用排程提供、計入配額的 `ctx.fetch`：
+
+- `redirect: 'manual'`（workerd 不接受 `'error'`）；任何 3xx 或 opaque redirect 都記成 `redirect_rejected`，不會跟隨，request body 與金鑰不會送到其他來源。
+- `AbortSignal.timeout(timeout_ms)` 涵蓋整個交換；回應 body 以串流讀取，上限 1 MiB。
+- 結果只有代碼（`http_<狀態>`、`timeout`、`network_error`、`response_too_large`、`invalid_response`、`redirect_rejected`）。回應 body、例外訊息與 header 不會出現在 `last_error`、API、排程記錄或 log。
+
+### 每日預算
+
+單列 `processing_budget`，用 `POST /api/processing/budget` 整份取代（審閱金鑰；`processing_budget_audit` 保存每一版）。沒有這一列等於所有上限為 0。
+
+| 欄位 | 意思 | 範圍 |
+| --- | --- | --- |
+| `daily_call_limit` | 每個 UTC 日的呼叫數上限；0 代表停用 | 0–10,000 |
+| `daily_token_limit` | 每日計入 token 上限；0 代表停用 | 0–100,000,000 |
+| `daily_usd_ceiling` | 每日供應商回報金額上限；`null` 代表不設定 | 0–10,000 或 `null` |
+| `max_input_chars` | 每次 request 的字元上限 | 1,000–200,000 |
+| `max_output_tokens` | 每次輸出 token 的預估值 | 1–8,192 |
+| `timeout_ms` | 每次呼叫的逾時 | 1,000–30,000 |
+
+- **先預約再呼叫。** 每次呼叫前用一個 `INSERT … SELECT` 原子地確認：工作租約仍屬於這次執行、輸入未超過 `max_input_chars`、今日呼叫數低於上限、今日計入 token（有回報用回報值，否則用預估 `ceil(輸入字元/3)+max_output_tokens`）加上這次預估不超過上限、今日回報金額低於美元上限。D1 逐一執行這個陳述式，同時發生的預約不會一起超過上限（測試：上限 1、八個同時預約只成功一個）。
+- **每個預約都算數**，不論結果。逾時或連線中斷記成 `outcome_unknown`，不當成成功，也不表示供應商只收一次費用；本機防重只代表這裡不會重送。
+- 同一份工作最多呼叫一次 Jev；之後的重試看到既有紀錄就不再送出，成功過的沿用已存的訊號。
+- 執行中斷而停在 `reserved` 的紀錄：超過最長逾時 30 秒再加 60 秒，而且該次嘗試已不持有有效租約時，排程把它標成 `outcome_unknown`（`stale_reservation`），仍計入當日用量。
+- `reported_cost_usd` 只存供應商回報的 `usage.cost_usd`，不用價目表推算。供應商不回報金額時美元上限不會生效，請以呼叫數與 token 上限為主要限制。
+
+`GET /api/processing/usage?day=YYYY-MM-DD`（讀取權限，預設今天 UTC）回傳預算、當日呼叫數與各狀態數量、計入 token、回報金額、剩餘額度與最近 20 筆呼叫，只有識別值、數量與代碼。
+
 ## 權限與稽核
 
 - 背景工作的 actor 是 `pipeline:<處理器>@<版本>`，從不是審閱者身分。0004 的 trigger 讓任何 `pipeline:%` actor 都不能把候選改成核准或拒絕；`context_generation` 只能指向由 pipeline 建立、`pending`、沒有取代關係的 `summary`。
-- 讀取 API 使用讀取權限；政策、立即整理、重試與放棄都需要獨立的 `REVIEW_TOKEN`；核准自動整理候選和手動候選一樣需要 `REVIEW_TOKEN`。
-- MCP 新增兩個唯讀工具：`beacon_list_processing_jobs`、`beacon_get_processing_job`。工作 API 只回傳識別值、狀態、數量、雜湊與短代碼，不含事件內容或標題；評估分數（B 部分）一律標示為未校準。
+- 讀取 API（包括用量）使用讀取權限；政策、預算、立即整理、重試與放棄都需要獨立的 `REVIEW_TOKEN`；核准自動整理候選和手動候選一樣需要 `REVIEW_TOKEN`。部署閘門與 Jev 金鑰只能由 operator 設定。
+- MCP 新增兩個唯讀工具：`beacon_list_processing_jobs`、`beacon_get_processing_job`。工作 API 只回傳識別值、狀態、數量、雜湊與短代碼，不含事件內容或標題；Jev 分數一律標示為未校準（`label: "uncalibrated"`）。
 - 排程記錄只包含工作名稱、耗時、呼叫次數與錯誤代碼。
 
 ## 成本與界限
 
-- `processing` 每次排程的配額：D1 400、R2 600、fetch 0。每次最多規劃 5 個範圍、執行 2 份工作；剩餘配額或時間不足一份完整工作時就停止，不會做到一半。
+- `processing` 每次排程的配額：D1 400、R2 600、fetch 2。每次最多規劃 5 個範圍、執行 2 份工作，每份最多一次 Jev 呼叫；剩餘配額或時間不足一份完整工作（D1 110、R2 260、fetch 1）時就停止，不會做到一半。
+- 沒有開啟任何政策時，每次排程只用 4 個 D1 查詢（租約與預約清理、工作區政策、一次領取），不讀 R2、不 fetch。
 - 一份工作最多讀 240 個 R2 批次、48 MiB 原文、1,000 個事件版本；超過時記錄短代碼並重試，最後需要人工處理。
 - Ingest 不讀寫任何新 table。測試中刪除全部 processing tables 後，ingest 仍正常回應，排程只記錄 `task_failed`。
 
@@ -184,8 +273,10 @@
 GET  /api/processing/policy                        工作區列、專案覆寫清單、生效政策
 GET  /api/processing/policy?project_id=…           該專案的工作區列、專案列、生效政策、外部呼叫條件、稽核
 GET  /api/processing/jobs?status=&project_id=&task_id=&before=&limit=
-GET  /api/processing/jobs/REPLACE_WITH_JOB_SHA256  來源識別值與涵蓋、訊號、呼叫紀錄、稽核
+GET  /api/processing/jobs/REPLACE_WITH_JOB_SHA256  來源識別值與涵蓋、未校準訊號、呼叫紀錄、稽核
+GET  /api/processing/usage?day=YYYY-MM-DD          預算、當日用量、剩餘額度、最近呼叫
 POST /api/processing/policies                      {"scope_type":"workspace"|"project","scope_id":…,全部政策欄位}
+POST /api/processing/budget                        {"daily_call_limit":…,"daily_token_limit":…,"daily_usd_ceiling":…|null,"max_input_chars":…,"max_output_tokens":…,"timeout_ms":…}
 POST /api/processing/run                           {"task_id":…} 或 {"project_id":…}，回傳每個範圍的結果與工作 ID
 POST /api/processing/jobs/REPLACE_WITH_JOB_SHA256/retry     {"reason":"選填"}
 POST /api/processing/jobs/REPLACE_WITH_JOB_SHA256/dismiss   {"reason":"選填"}
@@ -193,8 +284,10 @@ POST /api/processing/jobs/REPLACE_WITH_JOB_SHA256/dismiss   {"reason":"選填"}
 
 清單使用 `before` 傳回上一頁的 `next_cursor`，`limit` 為 1–40。所有 POST 都要求 `Content-Type: application/json`，整份 request 上限 64 KiB，拒絕多餘欄位。
 
-## B 部分的接點
+## 延後與後續
 
-- `src/processing-stage.ts`：`SelectionStage` 介面在選出來源之後、產生摘要之前執行，收到遮蔽後的投影與範圍，回傳 `continue`／`skip` 與訊號。預設是規則篩選；Jev stage 必須自行通過部署閘門、政策與預算預約，只能新增訊號或在 `jev_skip_threshold` 下略過，遇到非零結束碼、拒絕或政策強制這類高訊號事件時不得略過（`isHighSignal`）。
-- `src/processing-budget.ts`：`reserveCall`、`finishCall`、`sweepStaleReservations` 的型別已定義；目前預約一律被拒絕，因此不可能有外部呼叫。`processing_calls`、`processing_budget`、`processing_signals` 已在 0004 建立。
-- 外部呼叫要使用排程提供的 `ctx.fetch` 並計入配額；`processing` 的 fetch 配額目前是 0。
+- **模型生成延後。** `src/generator.ts` 的 `Generator` 介面保留給日後的生成器，沒有任何 `GENERATOR_*` 設定，也沒有 OpenAI 相容的 adapter。要開始之前先記錄供應商、模型、secret 管理、可送出的欄位範圍與每日美元上限的決定。生成器會共用同一個 `externalFetch` 與預算 ledger（`provider='generator'`）。
+- **只用專屬 secret。** `JEV_API_KEY` 與日後的生成器金鑰都只屬於這個服務，不借用其他 Cloudflare 專案或應用程式的 secret。
+- **真實供應商驗收另外進行。** Jev 目前只用合成資料與假的供應商測過（包括在 workerd 內的 bundled Worker）；真實帳號、金鑰、費用與私人內容需要各自的驗收紀錄。
+- **矛盾訊號轉成標記**屬於之後的修訂流程：只會在被問到的那一則筆記上建立待確認標記，不會改變核准狀態。
+- `src/processing-stage.ts` 的 `SelectionStage` 介面仍是規則篩選與 Jev 之間的接點：任何 stage 都只能新增訊號或在政策門檻下略過，遇到高訊號事件時不得略過（`isHighSignal`）。
