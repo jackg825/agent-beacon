@@ -206,7 +206,7 @@ Request 與上游 `cli/beacon/internal/learning/evaluator.go` 相同：`POST {mo
 - 每個回答存進 `processing_signals`（`calibrated=0`），API 與 dashboard 一律標示為未校準分數，不代表正確率。
 - 只有在政策設定了 `jev_skip_threshold`、`new_information` 低於門檻，**而且**來源中沒有高訊號事件（非零結束碼、工具失敗、拒絕、政策強制）、也沒有任何 `contradiction:*` ≥ 0.5 時，工作才會以 `jev_no_new_information` 略過。這種略過會涵蓋來源（門檻是審閱者校準後的明確選擇），原文仍然保留。有高訊號時照常產生候選並記 `jev_skip_overridden`。
 - 門檻預設 `null`，也就是永不略過。設定前先用合成或明確允許的資料記錄校準結果。
-- `contradiction:<筆記 ID>` ≥ 0.5 目前只是那一則筆記的訊號；之後的修訂流程才會把它轉成待確認標記。任何情況都不會修改筆記。
+- `contradiction:<筆記 ID>` ≥ 0.5 會在那一則筆記上建立一個待確認標記（`origin=jev`），與回答在同一個資料庫批次提交，每個工作與筆記最多一個，只限該工作專案自己的已核准筆記（見 [CONTEXT-WORKFLOWS.md](CONTEXT-WORKFLOWS.md)）。標記不會修改筆記或改變核准狀態，只有審閱者能處理。
 
 ### 失敗不影響整理
 
@@ -289,5 +289,4 @@ POST /api/processing/jobs/REPLACE_WITH_JOB_SHA256/dismiss   {"reason":"選填"}
 - **模型生成延後。** `src/generator.ts` 的 `Generator` 介面保留給日後的生成器，沒有任何 `GENERATOR_*` 設定，也沒有 OpenAI 相容的 adapter。要開始之前先記錄供應商、模型、secret 管理、可送出的欄位範圍與每日美元上限的決定。生成器會共用同一個 `externalFetch` 與預算 ledger（`provider='generator'`）。
 - **只用專屬 secret。** `JEV_API_KEY` 與日後的生成器金鑰都只屬於這個服務，不借用其他 Cloudflare 專案或應用程式的 secret。
 - **真實供應商驗收另外進行。** Jev 目前只用合成資料與假的供應商測過（包括在 workerd 內的 bundled Worker）；真實帳號、金鑰、費用與私人內容需要各自的驗收紀錄。
-- **矛盾訊號轉成標記**屬於之後的修訂流程：只會在被問到的那一則筆記上建立待確認標記，不會改變核准狀態。
 - `src/processing-stage.ts` 的 `SelectionStage` 介面仍是規則篩選與 Jev 之間的接點：任何 stage 都只能新增訊號或在政策門檻下略過，遇到高訊號事件時不得略過（`isHighSignal`）。

@@ -8,7 +8,7 @@
 
 | 項目 | 行為 |
 | --- | --- |
-| 快照內容 | 某個專案目前 `status=approved` 且 `sources_valid=true` 的筆記，也就是預設查詢會回傳的同一組 |
+| 快照內容 | 某個專案目前 `status=approved` 且 `sources_valid=true` 的筆記，也就是預設查詢會回傳的同一組；訂閱設定 `include_shared` 時再加上其他專案共享給它的長期記憶 |
 | 誰決定可讀 | 只有審閱者（`REVIEW_TOKEN`）能新增或撤銷訂閱；裝置不能替自己訂閱 |
 | 裝置多了什麼權限 | 只多一項：讀取審閱者替它訂閱的專案已核准筆記。仍不能讀時間線、待審候選或其他專案 |
 | 寫到哪裡 | 只寫到 Mac 上設定的 `sync_root` 底下、檔名以 `.beacon.md` 結尾的檔案 |
@@ -32,6 +32,7 @@ GET /api/context/snapshot?project_id=REPLACE_WITH_CENTRAL_PROJECT_SHA256&kind=me
 - `snapshot_sha256` 是 `{schema, project_id, kinds, entries}` 以排序鍵 JSON 計算的 SHA-256。同樣的已核准狀態永遠得到同一個雜湊；新增待審候選不會改變它，核准、取代或來源範圍改變才會改變。
 - `reviewed_through` 是快照內最新的核准時間；沒有筆記時為 `null`。
 - 權威性在**讀取當下**判斷：已被取代、已拒絕、待審，或來源事件後來離開專案／task 範圍的筆記都不會出現；範圍恢復後會再出現。
+- 加上 `&include_shared=1` 時，快照另外包含其他專案共享給這個專案、目前仍權威的長期記憶，每筆多出 `shared_from_project_id` 與 `share_id`；`include_shared` 欄位說明這份快照是否包含共享內容。本專案自己的筆記欄位不變，所以沒有共享內容時雜湊與先前相同。共享規則見 [CONTEXT-WORKFLOWS.md](CONTEXT-WORKFLOWS.md)。
 
 快照有明確上限：超過 **500 筆**或標題加內容合計超過 **2 MiB（UTF-8 位元組）**時回傳 `413`，而且在讀取任何筆記內容之前就先用計數查詢拒絕，不會悄悄截斷。遇到 `413` 時縮小訂閱的內容類型，或先用修訂流程整理筆記。
 
@@ -45,6 +46,9 @@ GET /api/context/snapshot?project_id=REPLACE_WITH_CENTRAL_PROJECT_SHA256&kind=me
 POST /api/sync/subscriptions
 {"device_id":"REPLACE_WITH_DEVICE_ID","project_id":"REPLACE_WITH_CENTRAL_PROJECT_SHA256","kinds":["memory"]}
 
+POST /api/sync/subscriptions
+{"device_id":"REPLACE_WITH_DEVICE_ID","project_id":"REPLACE_WITH_CENTRAL_PROJECT_SHA256","kinds":["memory"],"include_shared":true}
+
 POST /api/sync/subscriptions/REPLACE_WITH_SUBSCRIPTION_UUID/revoke
 {}
 
@@ -56,6 +60,7 @@ GET /api/sync/subscriptions/REPLACE_WITH_SUBSCRIPTION_UUID
 
 - 每台裝置對每個專案只能有一份有效訂閱。以相同類型重送回傳 `200` 與 `created:false`，不會重複新增；類型不同回傳 `409`，要改類型就先撤銷再新增，讓每次授權都有自己的紀錄。
 - `kinds` 只能是 `memory`、`summary` 各最多一次。裝置不存在回 `404`；裝置金鑰已撤銷回 `409`。
+- `include_shared` 可省略（預設 `false`），只接受 `true`／`false`。設為 `true` 時，這台裝置的快照也會收到其他專案共享給該專案的長期記憶。它和內容類型一樣在訂閱存續期間不能修改；設定不同時回 `409`，要改就先撤銷再新增。
 - 每台裝置最多 100 份有效訂閱，超過回 `409`。這個上限讓裝置清單有固定大小。
 - 訂閱除了一次撤銷以外不能修改或刪除；新增與撤銷的稽核由資料庫 trigger 寫入，稽核紀錄不能修改或刪除。Actor 與其他審閱一樣是共用審閱憑證的識別值，不代表具名個人。
 - 清單用 `next_cursor`／`before` 分頁，`limit` 為 1–40。
@@ -70,7 +75,7 @@ GET /v1/sync/subscriptions
 GET /v1/sync/snapshot?project_id=REPLACE_WITH_CENTRAL_PROJECT_SHA256
 ```
 
-- 只回傳這台裝置自己的有效訂閱；快照的內容類型完全由訂閱決定，帶 `kind` 參數會回 `400`，無法擴大範圍。
+- 只回傳這台裝置自己的有效訂閱（每份附 `include_shared`）；快照的內容類型與是否包含共享內容完全由訂閱決定，帶 `kind` 參數會回 `400`，無法擴大範圍。
 - 沒有訂閱、訂閱已撤銷、別台裝置的訂閱，以及根本不存在的專案，都回傳**同一個** `403` 本文，無法用來探測某個 repo 是否存在。裝置金鑰撤銷後回 `401`。
 - 只有 `GET`；其他方法回 `405`。`READ_TOKEN`、`MCP_TOKEN`、`REVIEW_TOKEN` 都不能使用這些路徑，裝置金鑰也不能使用 `/api/*`。
 - 大小上限與上面的快照相同（`413`）。目前**沒有**速率限制；不要把這裡描述成有限流。
@@ -176,6 +181,7 @@ node forwarder/sync.mjs --config /ABSOLUTE/PRIVATE/PATH/sync.json rollback 0 --v
 - 每筆內容放在比內容中任何連續反引號都長的 code fence 裡，內容無法提早關閉 fence，也無法偽造另一個 header 或筆記分隔。
 - 控制字元、雙向文字控制字元與 BOM 以 `\u{…}` 顯示；`content_sha256` 仍是中央原文的雜湊，可以和 API 對照。
 - 寫入前，工具會重新計算每筆 `content_sha256` 與整份 `snapshot_sha256`，不符就以 `SNAPSHOT_INTEGRITY_FAILED` 停止。
+- 共享進來的長期記憶多兩行 `- shared_from_project_id:` 與 `- share_id:`，檔案開頭也多一行說明它們屬於其他專案；這兩個欄位格式不符、指向本專案或出現在交接摘要上時，以 `INVALID_SNAPSHOT` 停止。沒有共享內容的檔案逐位元組與先前相同。
 
 ## 版本與回復
 
@@ -193,6 +199,6 @@ node forwarder/sync.mjs --config /ABSOLUTE/PRIVATE/PATH/sync.json rollback 0 --v
 - 尚未在隔離 TEST 套用 migration、部署或做雲端合成回歸，也沒有在兩台真實 Mac 試行；這些需要各自的驗收紀錄。
 - 沒有常駐程式、排程或自動套用；也不提供把檔案連結進 `AGENTS.md` 或 skills 的功能。
 - 沒有速率限制；裝置讀取只有大小上限。
-- 跨專案共用筆記（`include_shared`）留給後續的矛盾與修訂階段，目前的快照只包含該專案自己的筆記。
+- 共享內容只透過訂閱的 `include_shared` 取得，不支援專案群組；共享被撤銷或筆記失去權威後，已同步到 Mac 的副本不會被刪除，要等下一次 `preview`／`apply` 才會移除。
 - 同步檔案不會因撤銷訂閱而刪除；計畫檔若未套用會留在 `state_dir/plans/`，可以手動清除。
 - 同步工具異常結束時留下的 `sync.lock` 與同一資料夾內的 `.beacon-sync-*.tmp` 暫存檔需要手動清除。

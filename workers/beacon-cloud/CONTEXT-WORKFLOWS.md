@@ -140,6 +140,73 @@ Context 清單的狀態預設為已核准且 D1 來源範圍有效；明確指�
 | Context／task／group ID | UUID |
 | 專案／session／中央事件／payload hash | 64 位小寫十六進位識別值 |
 
+## 有效期間、待確認標記與跨專案共享
+
+這一節是第三階段的修訂功能。它們都**不會**改寫、核准、發布或刪除筆記：標記只提醒審閱者再看一次，處理標記只留下理由，要修正內容仍然用 `supersedes_id` 建立新版本；共享則在每次讀取時重新檢查。目前只有本機合成驗證（`npm test` 內的 Miniflare／workerd 與 bundled Worker，以及選用的瀏覽器測試），尚未在隔離 TEST 套用 `0007_context_revisions.sql`，也沒有真實資料的驗收紀錄。
+
+### 有效期間與修訂鏈
+
+- `valid_from` 是核准時間（等於 `reviewed_at`）；待審與已拒絕的候選為 `null`。
+- `valid_until` 是取代它的新版本被核准的時間；目前版本為 `null`。一份筆記最多只會有一個核准的新版本，所以期間不重疊，有效期間是 `[valid_from, valid_until)`。
+- 有效期間和權威性分開：來源範圍後來改變時，筆記仍在它的期間內，但 `authoritative=false`。
+- `GET /api/context/:id/history` 回傳這份筆記往前的所有舊版，以及往後的所有修訂（包含待審與已拒絕的修訂），依建立時間排序。每筆附 `relation`（`ancestor`／`self`／`descendant`）、有效期間、權威性、`open_flags` 與審閱紀錄；不含內容，內容請讀詳情。最多 100 筆，超過時 `truncated=true`。從最新版本往回看，不會列出舊版底下另一條被拒絕的修訂分支。
+- `GET /api/context?as_of=<UTC ISO 時間>` 回傳那一刻已核准、尚未被取代的筆記（現在可能已是 `superseded`）。這是歷史查詢：不套用目前的來源範圍，`authoritative` 仍代表現在的狀態；不能和 `status` 一起使用。時間必須是 `Z` 結尾的 UTC，可省略毫秒。
+
+### 待確認標記
+
+| 欄位 | 內容 |
+| --- | --- |
+| `kind` | `contradiction`（可能矛盾）或 `needs_review`（需要再確認） |
+| `origin` | `jev`（背景整理的 Jev 回答）或 `reviewer`（人工） |
+| `evidence` | 0–20 個不重複的「中央事件 ID＋`payload_hash`」，建立時必須存在；Jev 標記至少一個 |
+| `note` | 人工標記的說明，最多 2,000 字元，可省略 |
+| `status` | `open` → `resolved`（已處理）或 `dismissed`（已駁回），只能改一次，必須附理由 |
+
+- 只能標記目前已核准的筆記。標記不會改變核准狀態或權威性；清單與詳情回傳 `open_flags` 計數，MCP 說明要求 client 對有待處理標記的筆記保持謹慎。
+- **Jev 標記**：背景整理工作中，`contradiction:<筆記 ID>` 的回答 ≥ 0.5 時，只在被問到的那一則筆記上建立一個 `origin=jev` 標記，而且必須是該工作專案自己目前已核准的筆記；它和回答在同一個資料庫批次提交，同一個工作與筆記只會有一個標記，重試或重播不會重複。證據是該工作引用的確切版本，最多 20 個，先放失敗、拒絕、政策強制等高訊號事件，再放最新的。Jev 只回答「可能矛盾」，不指出是哪一句，分數也未校準。
+- **人工標記**：`POST /api/context/:id/flags` 建立，`POST /api/context/flags/:id/resolve` 處理或駁回。資料庫 trigger 保證：證據與內容不可修改、不能刪除、狀態只能從 `open` 轉成 `resolved`／`dismissed` 並附非空理由，而且 `pipeline:` 開頭的身分**不能**處理任何標記。建立與處理的稽核由 trigger 寫入，不能修改或刪除。
+- 處理標記不會修改筆記。內容真的過時時，撰寫新版本並核准；舊版本的標記保留作為紀錄，之後仍可處理，但已被取代的筆記不能再新增標記。
+- 詳情回傳 `flags`（待處理的在前，最多 50 筆；`flags_truncated` 表示還有更早的）。`GET /api/context/flags/:id` 讀單一標記與稽核，`GET /api/context?flagged=1` 只列有待處理標記的筆記。
+- 「資料維護」的 `open_flags` 發現項目列出標記 ID；原文保存期限會拒絕刪除待處理標記證據所在的批次（`referenced_by_flag`），標記處理後才放行。
+
+### 跨專案共享
+
+- 只有已核准、權威的長期記憶（`kind=memory`）可以共享，目標只能是另一個**專案**；不支援專案群組，群組成員變動不會讓共享擴散。`POST /api/context/:id/shares` 建立，`POST /api/context/shares/:id/revoke` 撤銷。同一筆記對同一專案只會有一份有效共享，重送回傳 `200` 與 `created:false`。
+- 共享紀錄除了一次撤銷以外不能修改或刪除；建立與撤銷的稽核由 trigger 寫入。
+- 預設查詢**不會**包含共享內容。`GET /api/context?project_id=<專案>&include_shared=1` 才會加入共享給該專案的長期記憶，每筆標示 `share_id` 與 `shared_from_project_id`（本專案自己的筆記這兩個欄位為 `null`）。`include_shared` 必須搭配 `project_id`，只能查已核准內容，不能和 `task_id`、`as_of` 一起使用。
+- 權威性在**讀取當下**檢查：被取代、或來源範圍離開原專案的筆記立即停止提供，共享在詳情中顯示為 `inactive`（暫停）。新版本是另一份筆記，不會自動沿用共享；需要時再共享一次。
+- Mac 同步的訂閱可以設定 `include_shared`。只有這種訂閱的快照會加入共享記憶，同樣在讀取當下檢查；`include_shared` 和內容類型一樣在訂閱存續期間不能修改。詳見 [MAC-SYNC.md](MAC-SYNC.md)。
+
+### API、MCP 與 dashboard
+
+```text
+GET /api/context/REPLACE_WITH_CONTEXT_UUID/history
+GET /api/context?project_id=REPLACE_WITH_CENTRAL_PROJECT_SHA256&as_of=2026-10-01T00:00:00.000Z
+GET /api/context?project_id=REPLACE_WITH_CENTRAL_PROJECT_SHA256&include_shared=1
+GET /api/context?flagged=1
+GET /api/context/flags/REPLACE_WITH_FLAG_UUID
+
+POST /api/context/REPLACE_WITH_CONTEXT_UUID/flags
+{"kind":"needs_review","note":"合成範例：新紀錄顯示 callback 已修改，請確認。","evidence":[{"event_id":"REPLACE_WITH_CENTRAL_EVENT_SHA256","payload_hash":"REPLACE_WITH_EXACT_PAYLOAD_SHA256"}]}
+
+POST /api/context/flags/REPLACE_WITH_FLAG_UUID/resolve
+{"resolution":"resolved","reason":"已用新版本修正。"}
+
+POST /api/context/REPLACE_WITH_CONTEXT_UUID/shares
+{"target_type":"project","target_id":"REPLACE_WITH_TARGET_PROJECT_SHA256"}
+
+POST /api/context/shares/REPLACE_WITH_SHARE_UUID/revoke
+{}
+```
+
+GET 使用讀取權限，POST 使用獨立審閱權限；body 規則與其他 context 寫入相同（`Content-Type: application/json`、64 KiB、拒絕多餘欄位）。重送已處理的標記或已撤銷的共享回傳 `409`。MCP 新增唯讀工具 `beacon_get_context_history`，`beacon_list_context` 多了 `as_of`、`include_shared` 與 `flagged`；沒有建立或處理標記、建立或撤銷共享的工具。
+
+Dashboard「交接與記憶」的筆記詳情顯示有效期間、修訂鏈、標記（可新增，並可附上目前在時間線勾選的事件作為證據；可處理或駁回）與共享（可共享到另一個專案或撤銷）；所有內容只以 `textContent` 顯示。清單可勾選「包含其他專案共享的長期記憶」與「只看有待處理標記」。
+
+### 升級
+
+`0007_context_revisions.sql` 是 additive migration：新增標記、共享與兩份稽核 tables、trigger 和索引，並在 `device_sync_subscriptions` 加上預設為 0 的 `include_shared` 欄位。Jev 標記的檢查會讀 `0004` 的背景整理 tables，所以要在 `0004`–`0006` 之後套用（`wrangler d1 migrations apply` 本來就依序執行）。ingest 不讀寫這些 tables；舊程式不使用它們，退版時保留不動，不要 drop tables 或刪除稽核紀錄。
+
 ## 升級既有 TEST 與回復
 
 以下是待執行的 runbook，本文件沒有替雲端部署或還原作業提供驗收證據。正式 production 仍依 [DEPLOYMENT.md](DEPLOYMENT.md) 的授權與隔離流程；不要把本機通過當成 production 完成。
