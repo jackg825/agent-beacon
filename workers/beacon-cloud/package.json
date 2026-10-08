@@ -10,12 +10,14 @@
     "build": "node scripts/build.mjs",
     "test": "npm run build && node --import tsx --test test/*.test.ts forwarder/*.test.mjs",
     "test:e2e": "npm run build && node --import tsx --test test/worker.test.ts",
+    "test:sync": "npm run build && node --import tsx --test test/sync.test.ts forwarder/sync.test.mjs",
     "test:collector": "npm run build && node --import tsx --test test/collector.e2e.ts",
     "test:browser": "node --import tsx --test test/dashboard.browser.mjs",
     "test:workflow-browser": "npm run build && node --import tsx --test test/workflow.browser.mjs",
     "test:remote": "node --import tsx scripts/cloud-smoke.ts",
     "deploy:dry-run": "wrangler deploy --dry-run --outdir dist/deploy",
-    "device:prepare": "node scripts/prepare-device.mjs"
+    "device:prepare": "node scripts/prepare-device.mjs",
+    "sync": "node forwarder/sync.mjs"
   },
   "overrides": {"sharp": "0.35.5"},
   "dependencies": {
