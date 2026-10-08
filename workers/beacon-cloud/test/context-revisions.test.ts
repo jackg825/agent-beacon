@@ -305,13 +305,13 @@ test('a fake Jev run through the processing runner flags only the contradicted e
     };
     const stagedTick = (minutes: number) => runMaintenance({ ...f.env, MAINTENANCE_TASKS: 'processing' } as Env,
       { now: later(minutes), schedule: 'frequent', tasks: staged(stage) });
-    const outcomes: string[] = [];
+    const outcomes: string[] = [], stagedJobs: string[] = [];
     for (const [index, minutes] of [[1, 200], [2, 260]]) {
       await f.ingest(command(`jev-later-${index}`, 'npm run lint', 0, { session: 'jev-s', timestamp: `2026-10-07T08:0${index}:00Z` }));
       const next = (await run(f.env, { project_id: event.project_id })).scopes[0];
       assert.equal((await stagedTick(minutes)).processing.ok, true);
       const row = await job(f.env, next.job_id);
-      outcomes.push(row.status);
+      outcomes.push(row.status); stagedJobs.push(next.job_id);
       if (row.result_context_id) await review(f.env, row.result_context_id, 'reject');
       const flagged = (await f.env.DB.prepare('SELECT context_id,evidence FROM context_flags WHERE job_id=?').bind(next.job_id).all<any>()).results;
       const versions = (await f.env.DB.prepare('SELECT event_id,payload_hash FROM processing_job_sources WHERE job_id=?').bind(next.job_id).all()).results;
@@ -320,6 +320,19 @@ test('a fake Jev run through the processing runner flags only the contradicted e
     }
     assert.deepEqual(outcomes, ['succeeded', 'skipped']);
     assert.equal(await count(f.env, "context_flags WHERE context_id=? OR context_id=?", foreign, contradicted), 1, 'only the resolved Jev flag');
+
+    // The database enforces the same rules for a Jev flag written past contradictionFlagStatements, with real
+    // jobs: the first job's stored answer for `consistent` is 0.2, and a later job's 0.95 for `foreign`
+    // concerns another project's note.
+    const direct = (context: string, jobId: string) => f.env.DB.prepare(`INSERT INTO context_flags(id,context_id,kind,origin,job_id,evidence,created_at,created_by)
+      VALUES(?,?,'contradiction','jev',?,?,?,?)`).bind(crypto.randomUUID(), context, jobId, JSON.stringify([pair(event)]), new Date().toISOString(), JEV_FLAG_ACTOR).run();
+    assert.equal((await f.env.DB.prepare('SELECT probability FROM processing_signals WHERE job_id=? AND question_id=?').bind(done.id, 'contradiction:' + consistent)
+      .first<{ probability: number }>())!.probability, 0.2);
+    await assert.rejects(direct(consistent, done.id), /context_flag_target/);
+    assert.equal((await f.env.DB.prepare('SELECT probability FROM processing_signals WHERE job_id=? AND question_id=?').bind(stagedJobs[0], 'contradiction:' + foreign)
+      .first<{ probability: number }>())!.probability, 0.95);
+    await assert.rejects(direct(foreign, stagedJobs[0]), /context_flag_target/);
+
   } finally { await f.close(); }
 });
 
