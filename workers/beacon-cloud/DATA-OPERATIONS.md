@@ -73,14 +73,21 @@ D1 用量的量級：`health` 每小時最多讀 50 頁 R2 清單（每頁最多
 ### 一個 checkpoint 包含什麼
 
 1. **原文複本**：每個已穩定（收到超過 10 分鐘）的批次只複製一次到 `BACKUP` 的 `raw/<原本的 key>`，寫入時附上 SHA-256 讓 R2 驗證；複製紀錄在 D1 `backup_raw_objects`，所有 checkpoint 共用。複製時找不到原文的批次記為 `source_missing`，之後每次排程依「最久沒檢查」的順序再找最多 50 個；裝置重送同一批次（內容相同、key 相同）或原文被放回後，就會補上複本，下一個 checkpoint 便能完整還原。
-2. **分塊匯出**：`batches`、`events`、`event_versions` 依（收到時間, ID）順序，每輪 100 個批次連同它們自己的事件與版本，寫成 `checkpoints/<id>/d1/<序號>.ndjson`。位置以 compare-and-swap 推進，checkpoint 有租約，重疊的排程不會重複寫。
-3. **最終快照**：剩下不到一整輪時，在**同一個 D1 transaction** 裡讀取尾端批次，以及 `sqlite_master` 列出的其他所有 table（排除 `_cf_%`、`sqlite_%`、`d1_migrations`），所以備份滿足外鍵封閉，其他階段新增的 table 自動包含在內。備份自身的帳務 table（`backup_*`、`health_state`）不放進快照，它們描述的是 BACKUP 本身。
+2. **分輪匯出**：每輪寫成 `checkpoints/<id>/d1/<序號>.ndjson`，位置以 compare-and-swap 推進，checkpoint 有租約，重疊的排程不會重複寫。依序是：
+   - `batches`、`events`、`event_versions`：依（收到時間, ID）順序，每輪 100 個已穩定的批次，連同它們自己的事件與版本。
+   - **帳本**：會隨活動增長、而且 trigger 禁止任何修改與刪除的 table（`context_sources`、`context_audit`、`context_generation`、`context_flag_audit`、`context_share_audit`、`processing_job_sources`、`processing_coverage`、`processing_signals`、`processing_job_audit`、`retention_runs`，以及 policy、budget、訂閱的稽核表），依 rowid 每輪最多 1,000 列。
+   - **會改變的 table**：會隨活動增長、資料列之後還會改變的 `sessions`、`processing_jobs`、`processing_calls`、`context_entries`（每輪 200 列）、`context_flags`（每輪 500 列）、`retention_run_objects`，同樣依 rowid 分輪匯出。
+
+   分類寫在 `src/operations-shared.ts`，每個 migration 建立的 table 都要分類，否則測試失敗；帳本必須真的有禁止修改與刪除的 trigger。
+3. **最終快照**：在**同一個 D1 transaction** 裡讀取：小型參照表（裝置、專案、任務與連結、群組與關係、policy 與 budget、訂閱、共享）全部；每個分輪 table 在最後一輪之後新增的尾端；以及會改變的 table 中，可能在它那一輪之後改變的資料列（**重讀**）。其他階段新增、尚未分類的 table 也整個放在這裡。備份自身的帳務 table（`backup_*`、`health_state`）不放進快照，它們描述的是 BACKUP 本身。
 4. **原文清單**：原文複製追上這次匯出的所有批次後，寫出這個 checkpoint 涵蓋的原文清單 `checkpoints/<id>/raw/<序號>.ndjson`。
 5. **manifest**：`checkpoints/<id>/manifest.json` 列出每個分塊的 key、SHA-256、大小與各 table 列數。
 
-一致性的說明：分塊與最終快照之間只有 `events.project_id` 可能改變（同一 session 之後補上 repo 時，ingest 會升級 session 的專案）。還原檢查把它列為 `event_project_drift` 發現，不算失敗。這個模型假設 ingest 在收到後 10 分鐘內提交。D1 Time Travel 仍是時間點回復的機制；這份備份用來證明可以在別處重建資料，並保存 R2 原文。
+**為什麼仍然外鍵封閉**：checkpoint 執行期間不會刪除任何資料列（保存期限在 checkpoint 執行時一律拒絕套用，其他 table 不是有禁止刪除的 trigger，就是沒有任何刪除的程式路徑）；新的資料列一定落在已匯出的位置之後（批次依收到時間並先等待 10 分鐘穩定，其他 table 依 rowid——沒有刪除時，SQLite 給新資料列的 rowid 一定大於現有最大值）；最終快照又讀取每個分輪 table 位置之後的尾端。所以每個 table 匯出的資料列集合，恰好就是最終快照那一刻的資料列集合，而 D1 在每次寫入時都強制外鍵，備份因此外鍵封閉。帳本的資料列不會改變，內容也與那一刻相同；會改變的 table 由**重讀**補上：重讀該 table 第一輪開始前 1 小時（容許排程時鐘落後）以後有改動紀錄、而且已在某一輪匯出的資料列——筆記看 `reviewed_at` 與被它取代的上一版、工作看 `updated_at`、外部呼叫看 `finished_at`、標記看 `resolved_at`、刪除紀錄看兩個刪除時間、session 看之後收到的批次。這些 table 的每一種更新都會寫入對應欄位；還原時重讀的資料列依主鍵取代較早一輪的同一列，manifest 另外記錄每個分塊的重讀列數，所以列數仍然精確。
 
-上限：最終快照最多 60,000 列、24 MiB，尾端最多 200 個批次。尾端太大時先多做一輪分塊；其他 table 太大時 checkpoint 以 `final_snapshot_too_large` 失敗，需要調整設計，不會靜默截斷。
+只有 `events.project_id` 仍可能與快照時不同（同一 session 之後補上 repo 時，ingest 會升級整個 session 的專案）；還原檢查把它列為 `event_project_drift` 發現，不算失敗。這個模型假設 ingest 在收到後 10 分鐘內提交，並假設 checkpoint 期間 rowid 不會被重新編號（只有 `VACUUM` 會這樣做，本服務從不執行它）；萬一發生，還原檢查會以 `row_load_failed`、`revision_without_row` 或列數不符失敗，而不是悄悄通過。D1 Time Travel 仍是時間點回復的機制；這份備份用來證明可以在別處重建資料，並保存 R2 原文。
+
+上限：最終快照讀取前，先以常數成本取得每個查詢的上限（`MAX(rowid)` 與有上限的計數），所有查詢的 `LIMIT` 加總不超過 60,000 列，另有 24 MiB 的大小上限，所以不會一次把超過預算的資料讀進記憶體。批次尾端超過 200 個、或某個分輪 table 的尾端超過 1,000 列時，先多做一輪再拍快照；最近 10 分鐘內收到的批次太多時，等下一次排程。某個 table 的重讀超過 10,000 列，或小型參照表加上重讀超過 60,000 列時，checkpoint 以 `final_snapshot_too_large` 失敗，需要調整分類或上限，不會靜默截斷。
 
 **完整性檢查**：checkpoint 完成後，`backup` 任務分次重新讀取並雜湊 manifest 與這個 checkpoint 的每個分塊（含原文清單），並以大小和 R2 保存的 SHA-256 核對清單中**還沒驗證過**的原文複本；通過後寫入 `integrity_verified_at`，失敗則記錄 `manifest_missing`、`manifest_mismatch`、`chunk_missing`、`chunk_mismatch`、`raw_missing` 或 `raw_mismatch`。
 
@@ -123,10 +130,10 @@ npm run backup:restore-check -- --dir /ABS/PATH/new-directory --checkpoint REPLA
 
 1. 先從伺服器取得 manifest 的 SHA-256，下載並核對 manifest；每個 key 都必須符合固定格式，檔案以 key 的 SHA-256 命名存在私人暫存目錄，不使用 key 當路徑。不使用 `--out` 時，結束後刪除暫存目錄。
 2. 下載並核對每個分塊與原文複本的大小與 SHA-256。不跟隨 redirect。
-3. 在新的 Miniflare D1 套用所有 migration，但**先略過 `CREATE TRIGGER`**；依 `PRAGMA foreign_key_list` 推出的外鍵順序載入資料（同 table 的版本鏈先載入前一版），再用同一份 migration 文字建立 trigger，並比對 `sqlite_master` 保存的 trigger SQL 與原文完全一致。這是唯一的載入方式，只用在這個暫存資料庫。
+3. 在新的 Miniflare D1 套用所有 migration，但**先略過 `CREATE TRIGGER`**；依 `PRAGMA foreign_key_list` 推出的外鍵順序載入資料（同 table 的版本鏈先載入前一版；最終快照重讀的資料列依主鍵取代較早一輪匯出的同一列，找不到那一列時記為 `revision_without_row`），再用同一份 migration 文字建立 trigger，並比對 `sqlite_master` 保存的 trigger SQL 與原文完全一致。任何一個 table 無法載入（例如主鍵重複）記為 `row_load_failed`。這是唯一的載入方式，只用在這個暫存資料庫。
 4. 檢查：`PRAGMA foreign_key_check` 為空、各 table 列數與 manifest 相同、筆記審閱狀態欄位一致、每份已審閱筆記都有 `review_id` 對應的稽核、每份被取代的筆記都有已核准的新版與 `:supersede` 稽核、密封筆記有 1–20 個來源、裝置數與 token 雜湊數一致，以及**每個事件版本都能從原文那一行重新算出 `payload_hash`**。
 
-輸出是 `{report, report_sha256, verify_request}`，只有數量、錯誤碼和雜湊。`result` 為 `passed` 時，把 `verify_request` 原樣送到 `POST /api/backups/:id/verify`，或貼到 dashboard 的「記錄還原演練結果」。常見失敗碼：`manifest_sha256_mismatch`、`chunk_sha256_mismatch`、`raw_sha256_mismatch`、`invalid_manifest_key`、`unknown_table`（備份含有本機 migration 沒有的 table）、`foreign_key_violation`、`trigger_mismatch`、`raw_not_in_manifest`、`payload_hash_mismatch`。
+輸出是 `{report, report_sha256, verify_request}`，只有數量、錯誤碼和雜湊。`result` 為 `passed` 時，把 `verify_request` 原樣送到 `POST /api/backups/:id/verify`，或貼到 dashboard 的「記錄還原演練結果」。常見失敗碼：`manifest_sha256_mismatch`、`chunk_sha256_mismatch`、`raw_sha256_mismatch`、`invalid_manifest_key`、`unknown_table`（備份含有本機 migration 沒有的 table）、`foreign_key_violation`、`trigger_mismatch`、`raw_not_in_manifest`、`payload_hash_mismatch`、`revision_without_row`、`row_load_failed`。
 
 這是演練，不是正式回復。真正需要回復時，D1 仍以 Time Travel 或匯出檔處理；R2 原文可從 `BACKUP` 的 `raw/` 複本以同一個 key 放回 RAW。兩者都要先另行規劃並停止寫入。
 

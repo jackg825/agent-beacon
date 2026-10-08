@@ -3,8 +3,47 @@
 import type { Allotment, MaintenanceContext } from './maintenance';
 import { Env, HttpError } from './types';
 
-/** Tables exported in chunks across ticks instead of in the final snapshot. */
-export const CHUNKED_TABLES = ['batches', 'events', 'event_versions'] as const;
+// How a backup checkpoint exports each table (DATA-OPERATIONS.md). Every table a committed
+// migration creates is classified here; a schema test fails until a new one is. A table that
+// is not (one added by a later track and not yet classified) goes to the final snapshot,
+// which is always consistent.
+
+/** Batches with their own events and versions, exported together by (received_at,id) once settled. */
+export const BATCH_TABLES = ['batches', 'events', 'event_versions'] as const;
+/** @deprecated The batch tables; kept for existing imports. */
+export const CHUNKED_TABLES = BATCH_TABLES;
+/**
+ * Append-only ledgers: unconditional triggers forbid every update and delete, so the rows a round
+ * exports by rowid are exactly the rows at the final snapshot, which reads only the tail after them.
+ */
+export const LEDGER_TABLES = ['context_sources', 'context_audit', 'context_generation', 'context_flag_audit', 'context_share_audit',
+  'processing_job_sources', 'processing_coverage', 'processing_signals', 'processing_job_audit', 'processing_policy_audit',
+  'processing_budget_audit', 'device_sync_audit', 'retention_runs', 'retention_policy_audit'] as const;
+/**
+ * Tables that grow with activity and whose rows change: rounds export them by rowid (never deleted,
+ * so membership is exact), then the final snapshot re-reads every exported row that may have changed
+ * since its round. `touched` lists indexed queries for the rowids of rows changed at or after `?`,
+ * a time a margin before the table's first round began. Every UPDATE these tables receive sets the
+ * column a query reads (sessions: through the batch whose ingest changed them).
+ */
+export const REVISED_TABLES: Record<string, { page?: number; touched: string[] }> = {
+  // Nested IN lists keep the walk on indexes: recent batches, their versions, those events, their sessions.
+  sessions: { touched: [`SELECT s.rowid FROM sessions s WHERE s.id IN (SELECT e.session_id FROM events e WHERE e.id IN (
+    SELECT v.event_id FROM event_versions v WHERE v.batch_id IN (SELECT b.id FROM batches b WHERE b.received_at>=?)))`] },
+  processing_jobs: { touched: ['SELECT rowid FROM processing_jobs WHERE updated_at>=?'] },
+  processing_calls: { touched: ['SELECT rowid FROM processing_calls WHERE finished_at>=?'] },
+  // Content up to 12,000 characters per row: smaller pages keep each round's memory bounded.
+  context_entries: { page: 200, touched: ['SELECT rowid FROM context_entries WHERE reviewed_at>=?',
+    `SELECT p.rowid FROM context_entries p WHERE p.id IN (SELECT c.supersedes_id FROM context_entries c WHERE c.reviewed_at>=?
+      AND c.supersedes_id IS NOT NULL)`] },
+  context_flags: { page: 500, touched: ['SELECT rowid FROM context_flags WHERE resolved_at>=?'] },
+  retention_run_objects: { touched: ['SELECT rowid FROM retention_run_objects WHERE raw_deleted_at>=?',
+    'SELECT rowid FROM retention_run_objects WHERE backup_deleted_at>=?'] },
+};
+/** Small reference tables the final snapshot reads whole, in one transaction. */
+export const SNAPSHOT_TABLES = ['devices', 'projects', 'project_groups', 'project_group_members', 'project_relations', 'tasks', 'task_sessions',
+  'project_workflow_audit', 'processing_policies', 'processing_job_fence', 'processing_scan_cursor', 'processing_budget',
+  'device_sync_subscriptions', 'retention_policies', 'context_shares'] as const;
 /** Bookkeeping that describes BACKUP itself; restored databases do not need it. */
 export const BACKUP_BOOKKEEPING = new Set(['backup_checkpoints', 'backup_chunks', 'backup_raw_objects', 'backup_raw_generations', 'backup_audit',
   'backup_state', 'health_state']);

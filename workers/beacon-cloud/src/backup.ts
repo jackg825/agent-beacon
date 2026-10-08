@@ -9,17 +9,26 @@ import type { Allotment, MaintenanceContext, MaintenanceTask } from './maintenan
 import { pageLimit } from './queries';
 import { Env, HttpError, json } from './types';
 import { readJson } from './workflow';
-import { BACKUP_BOOKKEEPING, CHUNKED_TABLES, HASH, RAW_KEY, SETTLE_MS, UUID, backupIntervalHours, decodeCursor,
-  encodeCursor, hex, iso, jsonChunks, quoted, retentionGraceDays, room, scheduledTask, userTables } from './operations-shared';
+import { BACKUP_BOOKKEEPING, BATCH_TABLES, HASH, LEDGER_TABLES, RAW_KEY, REVISED_TABLES, SETTLE_MS, UUID, backupIntervalHours, decodeCursor,
+  encodeCursor, hex, iso, jsonChunks, quoted, retentionGraceDays, room, scheduledTask, tableSet, userTables } from './operations-shared';
 
 export const BACKUP_ALLOTMENT: Allotment = { d1: 300, r2: 2500, fetch: 0 };
 export interface BackupLimits {
   /** Platform calls per tick; every step checks it before starting so a tick ends cleanly. */
   allotment: Allotment;
-  /** Batches per chunk round; a smaller remainder waits for the final snapshot. */
+  /** Batches per batch round. */
   chunkBatches: number;
   /** Most batches the final snapshot may carry as its tail. */
   tailBatches: number;
+  /** Rows per ledger or revised-table round (a table may set a smaller page). */
+  tablePageRows: number;
+  /** Most rows of one round table the final snapshot may carry as its tail; more sends the table back for a round. */
+  tailRows: number;
+  /** Most rows of one revised table the final snapshot may re-read. */
+  revisionMaxRows: number;
+  /** How long before a revised table's first round a change still counts as possibly after it (writer clock lag). */
+  revisionMarginMs: number;
+  /** Rows the final snapshot may read in total, counting every statement's upper bound. */
   finalMaxRows: number;
   finalMaxBytes: number;
   /** Largest single final-snapshot object. */
@@ -42,7 +51,8 @@ export interface BackupLimits {
   settleMs: number;
 }
 export const BACKUP_LIMITS: BackupLimits = {
-  allotment: BACKUP_ALLOTMENT, chunkBatches: 100, tailBatches: 200, finalMaxRows: 60_000, finalMaxBytes: 24 * 1024 * 1024, objectMaxBytes: 4 * 1024 * 1024,
+  allotment: BACKUP_ALLOTMENT, chunkBatches: 100, tailBatches: 200, tablePageRows: 1000, tailRows: 1000, revisionMaxRows: 10_000,
+  revisionMarginMs: 3600_000, finalMaxRows: 60_000, finalMaxBytes: 24 * 1024 * 1024, objectMaxBytes: 4 * 1024 * 1024,
   rawListPage: 5000, rawCopyPerTick: 500, missingRetryPerTick: 50, pruneBatch: 200, integrityPerTick: 1500, integrityShare: 0.4, maxSteps: 1000,
   leaseMs: 20 * 60_000,
   settleMs: SETTLE_MS,
@@ -80,11 +90,12 @@ async function put(bucket: R2Bucket, key: string, body: Uint8Array) {
   return sha256;
 }
 function ndjson(lines: string[]): Uint8Array { return encoder.encode(lines.length ? lines.join('\n') + '\n' : ''); }
-function line(table: string, row: Row): string {
+/** One exported row; a revision replaces the row with the same primary key that an earlier round exported. */
+function line(table: string, row: Row, revision = false): string {
   for (const value of Object.values(row)) {
     if (value !== null && typeof value === 'object') throw new BackupFailure('unsupported_column_value');
   }
-  return JSON.stringify({ t: table, r: row });
+  return JSON.stringify(revision ? { t: table, r: row, revision: true } : { t: table, r: row });
 }
 
 // ---- raw copies -----------------------------------------------------------------
@@ -268,10 +279,100 @@ async function ensureCheckpoint(env: Env, ctx: MaintenanceContext): Promise<Chec
   return (created.results[0] as Checkpoint | undefined) ?? null;
 }
 
-/** Full chunk rounds export settled batches with their events and versions; the remainder goes to the final snapshot. */
+/**
+ * Where a running checkpoint's rounds stand, stored as JSON in backup_checkpoints.cursor. Rounds
+ * export the batch tables, then every ledger, then every revised table present when the
+ * checkpoint started (operations-shared.ts); the final snapshot comes last.
+ */
+type Rounds = {
+  v: 2;
+  /** 'batches' (batches with their events and versions), then ledger and revised tables. */
+  order: string[];
+  /** Index into order of the round in progress; order.length means the final snapshot is next. */
+  stage: number;
+  batches: [string, string] | null;
+  rowids: Record<string, number>;
+  /** When each revised table's first round began. */
+  since: Record<string, string>;
+  /** The final snapshot sent one table back for another round: return to it straight afterwards. */
+  revisit?: boolean;
+};
+type Piece = { table: string; row: Row; revision?: boolean };
+type ChunkRecord = { seq: number; key: string; sha256: string; bytes: number; rows: string; revisions: string | null };
+const ROWID = '__beacon_rowid';
+
+async function readRounds(env: Env, cp: Checkpoint): Promise<Rounds> {
+  const stored = cp.cursor ? JSON.parse(cp.cursor) as Rounds | [string, string] : null;
+  if (stored && !Array.isArray(stored)) return stored;
+  // A new checkpoint, or one started before rounds existed (its cursor was the batch position).
+  const tables = await tableSet(env.DB);
+  const order = ['batches', ...[...LEDGER_TABLES, ...Object.keys(REVISED_TABLES)].filter(name => tables.has(name))];
+  return { v: 2, order, stage: 0, batches: stored, rowids: {}, since: {} };
+}
+function advance(rounds: Rounds): Rounds {
+  return rounds.revisit ? { ...rounds, stage: rounds.order.length, revisit: false } : { ...rounds, stage: rounds.stage + 1 };
+}
+
+/** Lines in objects of at most objectMaxBytes; each object counts its base rows and its revisions per table. */
+function pack(pieces: Piece[], limits: BackupLimits, names: string[] = [], maxBytes = Infinity) {
+  const objects: { lines: string[]; bytes: number; rows: Record<string, number>; revisions: Record<string, number> }[] =
+    [{ lines: [], bytes: 0, rows: Object.fromEntries(names.map(name => [name, 0])), revisions: {} }];
+  let size = 0;
+  for (const piece of pieces) {
+    const text = line(piece.table, piece.row, piece.revision), bytes = encoder.encode(text).byteLength + 1;
+    size += bytes;
+    if (size > maxBytes) throw new BackupFailure('final_snapshot_too_large');
+    let current = objects.at(-1)!;
+    if (current.lines.length && current.bytes + bytes > limits.objectMaxBytes) { current = { lines: [], bytes: 0, rows: {}, revisions: {} }; objects.push(current); }
+    current.lines.push(text); current.bytes += bytes;
+    const counts = piece.revision ? current.revisions : current.rows;
+    counts[piece.table] = (counts[piece.table] ?? 0) + 1;
+  }
+  return objects;
+}
+async function writeObjects(env: Env, cp: Checkpoint, objects: ReturnType<typeof pack>): Promise<ChunkRecord[]> {
+  const chunks: ChunkRecord[] = [];
+  let seq = cp.chunk_count;
+  for (const object of objects) {
+    seq++;
+    const key = chunkKey(cp.id, 'd1', seq), body = ndjson(object.lines);
+    chunks.push({ seq, key, sha256: await put(env.BACKUP!, key, body), bytes: body.byteLength, rows: JSON.stringify(object.rows),
+      revisions: Object.keys(object.revisions).length ? JSON.stringify(object.revisions) : null });
+  }
+  return chunks;
+}
+function insertChunks(env: Env, cp: Checkpoint, kind: 'rows' | 'final', chunks: ChunkRecord[], now: string, phase: string, owner: string) {
+  return env.DB.prepare(`INSERT INTO backup_chunks(checkpoint_id,seq,kind,key,sha256,bytes,rows,revisions,created_at)
+    SELECT ?,json_extract(value,'$.seq'),?,json_extract(value,'$.key'),json_extract(value,'$.sha256'),json_extract(value,'$.bytes'),
+    json_extract(value,'$.rows'),json_extract(value,'$.revisions'),? FROM json_each(?)
+    WHERE EXISTS(SELECT 1 FROM backup_checkpoints WHERE id=? AND phase=? AND chunk_count=? AND lease_owner=?)`)
+    .bind(cp.id, kind, now, JSON.stringify(chunks), cp.id, phase, cp.chunk_count + chunks.length, owner);
+}
+/** Record a round: the new position and its objects in one D1 batch, behind the lease and the old position. */
+async function commitRound(env: Env, ctx: MaintenanceContext, cp: Checkpoint, owner: string, rounds: Rounds, chunks: ChunkRecord[],
+  through: string | null): Promise<Checkpoint> {
+  const now = iso(ctx.now);
+  const statements = [env.DB.prepare(`UPDATE backup_checkpoints SET cursor=?,chunk_count=?,batches_through=?,updated_at=?
+    WHERE id=? AND status='running' AND phase='chunks' AND lease_owner=? AND chunk_count=? AND cursor IS ? RETURNING *`)
+    .bind(JSON.stringify(rounds), cp.chunk_count + chunks.length, through, now, cp.id, owner, cp.chunk_count, cp.cursor)];
+  if (chunks.length) statements.push(insertChunks(env, cp, 'rows', chunks, now, 'chunks', owner));
+  const [updated] = await env.DB.batch(statements);
+  const next = updated.results[0] as Checkpoint | undefined;
+  if (!next) throw new MaintenanceError('backup_cas_conflict');
+  return next;
+}
+
 async function chunkStep(env: Env, ctx: MaintenanceContext, cp: Checkpoint, limits: BackupLimits, owner: string): Promise<Checkpoint | Stop> {
+  const rounds = await readRounds(env, cp);
+  if (rounds.stage >= rounds.order.length) return finalStep(env, ctx, cp, limits, owner, rounds);
+  const table = rounds.order[rounds.stage];
+  return table === 'batches' ? batchRound(env, ctx, cp, limits, owner, rounds) : tableRound(env, ctx, cp, limits, owner, rounds, table);
+}
+
+/** Settled batches with their own events and versions, in (received_at,id) order. */
+async function batchRound(env: Env, ctx: MaintenanceContext, cp: Checkpoint, limits: BackupLimits, owner: string, rounds: Rounds): Promise<Checkpoint | Stop> {
   if (!room(ctx, limits.allotment, { d1: 6, r2: 1 })) return 'budget';
-  const range = after(parsePair(cp.cursor));
+  const range = after(rounds.batches);
   const pick = `SELECT id FROM batches WHERE received_at<? AND ${range.sql} ORDER BY received_at,id LIMIT ?`;
   const args = [iso(ctx.now.getTime() - limits.settleMs), ...range.args, limits.chunkBatches];
   // One D1 batch is one transaction, so a batch row always travels with its own events and versions.
@@ -280,88 +381,122 @@ async function chunkStep(env: Env, ctx: MaintenanceContext, cp: Checkpoint, limi
     env.DB.prepare(`SELECT * FROM events WHERE batch_id IN (${pick}) ORDER BY batch_id,rowid`).bind(...args),
     env.DB.prepare(`SELECT * FROM event_versions WHERE batch_id IN (${pick}) ORDER BY batch_id,rowid`).bind(...args),
   ]);
-  const rows = { batches: batches.results as Row[], events: events.results as Row[], event_versions: versions.results as Row[] };
-  if (rows.batches.length < limits.chunkBatches) return finalStep(env, ctx, cp, limits, owner, rows);
-  return writeRowsChunk(env, ctx, cp, owner, rows);
+  const rows: Record<typeof BATCH_TABLES[number], Row[]> = { batches: batches.results as Row[], events: events.results as Row[],
+    event_versions: versions.results as Row[] };
+  const pieces = BATCH_TABLES.flatMap(table => rows[table].map(row => ({ table, row })));
+  const chunks = pieces.length ? await writeObjects(env, cp, pack(pieces, limits)) : [];
+  const last = rows.batches.at(-1);
+  let next: Rounds = { ...rounds, batches: last ? [String(last.received_at), String(last.id)] : rounds.batches };
+  if (rows.batches.length < limits.chunkBatches) next = advance(next);
+  return commitRound(env, ctx, cp, owner, next, chunks, last ? latest(cp.batches_through, String(last.received_at)) : cp.batches_through);
 }
 
-async function writeRowsChunk(env: Env, ctx: MaintenanceContext, cp: Checkpoint, owner: string,
-  rows: { batches: Row[]; events: Row[]; event_versions: Row[] }): Promise<Checkpoint> {
-  const lines = CHUNKED_TABLES.flatMap(table => rows[table].map(row => line(table, row)));
-  const body = ndjson(lines), seq = cp.chunk_count + 1, key = chunkKey(cp.id, 'd1', seq), now = iso(ctx.now);
-  const sha256 = await put(env.BACKUP!, key, body);
-  const last = rows.batches.at(-1)!;
-  const counts = Object.fromEntries(CHUNKED_TABLES.map(table => [table, rows[table].length]));
-  const [updated] = await env.DB.batch([
-    env.DB.prepare(`UPDATE backup_checkpoints SET cursor=?,chunk_count=?,batches_through=?,updated_at=?
-      WHERE id=? AND status='running' AND phase='chunks' AND lease_owner=? AND chunk_count=? RETURNING *`)
-      .bind(JSON.stringify([last.received_at, last.id]), seq, latest(cp.batches_through, String(last.received_at)), now, cp.id, owner, cp.chunk_count),
-    env.DB.prepare(`INSERT INTO backup_chunks(checkpoint_id,seq,kind,key,sha256,bytes,rows,created_at)
-      SELECT ?,?,'rows',?,?,?,?,? WHERE EXISTS(SELECT 1 FROM backup_checkpoints WHERE id=? AND chunk_count=? AND lease_owner=?)`)
-      .bind(cp.id, seq, key, sha256, body.byteLength, JSON.stringify(counts), now, cp.id, seq, owner),
-  ]);
-  const next = updated.results[0] as Checkpoint | undefined;
-  if (!next) throw new MaintenanceError('backup_cas_conflict');
-  return next;
+/** One page of a ledger or revised table by rowid: rows are never deleted, so every later row lands past the position. */
+async function tableRound(env: Env, ctx: MaintenanceContext, cp: Checkpoint, limits: BackupLimits, owner: string, rounds: Rounds,
+  table: string): Promise<Checkpoint | Stop> {
+  if (!room(ctx, limits.allotment, { d1: 4, r2: 1 })) return 'budget';
+  const page = Math.min(REVISED_TABLES[table]?.page ?? limits.tablePageRows, limits.tablePageRows);
+  let next: Rounds = { ...rounds, rowids: { ...rounds.rowids }, since: { ...rounds.since } };
+  if (REVISED_TABLES[table] && !next.since[table]) next.since[table] = iso(ctx.now);
+  const rows = (await env.DB.prepare(`SELECT rowid AS ${ROWID},* FROM ${quoted(table)} WHERE rowid>? ORDER BY rowid LIMIT ?`)
+    .bind(rounds.rowids[table] ?? 0, page).all<Row>()).results;
+  const pieces = rows.map(({ [ROWID]: _rowid, ...row }) => ({ table, row }));
+  const chunks = pieces.length ? await writeObjects(env, cp, pack(pieces, limits)) : [];
+  if (rows.length) next.rowids[table] = Number(rows.at(-1)![ROWID]);
+  if (rows.length < page) next = advance(next);
+  return commitRound(env, ctx, cp, owner, next, chunks, cp.batches_through);
 }
 
 /**
- * Every non-chunked table plus the chunk tail, read in ONE D1 batch (one transaction), so
- * the checkpoint is foreign-key closed. Only events.project_id can drift between an earlier
- * chunk and this snapshot; restore-check reports that as a finding.
+ * ONE D1 batch (one transaction): the small reference tables whole, the tail of every round table
+ * past its position, and every revised row that may have changed since its round. Every table's
+ * exported rows are therefore exactly its rows at this moment (rows are never deleted while a
+ * checkpoint runs), so the checkpoint is foreign-key closed; only events.project_id can drift,
+ * which restore-check reports as a finding. Upper bounds are read first, so no statement can
+ * return more rows than the snapshot's total budget allows.
  */
-async function finalStep(env: Env, ctx: MaintenanceContext, cp: Checkpoint, limits: BackupLimits, owner: string,
-  settled: { batches: Row[]; events: Row[]; event_versions: Row[] }): Promise<Checkpoint | Stop> {
-  const tables = (await userTables(env.DB)).filter(table => !(CHUNKED_TABLES as readonly string[]).includes(table.name)
+async function finalStep(env: Env, ctx: MaintenanceContext, cp: Checkpoint, limits: BackupLimits, owner: string, rounds: Rounds): Promise<Checkpoint | Stop> {
+  const all = await userTables(env.DB), present = new Set(all.map(table => table.name));
+  const chunked = rounds.order.filter(name => name !== 'batches' && present.has(name));
+  const revised = chunked.filter(name => REVISED_TABLES[name]);
+  const finals = all.filter(table => !(BATCH_TABLES as readonly string[]).includes(table.name) && !rounds.order.includes(table.name)
     && !BACKUP_BOOKKEEPING.has(table.name));
+  const measured = [...chunked, ...finals.filter(table => table.rowid).map(table => table.name)];
+  const groups = Array.from({ length: Math.ceil(measured.length / 20) }, (_, index) => measured.slice(index * 20, index * 20 + 20));
+  const plain = finals.filter(table => !table.rowid);
+  const reads = 3 + chunked.length + revised.length + finals.length;
   const maxObjects = Math.ceil(limits.finalMaxBytes / limits.objectMaxBytes) + 1;
-  if (!room(ctx, limits.allotment, { d1: tables.length + 6, r2: maxObjects })) return 'budget';
-  const range = after(parsePair(cp.cursor));
-  const tail = `SELECT id FROM batches WHERE ${range.sql} ORDER BY received_at,id LIMIT ?`;
-  const args = [...range.args, limits.tailBatches + 1];
-  const results = await env.DB.batch([
-    env.DB.prepare(`SELECT * FROM batches WHERE id IN (${tail}) ORDER BY received_at,id`).bind(...args),
-    env.DB.prepare(`SELECT * FROM events WHERE batch_id IN (${tail}) ORDER BY batch_id,rowid`).bind(...args),
-    env.DB.prepare(`SELECT * FROM event_versions WHERE batch_id IN (${tail}) ORDER BY batch_id,rowid`).bind(...args),
-    ...tables.map(table => env.DB.prepare(`SELECT * FROM ${quoted(table.name)} ${table.rowid ? 'ORDER BY rowid' : ''} LIMIT ?`)
-      .bind(limits.finalMaxRows + 1)),
+  if (!room(ctx, limits.allotment, { d1: 1 + groups.length + plain.length + revised.length + reads + 2, r2: maxObjects })) return 'budget';
+  const range = after(rounds.batches), settled = iso(ctx.now.getTime() - limits.settleMs);
+  const since = (table: string) => iso(Date.parse(rounds.since[table] ?? iso(ctx.now)) - limits.revisionMarginMs);
+  const touched = (table: string) => REVISED_TABLES[table].touched.join(' UNION ');
+  const revisionArgs = (table: string) => [rounds.rowids[table] ?? 0, ...REVISED_TABLES[table].touched.map(() => since(table))];
+  // Upper bounds, read without a transaction: MAX(rowid) bounds a table that never loses rows, and
+  // the rows past a position; bounded counts cover the batch tail and the re-read rows.
+  const estimates = await env.DB.batch([
+    env.DB.prepare(`SELECT COUNT(*) AS n,COALESCE(SUM(event_count),0) AS events,COALESCE(SUM(received_at<?),0) AS settled
+      FROM (SELECT received_at,event_count FROM batches WHERE ${range.sql} ORDER BY received_at,id LIMIT ?)`).bind(settled, ...range.args, limits.tailBatches + 1),
+    ...groups.map(group => env.DB.prepare('SELECT ' + group.map((name, index) => `(SELECT MAX(rowid) FROM ${quoted(name)}) AS c${index}`).join(','))),
+    ...plain.map(table => env.DB.prepare(`SELECT COUNT(*) AS c0 FROM (SELECT 1 FROM ${quoted(table.name)} LIMIT ?)`).bind(limits.finalMaxRows + 1)),
+    ...revised.map(table => env.DB.prepare(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM ${quoted(table)} WHERE rowid<=? AND rowid IN (${touched(table)}) LIMIT ?)`)
+      .bind(...revisionArgs(table), limits.revisionMaxRows + 1)),
   ]);
-  const tailBatches = results[0].results as Row[];
-  if (tailBatches.length > limits.tailBatches) {
-    // Too much recent ingest to carry in one transaction: export what has settled and retry later.
-    return settled.batches.length ? writeRowsChunk(env, ctx, cp, owner, settled) : 'wait';
+  const tail = estimates[0].results[0] as { n: number; events: number; settled: number };
+  const bound = new Map<string, number>();
+  groups.forEach((group, index) => {
+    const row = estimates[1 + index].results[0] as Record<string, number | null>;
+    group.forEach((name, column) => bound.set(name, row[`c${column}`] ?? 0));
+  });
+  plain.forEach((table, index) => bound.set(table.name, (estimates[1 + groups.length + index].results[0] as { c0: number }).c0));
+  const revisions = new Map(revised.map((table, index) => [table, (estimates[1 + groups.length + plain.length + index].results[0] as { n: number }).n]));
+  const back = (table: string) => commitRound(env, ctx, cp, owner, { ...rounds, stage: rounds.order.indexOf(table), revisit: true }, [], cp.batches_through);
+  // Too much recent ingest to carry in one transaction: another batch round first, or wait for it to settle.
+  if (tail.n > limits.tailBatches) return tail.settled ? back('batches') : 'wait';
+  const tails = new Map(chunked.map(name => [name, Math.max(0, (bound.get(name) ?? 0) - (rounds.rowids[name] ?? 0))]));
+  for (const [name, size] of tails) if (size > limits.tailRows) return back(name);
+  for (const count of revisions.values()) if (count > limits.revisionMaxRows) throw new BackupFailure('final_snapshot_too_large');
+  // Reference tables and re-read rows cannot shrink; tails can, with another round.
+  const fixed = finals.reduce((sum, table) => sum + (bound.get(table.name) ?? 0), 0) + [...revisions.values()].reduce((sum, count) => sum + count, 0);
+  if (fixed > limits.finalMaxRows) throw new BackupFailure('final_snapshot_too_large');
+  const batchRows = tail.n + 2 * tail.events, tailRows = [...tails.values()].reduce((sum, size) => sum + size, 0);
+  if (fixed + batchRows + tailRows > limits.finalMaxRows) {
+    const [largest, size] = [...tails].sort((a, b) => b[1] - a[1])[0] ?? ['', 0];
+    if (tail.settled && batchRows > size) return back('batches');
+    if (size > 0) return back(largest);
+    throw new BackupFailure('final_snapshot_too_large');
   }
-  const snapshot: [string, Row[]][] = [['batches', tailBatches], ['events', results[1].results as Row[]],
-    ['event_versions', results[2].results as Row[]], ...tables.map((table, index) => [table.name, results[index + 3].results as Row[]] as [string, Row[]])];
-  let total = 0;
-  for (const [, rows] of snapshot) { total += rows.length; if (rows.length > limits.finalMaxRows || total > limits.finalMaxRows) throw new BackupFailure('final_snapshot_too_large'); }
-  // Split into bounded objects; the first object's row counts name every snapshot table, including empty ones.
-  const objects: { lines: string[]; bytes: number; rows: Record<string, number> }[] = [{ lines: [], bytes: 0, rows: Object.fromEntries(snapshot.map(([name]) => [name, 0])) }];
-  let size = 0;
-  for (const [table, rows] of snapshot) for (const row of rows) {
-    const text = line(table, row), bytes = encoder.encode(text).byteLength + 1;
-    size += bytes;
-    if (size > limits.finalMaxBytes) throw new BackupFailure('final_snapshot_too_large');
-    let current = objects.at(-1)!;
-    if (current.lines.length && current.bytes + bytes > limits.objectMaxBytes) { current = { lines: [], bytes: 0, rows: {} }; objects.push(current); }
-    current.lines.push(text); current.bytes += bytes; current.rows[table] = (current.rows[table] ?? 0) + 1;
-  }
-  const now = iso(ctx.now), chunks: Row[] = [];
-  let seq = cp.chunk_count;
-  for (const object of objects) {
-    seq++;
-    const key = chunkKey(cp.id, 'd1', seq), body = ndjson(object.lines);
-    chunks.push({ seq, key, sha256: await put(env.BACKUP!, key, body), bytes: body.byteLength, rows: JSON.stringify(object.rows) });
-  }
-  const through = tailBatches.reduce<string | null>((value, row) => latest(value, String(row.received_at)), cp.batches_through);
+  // Spread what is left of the budget as growth room; a statement that fills its limit means the
+  // table grew past its bound since it was read, and the snapshot is taken again later.
+  const slack = Math.max(0, Math.min(1000, Math.floor((limits.finalMaxRows - fixed - batchRows - tailRows) / reads)));
+  const limit = (base: number) => base + slack + 1;
+  const tailIds = `SELECT id FROM batches WHERE ${range.sql} ORDER BY received_at,id LIMIT ?`, tailArgs = [...range.args, limit(tail.n)];
+  const statements: [D1PreparedStatement, number][] = [
+    [env.DB.prepare(`SELECT * FROM batches WHERE id IN (${tailIds}) ORDER BY received_at,id`).bind(...tailArgs), limit(tail.n)],
+    [env.DB.prepare(`SELECT * FROM events WHERE batch_id IN (${tailIds}) ORDER BY batch_id,rowid LIMIT ?`).bind(...tailArgs, limit(tail.events)), limit(tail.events)],
+    [env.DB.prepare(`SELECT * FROM event_versions WHERE batch_id IN (${tailIds}) ORDER BY batch_id,rowid LIMIT ?`).bind(...tailArgs, limit(tail.events)), limit(tail.events)],
+    ...chunked.map(name => [env.DB.prepare(`SELECT * FROM ${quoted(name)} WHERE rowid>? ORDER BY rowid LIMIT ?`)
+      .bind(rounds.rowids[name] ?? 0, limit(tails.get(name)!)), limit(tails.get(name)!)] as [D1PreparedStatement, number]),
+    ...revised.map(name => [env.DB.prepare(`SELECT * FROM ${quoted(name)} WHERE rowid<=? AND rowid IN (${touched(name)}) ORDER BY rowid LIMIT ?`)
+      .bind(...revisionArgs(name), limit(revisions.get(name)!)), limit(revisions.get(name)!)] as [D1PreparedStatement, number]),
+    ...finals.map(table => [env.DB.prepare(`SELECT * FROM ${quoted(table.name)} ${table.rowid ? 'ORDER BY rowid' : ''} LIMIT ?`)
+      .bind(limit(bound.get(table.name) ?? 0)), limit(bound.get(table.name) ?? 0)] as [D1PreparedStatement, number]),
+  ];
+  const results = await env.DB.batch(statements.map(([statement]) => statement));
+  if (results.some((result, index) => result.results.length >= statements[index][1])) return 'wait';
+  const pieces: Piece[] = [];
+  BATCH_TABLES.forEach((table, index) => { for (const row of results[index].results as Row[]) pieces.push({ table, row }); });
+  chunked.forEach((table, index) => { for (const row of results[3 + index].results as Row[]) pieces.push({ table, row }); });
+  revised.forEach((table, index) => { for (const row of results[3 + chunked.length + index].results as Row[]) pieces.push({ table, row, revision: true }); });
+  finals.forEach((table, index) => { for (const row of results[3 + chunked.length + revised.length + index].results as Row[]) pieces.push({ table: table.name, row }); });
+  // The first object's row counts name every exported table, including empty ones, so the manifest lists them all.
+  const chunks = await writeObjects(env, cp, pack(pieces, limits, [...BATCH_TABLES, ...chunked, ...finals.map(table => table.name)], limits.finalMaxBytes));
+  const now = iso(ctx.now), seq = cp.chunk_count + chunks.length;
+  const through = (results[0].results as Row[]).reduce<string | null>((value, row) => latest(value, String(row.received_at)), cp.batches_through);
   const [updated] = await env.DB.batch([
     env.DB.prepare(`UPDATE backup_checkpoints SET phase='raw',cursor=NULL,chunk_count=?,final_snapshot_at=?,batches_through=?,updated_at=?
-      WHERE id=? AND status='running' AND phase='chunks' AND lease_owner=? AND chunk_count=? RETURNING *`)
-      .bind(seq, now, through, now, cp.id, owner, cp.chunk_count),
-    env.DB.prepare(`INSERT INTO backup_chunks(checkpoint_id,seq,kind,key,sha256,bytes,rows,created_at)
-      SELECT ?,json_extract(value,'$.seq'),'final',json_extract(value,'$.key'),json_extract(value,'$.sha256'),json_extract(value,'$.bytes'),
-      json_extract(value,'$.rows'),? FROM json_each(?) WHERE EXISTS(SELECT 1 FROM backup_checkpoints WHERE id=? AND phase='raw' AND chunk_count=? AND lease_owner=?)`)
-      .bind(cp.id, now, JSON.stringify(chunks), cp.id, seq, owner),
+      WHERE id=? AND status='running' AND phase='chunks' AND lease_owner=? AND chunk_count=? AND cursor IS ? RETURNING *`)
+      .bind(seq, now, through, now, cp.id, owner, cp.chunk_count, cp.cursor),
+    insertChunks(env, cp, 'final', chunks, now, 'raw', owner),
   ]);
   const next = updated.results[0] as Checkpoint | undefined;
   if (!next) throw new MaintenanceError('backup_cas_conflict');
@@ -416,28 +551,32 @@ async function rawListStep(env: Env, ctx: MaintenanceContext, cp: Checkpoint, li
 
 export type Manifest = {
   format: 'beacon.backup.v1'; checkpoint_id: string; started_at: string; final_snapshot_at: string; batches_through: string | null;
-  raw_listed_at: string; consistency: string; chunked_tables: string[]; excluded_tables: string[]; migrations: string[];
-  table_counts: Record<string, number>; chunks: { seq: number; kind: 'rows' | 'final' | 'raw_list'; key: string; sha256: string; bytes: number;
-    rows: Record<string, number> }[]; raw: { prefix: 'raw/'; objects: number; bytes: number };
+  raw_listed_at: string; consistency: string; chunked_tables: string[]; ledger_tables: string[]; revised_tables: string[]; excluded_tables: string[];
+  migrations: string[]; table_counts: Record<string, number>; chunks: { seq: number; kind: 'rows' | 'final' | 'raw_list'; key: string; sha256: string;
+    bytes: number; rows: Record<string, number>; revisions?: Record<string, number> }[]; raw: { prefix: 'raw/'; objects: number; bytes: number };
 };
 
 async function manifestStep(env: Env, ctx: MaintenanceContext, cp: Checkpoint, limits: BackupLimits, owner: string): Promise<Checkpoint | Stop> {
   // A two-statement batch, the migrations ledger (present on every wrangler-migrated D1) and the completing update.
   if (!room(ctx, limits.allotment, { d1: 4, r2: 1 })) return 'budget';
   const [chunkRows, ledger] = await env.DB.batch([
-    env.DB.prepare('SELECT seq,kind,key,sha256,bytes,rows FROM backup_chunks WHERE checkpoint_id=? ORDER BY seq').bind(cp.id),
+    env.DB.prepare('SELECT seq,kind,key,sha256,bytes,rows,revisions FROM backup_chunks WHERE checkpoint_id=? ORDER BY seq').bind(cp.id),
     env.DB.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='d1_migrations'"),
   ]);
   const migrations = ledger.results.length
     ? (await env.DB.prepare('SELECT name FROM d1_migrations ORDER BY id').all<{ name: string }>()).results.map(row => row.name) : [];
-  const chunks = (chunkRows.results as { seq: number; kind: 'rows' | 'final' | 'raw_list'; key: string; sha256: string; bytes: number; rows: string }[])
-    .map(chunk => ({ ...chunk, rows: JSON.parse(chunk.rows) as Record<string, number> }));
+  // Revisions replace rows an earlier round exported, so table counts add up base rows only.
+  const chunks = (chunkRows.results as { seq: number; kind: 'rows' | 'final' | 'raw_list'; key: string; sha256: string; bytes: number; rows: string;
+    revisions: string | null }[]).map(({ revisions, ...chunk }) => ({ ...chunk, rows: JSON.parse(chunk.rows) as Record<string, number>,
+    ...(revisions ? { revisions: JSON.parse(revisions) as Record<string, number> } : {}) }));
   const counts: Record<string, number> = {};
   for (const chunk of chunks) if (chunk.kind !== 'raw_list') for (const [table, count] of Object.entries(chunk.rows)) counts[table] = (counts[table] ?? 0) + count;
   const tableCounts = Object.fromEntries(Object.entries(counts).sort(([a], [b]) => a < b ? -1 : 1));
   const manifest: Manifest = { format: 'beacon.backup.v1', checkpoint_id: cp.id, started_at: cp.started_at, final_snapshot_at: cp.final_snapshot_at!,
-    batches_through: cp.batches_through, raw_listed_at: cp.raw_listed_at!, consistency: 'chunked_rows_then_final_snapshot',
-    chunked_tables: [...CHUNKED_TABLES], excluded_tables: [...BACKUP_BOOKKEEPING].sort(), migrations, table_counts: tableCounts, chunks,
+    batches_through: cp.batches_through, raw_listed_at: cp.raw_listed_at!, consistency: 'rounds_then_final_snapshot',
+    chunked_tables: [...BATCH_TABLES], ledger_tables: LEDGER_TABLES.filter(name => name in tableCounts),
+    revised_tables: Object.keys(REVISED_TABLES).filter(name => name in tableCounts), excluded_tables: [...BACKUP_BOOKKEEPING].sort(), migrations,
+    table_counts: tableCounts, chunks,
     raw: { prefix: 'raw/', objects: cp.raw_object_count, bytes: cp.raw_bytes } };
   const body = encoder.encode(JSON.stringify(manifest)), key = manifestKey(cp.id), now = iso(ctx.now);
   const sha256 = await put(env.BACKUP!, key, body);

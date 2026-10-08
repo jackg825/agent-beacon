@@ -7,7 +7,10 @@ import { existsSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { BACKUP_BOOKKEEPING } from '../src/operations-shared';
+import { BACKUP_BOOKKEEPING, BATCH_TABLES, LEDGER_TABLES, REVISED_TABLES, SNAPSHOT_TABLES } from '../src/operations-shared';
+import { contextWrite } from '../src/context';
+import { processingWrite } from '../src/processing';
+import { planRequest } from '../src/processing-planner';
 import { BACKUP_ALLOTMENT, Checkpoint, Manifest, backupTask, backupsReviewerRead, backupsWrite, createBackupTask, expireCheckpoint } from '../src/backup';
 import { revisionsWrite } from '../src/context-revisions';
 import { dataHealth } from '../src/health';
@@ -16,6 +19,8 @@ import { Env } from '../src/types';
 import { RestoreError, bucketSource, dirSource, httpSource, parseArgs, readReviewToken, reportSha256, restoreCheck, runCli, verifyRequest, workerUrl }
   from '../scripts/restore-check';
 import { createEnvFixture, migrationsExcept, syntheticEvent } from './env-fixture';
+import { setPolicy as setProcessingPolicy, tick as processingTick, workspace } from './processing-helpers';
+import { migrationStatements } from '../scripts/migration-sql';
 import { addTrackMigration, backupTick, completeCheckpoint, createContext, drill, get, later, latestCheckpoint, operationsTokens, operationsWorker, post,
   reviewer, verifiedCheckpoint } from './operations-fixture';
 
@@ -382,6 +387,163 @@ test('the integrity pass reports every kind of change to a completed checkpoint'
       assert.deepEqual([after.integrity_error, after.integrity_verified_at], [code, null], code);
       await restore();
     }
+  } finally { await fixture.close(); }
+});
+
+test('every committed table has a backup export class that its schema supports', async () => {
+  const statements = await migrationStatements();
+  const created = statements.flatMap(statement => /^\s*CREATE TABLE\s+(\w+)/i.exec(statement.sql)?.[1] ?? []);
+  const classes = [BATCH_TABLES, LEDGER_TABLES, Object.keys(REVISED_TABLES), SNAPSHOT_TABLES, [...BACKUP_BOOKKEEPING]].map(list => new Set<string>(list));
+  for (const table of created) assert.equal(classes.filter(set => set.has(table)).length, 1, `${table} needs exactly one export class`);
+  for (const set of classes) for (const table of set) assert.ok(created.includes(table), `${table} is classified but no migration creates it`);
+  // A ledger round is exact only because nothing can change or delete an exported row.
+  const forbids = (table: string, event: 'UPDATE' | 'DELETE') => statements.some(statement =>
+    new RegExp(`^\\s*CREATE TRIGGER \\w+ BEFORE ${event} ON ${table}\\s+BEGIN\\s+SELECT RAISE\\(ABORT,'\\w+'\\);\\s+END;\\s*$`).test(statement.sql));
+  for (const table of LEDGER_TABLES) for (const event of ['UPDATE', 'DELETE'] as const) assert.ok(forbids(table, event), `${table}: ${event} must be forbidden`);
+  const fixture = await createEnvFixture({ backup: true });
+  try {
+    const rowless = (await fixture.env.DB.prepare("SELECT name FROM sqlite_master WHERE type='table' AND sql LIKE '%WITHOUT ROWID%'").all<{ name: string }>()).results;
+    assert.deepEqual(rowless, [], 'round tables are exported by rowid');
+    // Every query that finds possibly changed rows reaches them through an index, never a table scan.
+    for (const [table, revised] of Object.entries(REVISED_TABLES)) for (const query of revised.touched) {
+      const plan = await fixture.env.DB.prepare('EXPLAIN QUERY PLAN ' + query).bind('2026-01-01T00:00:00.000Z').all<{ detail: string }>();
+      for (const step of plan.results) assert.doesNotMatch(step.detail, /^SCAN \w+$/, `${table}: ${step.detail}`);
+    }
+  } finally { await fixture.close(); }
+});
+
+test('tables that grow with activity are exported in rounds, so the final snapshot stays bounded by the small tables', async () => {
+  const fixture = await createEnvFixture({ backup: true });
+  try {
+    const env = fixture.env;
+    // Events without a session id get one session each; processing adds a coverage and a source row per event.
+    for (let index = 0; index < 30; index++)
+      await fixture.ingest([syntheticEvent('grow-' + index, { extra: { session: { working_directory: '/synthetic/alpha' } } })]);
+    await setProcessingPolicy(env, workspace);
+    assert.equal((await processingTick(env, later(120))).ok, true);
+    const live = async (table: string) => (await env.DB.prepare(`SELECT COUNT(*) AS n FROM "${table}"`).first<{ n: number }>())!.n;
+    for (const table of ['sessions', 'processing_coverage', 'processing_job_sources']) assert.equal(await live(table), 30, table);
+    const limits = { finalMaxRows: 40, tablePageRows: 7, tailRows: 5, revisionMarginMs: 0 };
+    let finalLimits: number[] = [];
+    const recording = { ...env, DB: new Proxy(env.DB, { get(target, property) {
+      if (property === 'prepare') return (sql: string) => {
+        const wrap = (statement: any, args: unknown[]): any => new Proxy(statement, { get(object, key) {
+          if (key === '__recorded') return { sql, args };
+          if (key === 'bind') return (...values: unknown[]) => wrap(object.bind(...values), values);
+          const value = object[key]; return typeof value === 'function' ? value.bind(object) : value;
+        } });
+        return wrap(target.prepare(sql), []);
+      };
+      if (property === 'batch') return (statements: any[]) => {
+        const recorded = statements.map(statement => statement.__recorded as { sql: string; args: unknown[] });
+        if (recorded.some(item => /^SELECT \* FROM "devices"/.test(item.sql))) finalLimits = recorded.map(item => Number(item.args.at(-1)));
+        return target.batch(statements);
+      };
+      const value = Reflect.get(target, property, target); return typeof value === 'function' ? value.bind(target) : value;
+    } }) } as Env;
+    const checkpoint = await completeCheckpoint(recording, later(180), limits);
+    assert.deepEqual([checkpoint.status, checkpoint.error_code], ['completed', null]);
+    // Every statement of the one-transaction snapshot has a limit, and together they stay within the budget.
+    assert.ok(finalLimits.length > 3 && finalLimits.every(Number.isInteger));
+    assert.ok(finalLimits.reduce((sum, value) => sum + value, 0) <= limits.finalMaxRows + finalLimits.length, finalLimits.join());
+    const manifest = JSON.parse(await objectText(env, checkpoint.manifest_key!)) as Manifest;
+    for (const table of Object.keys(manifest.table_counts)) assert.equal(manifest.table_counts[table], await live(table), table);
+    const rounds = manifest.chunks.filter(chunk => chunk.kind === 'rows' && 'processing_coverage' in chunk.rows);
+    assert.ok(rounds.length >= 4, 'processing_coverage went out in several pages');
+    const final = manifest.chunks.filter(chunk => chunk.kind === 'final');
+    assert.equal(final.reduce((sum, chunk) => sum + (chunk.rows.sessions ?? 0) + (chunk.rows.processing_coverage ?? 0), 0), 0);
+    assert.ok(manifest.ledger_tables.includes('processing_coverage') && manifest.revised_tables.includes('sessions'));
+    const report = await drill(env, checkpoint);
+    assert.equal(report.result, 'passed', JSON.stringify(report.failures));
+    // A reference table larger than the whole budget fails before anything is read into memory.
+    await env.DB.prepare('UPDATE backup_checkpoints SET started_at=?').bind('2000-01-01T00:00:00.000Z').run();
+    for (let index = 0; index < 50; index++) await env.DB.prepare(`INSERT INTO project_workflow_audit(id,actor,action,resource_type,resource_id,created_at)
+      VALUES(?,?,?,?,?,?)`).bind(crypto.randomUUID(), reviewer, 'synthetic', 'task', 'synthetic', new Date().toISOString()).run();
+    finalLimits = [];
+    const failed = await completeCheckpoint(recording, later(181), limits);
+    assert.deepEqual([failed.status, failed.error_code], ['failed', 'final_snapshot_too_large']);
+    assert.deepEqual(finalLimits, [], 'the snapshot was refused from its upper bounds');
+  } finally { await fixture.close(); }
+});
+
+test('rows that change after their round are re-read by the final snapshot, and rows added after it land in its tail', async () => {
+  const fixture = await createEnvFixture({ backup: true });
+  try {
+    const env = fixture.env, run = later(15);
+    await fixture.ingest([syntheticEvent('revise-1', { session: 'revise', timestamp: '2026-10-08T00:00:00Z' })]);
+    await fixture.ingest([syntheticEvent('revise-2', { session: 'revise-other' })]);
+    const source = (await fixture.event('revise-1'))!;
+    const base = { kind: 'memory', project_id: source.project_id, title: 'Synthetic revised', content: 'Synthetic only.',
+      sources: [{ event_id: source.id, payload_hash: source.payload_hash }] };
+    const parent = await createContext(env, base, 'approve');
+    const child = await createContext(env, { ...base, title: 'Synthetic revision', supersedes_id: parent });
+    const flag = ((await (await revisionsWrite(post(`/api/context/${parent}/flags`, { kind: 'needs_review', note: 'Synthetic' }), env, reviewer))!.json()) as any).flag.id;
+    await setProcessingPolicy(env, workspace);
+    const [scope] = (await planRequest(env, { project_id: source.project_id }, reviewer, new Date())).scopes;
+    const job = scope.job_id!, call = crypto.randomUUID(), runId = crypto.randomUUID(), now = new Date().toISOString();
+    await env.DB.batch([
+      env.DB.prepare(`INSERT INTO processing_calls(id,job_id,provider,attempt,status,day,input_chars,estimated_tokens,started_at)
+        VALUES(?,?,'jev',1,'reserved',?,10,10,?)`).bind(call, job, now.slice(0, 10), now),
+      env.DB.prepare(`INSERT INTO retention_runs(id,data_class,plan_sha256,generated_at,cutoff,batch_count,event_count,version_count,raw_bytes,keys_sha256,
+        checkpoint_id,actor,created_at) VALUES(?,'raw',?,?,?,1,0,0,0,?,?,?,?)`).bind(runId, 'a'.repeat(64), now, now, 'b'.repeat(64), crypto.randomUUID(), reviewer, now),
+      // Its RAW object is already gone and its grace period far away, so the backup task leaves the row alone.
+      env.DB.prepare(`INSERT INTO retention_run_objects(run_id,batch_id,r2_key,size,created_at,raw_deleted_at,backup_delete_after) VALUES(?,?,?,1,?,?,?)`)
+        .bind(runId, 'c'.repeat(64), 'batches/mbp/runtime/' + 'c'.repeat(64) + '.ndjson', now, now, later(365 * 24 * 60).toISOString()),
+    ]);
+    // Every round, one step per tick, until only the final snapshot is left.
+    for (let index = 0; index < 60; index++) {
+      const cp = await latestCheckpoint(env);
+      const rounds = cp?.cursor ? JSON.parse(cp.cursor) : null;
+      if (rounds && rounds.stage === rounds.order.length) break;
+      await backupTick(env, run, { maxSteps: 1, tablePageRows: 2 });
+    }
+    const pending = JSON.parse((await latestCheckpoint(env))!.cursor!);
+    assert.equal(pending.stage, pending.order.length);
+    assert.ok(['sessions', 'context_entries', 'context_flags', 'processing_jobs', 'processing_calls', 'retention_run_objects', 'context_audit']
+      .every(table => pending.order.includes(table)));
+    // Changes after every round: a review that supersedes a note, a resolved flag, a dismissed job, a finished
+    // call, a recorded RAW deletion, a session that saw a newer event, and new ledger rows from a new note.
+    const reviewed = await contextWrite(post(`/api/context/${child}/review`, { decision: 'approve' }), env, reviewer);
+    assert.equal(reviewed!.status, 200);
+    assert.equal((await revisionsWrite(post(`/api/context/flags/${flag}/resolve`, { resolution: 'resolved', reason: 'Synthetic' }), env, reviewer))!.status, 200);
+    assert.equal((await processingWrite(post(`/api/processing/jobs/${job}/dismiss`, {}), env, reviewer))!.status, 200);
+    await env.DB.batch([
+      env.DB.prepare("UPDATE processing_calls SET status='succeeded',finished_at=? WHERE id=?").bind(new Date().toISOString(), call),
+      env.DB.prepare('UPDATE retention_run_objects SET backup_deleted_at=? WHERE run_id=?').bind(new Date().toISOString(), runId),
+    ]);
+    await fixture.ingest([syntheticEvent('revise-3', { session: 'revise', timestamp: '2026-10-09T00:00:00Z' })]);
+    await createContext(env, { ...base, kind: 'summary', title: 'Synthetic late note' });
+    const checkpoint = await completeCheckpoint(env, run);
+    assert.equal(checkpoint.status, 'completed');
+    const manifest = JSON.parse(await objectText(env, checkpoint.manifest_key!)) as Manifest;
+    const revised = manifest.chunks.reduce<Record<string, number>>((all, chunk) => {
+      for (const [table, count] of Object.entries(chunk.revisions ?? {})) all[table] = (all[table] ?? 0) + count;
+      return all;
+    }, {});
+    for (const table of ['sessions', 'context_entries', 'context_flags', 'processing_jobs', 'processing_calls', 'retention_run_objects'])
+      assert.ok(revised[table] >= 1, `${table} rows were re-read`);
+    const liveRow = (sql: string, ...args: unknown[]) => env.DB.prepare(sql).bind(...args).first<Record<string, unknown>>();
+    const checks: [string, unknown[]][] = [
+      ['SELECT status,review_id FROM context_entries WHERE id=?', [parent]], ['SELECT status,review_id FROM context_entries WHERE id=?', [child]],
+      ['SELECT status,resolved_at FROM context_flags WHERE id=?', [flag]], ['SELECT status,updated_at FROM processing_jobs WHERE id=?', [job]],
+      ['SELECT status,finished_at FROM processing_calls WHERE id=?', [call]], ['SELECT backup_deleted_at FROM retention_run_objects WHERE run_id=?', [runId]],
+      ["SELECT last_event_at FROM sessions WHERE id=(SELECT session_id FROM events WHERE event_id='revise-1')", []],
+    ];
+    const expected = await Promise.all(checks.map(([sql, args]) => liveRow(sql, ...args)));
+    assert.deepEqual([expected[0]!.status, expected[1]!.status, expected[2]!.status, expected[3]!.status],
+      ['superseded', 'approved', 'resolved', 'dismissed']);
+    const report = await (async () => {
+      const workDir = await mkdtemp(join(tmpdir(), 'beacon-drill-'));
+      try {
+        return await restoreCheck({ checkpointId: checkpoint.id, source: bucketSource(env.BACKUP!), expectedManifestSha256: checkpoint.manifest_sha256!, workDir,
+          inspect: async (db) => {
+            for (const [index, [sql, args]] of checks.entries()) assert.deepEqual(await db.prepare(sql).bind(...args).first(), expected[index], sql);
+          } });
+      } finally { await rm(workDir, { recursive: true, force: true }); }
+    })();
+    assert.equal(report.result, 'passed', JSON.stringify(report.failures));
+    for (const [table, count] of Object.entries(report.counts.tables))
+      assert.equal(count, (await env.DB.prepare(`SELECT COUNT(*) AS n FROM "${table}"`).first<{ n: number }>())!.n, table);
   } finally { await fixture.close(); }
 });
 

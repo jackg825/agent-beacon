@@ -25,7 +25,9 @@ export class RestoreError extends Error { constructor(public code: string) { sup
 /** Where checkpoint objects come from: the Worker's reviewer object route, a BACKUP binding, or a previous --out directory. */
 export interface BackupSource { get(key: string): Promise<Uint8Array | null> }
 type Row = Record<string, string | number | null>;
-type Chunk = { seq: number; kind: 'rows' | 'final' | 'raw_list'; key: string; sha256: string; bytes: number; rows: Record<string, number> };
+type Chunk = { seq: number; kind: 'rows' | 'final' | 'raw_list'; key: string; sha256: string; bytes: number; rows: Record<string, number>;
+  /** Rows the final snapshot re-read because they may have changed after the round that exported them. */
+  revisions?: Record<string, number> };
 type Manifest = { format: string; checkpoint_id: string; table_counts: Record<string, number>; chunks: Chunk[]; raw: { objects: number } };
 type RawEntry = { batch_id: string; key: string; size: number; sha256: string };
 type Tally = { code: string; count: number };
@@ -86,6 +88,9 @@ function validateManifest(value: unknown, checkpointId: string): Manifest {
     // Every key must have the exact shape this Worker writes; nothing else is fetched or stored.
     if (!['rows', 'final', 'raw_list'].includes(chunk.kind) || chunk.key !== `checkpoints/${checkpointId}/${directory}/${String(chunk.seq).padStart(6, '0')}.ndjson`
       || !HASH.test(chunk.sha256) || !Number.isInteger(chunk.bytes) || chunk.bytes < 0 || seen.has(chunk.key)) throw new RestoreError('invalid_manifest_key');
+    if (chunk.revisions !== undefined && (chunk.kind !== 'final' || !chunk.revisions || typeof chunk.revisions !== 'object'
+      || Object.entries(chunk.revisions).some(([table, count]) => !(table in manifest.table_counts) || !Number.isInteger(count) || count < 0)))
+      throw new RestoreError('invalid_manifest');
     seen.add(chunk.key);
   }
   return manifest;
@@ -150,7 +155,9 @@ function jsonGroups(rows: Row[], maxBytes = 90_000): string[] {
  */
 export async function restoreCheck(options: { checkpointId: string; source: BackupSource; expectedManifestSha256: string; workDir: string;
   /** Tests only: a copy of the committed migrations plus a simulated later track. The CLI always uses migrations/. */
-  migrationsDirectory?: string }): Promise<RestoreReport> {
+  migrationsDirectory?: string;
+  /** Tests only: look at the restored scratch database after every check, before it is removed. */
+  inspect?: (db: D1Database) => Promise<void> }): Promise<RestoreReport> {
   const failures = new Map<string, number>(), findings = new Map<string, number>(), checks: string[] = [];
   const fail = (code: string, count = 1) => failures.set(code, (failures.get(code) ?? 0) + count);
   const note = (code: string, count: number) => { if (count) findings.set(code, (findings.get(code) ?? 0) + count); };
@@ -169,7 +176,7 @@ export async function restoreCheck(options: { checkpointId: string; source: Back
     if (key.startsWith('raw/')) rawPaths.set(key, path);
   };
   let manifest: Manifest;
-  const rows = new Map<string, Row[]>(), raw: RawEntry[] = [];
+  const rows = new Map<string, Row[]>(), revisions = new Map<string, Row[]>(), raw: RawEntry[] = [];
   try {
     const manifestKey = `checkpoints/${options.checkpointId}/manifest.json`;
     const bytes = await fetchVerified(options.source, manifestKey, options.expectedManifestSha256, null, save, 'manifest');
@@ -178,7 +185,7 @@ export async function restoreCheck(options: { checkpointId: string; source: Back
     checks.push('manifest_sha256');
     for (const chunk of manifest.chunks) {
       const body = await fetchVerified(options.source, chunk.key, chunk.sha256, chunk.bytes, save, 'chunk');
-      const counted: Record<string, number> = {};
+      const counted: Record<string, number> = {}, revised: Record<string, number> = {};
       for (const text of lines(body)) {
         const value = JSON.parse(text);
         if (chunk.kind === 'raw_list') {
@@ -186,13 +193,18 @@ export async function restoreCheck(options: { checkpointId: string; source: Back
           raw.push(value); counted.raw_objects = (counted.raw_objects ?? 0) + 1;
           continue;
         }
-        if (!(value.t in manifest.table_counts) || !value.r || typeof value.r !== 'object' || Array.isArray(value.r)) throw new RestoreError('invalid_chunk_row');
+        const revision = value.revision === true;
+        if (!(value.t in manifest.table_counts) || !value.r || typeof value.r !== 'object' || Array.isArray(value.r)
+          || Object.keys(value).some(key => !['t', 'r', 'revision'].includes(key)) || ('revision' in value && !revision)
+          || (revision && chunk.kind !== 'final')) throw new RestoreError('invalid_chunk_row');
         for (const field of Object.values(value.r)) if (field !== null && typeof field === 'object') throw new RestoreError('invalid_chunk_row');
-        (rows.get(value.t) ?? rows.set(value.t, []).get(value.t)!).push(value.r);
-        counted[value.t] = (counted[value.t] ?? 0) + 1;
+        const target = revision ? revisions : rows, tally = revision ? revised : counted;
+        (target.get(value.t) ?? target.set(value.t, []).get(value.t)!).push(value.r);
+        tally[value.t] = (tally[value.t] ?? 0) + 1;
       }
-      if (Object.entries(chunk.rows).some(([name, count]) => (counted[name] ?? 0) !== count)
-        || Object.keys(counted).some(name => !(name in chunk.rows))) fail('chunk_row_count_mismatch');
+      const same = (expected: Record<string, number>, actual: Record<string, number>) =>
+        Object.entries(expected).every(([name, count]) => (actual[name] ?? 0) === count) && Object.keys(actual).every(name => name in expected);
+      if (!same(chunk.rows, counted) || !same(chunk.revisions ?? {}, revised)) fail('chunk_row_count_mismatch');
     }
     checks.push('chunk_sha256');
     if (raw.length !== manifest.raw.objects) fail('raw_object_count_mismatch');
@@ -214,25 +226,44 @@ export async function restoreCheck(options: { checkpointId: string; source: Back
     const db = await mf.getD1Database('DB') as unknown as D1Database, bucket = await mf.getR2Bucket('RAW');
     const deferred = await applyMigrationStatements(db, { deferTriggers: true, directory: options.migrationsDirectory });
     const tables = Object.keys(manifest.table_counts).sort();
-    const columns = new Map<string, Set<string>>();
+    const columns = new Map<string, Set<string>>(), keys = new Map<string, string[]>();
     // Read-only lookups go in D1 batches: one local round trip each instead of one per table.
-    const infos = tables.length ? await db.batch<{ name: string }>(tables.map(table => db.prepare('SELECT name FROM pragma_table_info(?)').bind(table))) : [];
+    const infos = tables.length ? await db.batch<{ name: string; pk: number }>(tables.map(table => db.prepare('SELECT name,pk FROM pragma_table_info(?)').bind(table))) : [];
     tables.forEach((table, index) => {
       if (!infos[index].results.length) { fail('unknown_table'); return; }
       columns.set(table, new Set(infos[index].results.map(row => row.name)));
+      keys.set(table, infos[index].results.filter(row => row.pk > 0).sort((a, b) => a.pk - b.pk).map(row => row.name));
     });
     if (failures.size) return report({ tables: {}, raw_objects: raw.length });
     const { order, selfRefs } = await loadOrder(db, tables);
     // Migrations may seed rows (single-row state tables); the checkpoint's rows replace them.
     await db.batch([...order].reverse().map(table => db.prepare(`DELETE FROM "${table}"`)));
     for (const table of order) {
-      const list = selfOrdered(rows.get(table) ?? [], selfRefs.get(table));
+      // A revision is the newer state of a row an earlier round exported; it must replace exactly one row.
+      let base = rows.get(table) ?? [];
+      const updates = revisions.get(table) ?? [];
+      if (updates.length) {
+        const key = keys.get(table)!, identity = (row: Row) => JSON.stringify(key.map(name => row[name] ?? null));
+        if (!key.length) { fail('revision_without_key', updates.length); continue; }
+        const positions = new Map(base.map((row, index) => [identity(row), index]));
+        base = [...base];
+        for (const update of updates) {
+          const index = positions.get(identity(update));
+          if (index === undefined) fail('revision_without_row'); else base[index] = update;
+        }
+      }
+      const list = selfOrdered(base, selfRefs.get(table));
       const names = [...new Set(list.flatMap(row => Object.keys(row)))];
       if (names.some(name => !columns.get(table)!.has(name) || !TABLE.test(name))) { fail('unknown_column'); continue; }
       if (!list.length) continue;
       const insert = `INSERT INTO "${table}"(${names.map(name => `"${name}"`).join(',')}) SELECT ${names.map(name => `json_extract(value,'$."${name}"')`).join(',')} FROM json_each(?)`;
       const groups = jsonGroups(list);
-      for (let index = 0; index < groups.length; index += 50) await db.batch(groups.slice(index, index + 50).map(group => db.prepare(insert).bind(group)));
+      try {
+        for (let index = 0; index < groups.length; index += 50) await db.batch(groups.slice(index, index + 50).map(group => db.prepare(insert).bind(group)));
+      } catch {
+        // A duplicate key or a value the schema refuses: the backup cannot rebuild this table.
+        fail('row_load_failed');
+      }
     }
     checks.push('load_in_foreign_key_order');
     for (const entry of raw) {
@@ -326,6 +357,7 @@ export async function restoreCheck(options: { checkpointId: string; source: Back
       note('event_project_drift', await count('SELECT COUNT(*) AS n FROM events e JOIN sessions s ON s.id=e.session_id WHERE e.project_id!=s.project_id'));
       checks.push('project_drift');
     }
+    if (options.inspect) await options.inspect(db);
     return report({ tables: counts, raw_objects: raw.length }, { expected: deferred.length, matched });
   } catch (error) {
     if (!(error instanceof RestoreError)) throw error;
