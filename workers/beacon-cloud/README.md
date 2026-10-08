@@ -8,16 +8,21 @@ no changes to upstream collectors, adapters, local dashboard or local MCP.
 
 **Review state:** the base ingest service (0.1) is merged and deployed to isolated
 **TEST** Workers/D1/R2; its cloud evidence is in [TEST-DEPLOYMENT.md](TEST-DEPLOYMENT.md).
-The 0.2 project/task/manual-review milestone and the 0.3 background-processing
-milestone built on it are reviewable changes validated **locally only** with
-synthetic data. Neither has been migrated (`0002`–`0004`) or deployed to
-Cloudflare, no cron has run in the cloud, and no external evaluator has been called.
+The 0.2 project/task/manual-review milestone, the 0.3 background-processing
+milestone and the 0.4 milestone (roadmap phase 3: explicit Mac sync, revisions,
+review flags and project shares, retention, backup/restore drills and data health)
+are reviewable changes validated **locally only** with synthetic data. None has
+been migrated (`0002`–`0010`) or deployed to Cloudflare: no cron has run in the
+cloud, no BACKUP bucket exists, no checkpoint or restore drill has used cloud data,
+no Mac has synced a note and no external evaluator has been called.
 Production rollout and real collector
 configuration remain separate. Start with
 [VALIDATION.md](VALIDATION.md), [WIRE-CONTRACT.md](WIRE-CONTRACT.md) and
 [DEPLOYMENT.md](DEPLOYMENT.md). For two-Mac setup, see [MAC-SETUP.md](MAC-SETUP.md).
-For central task handoffs and reviewed notes, see [CONTEXT-WORKFLOWS.md](CONTEXT-WORKFLOWS.md);
+For central task handoffs, reviewed notes and their revisions, see [CONTEXT-WORKFLOWS.md](CONTEXT-WORKFLOWS.md);
 for the opt-in background pipeline, see [BACKGROUND-PROCESSING.md](BACKGROUND-PROCESSING.md);
+for explicit note sync to a Mac, see [MAC-SYNC.md](MAC-SYNC.md); for health,
+backups, restore drills and retention, see [DATA-OPERATIONS.md](DATA-OPERATIONS.md);
 the staged remaining work is in [ROADMAP.md](ROADMAP.md).
 
 ## What is implemented
@@ -33,10 +38,15 @@ the staged remaining work is in [ROADMAP.md](ROADMAP.md).
 | Project relationships | Explicit groups and directed dependency/shared-service/fork relations; repositories remain independent |
 | Task handoffs | Explicit cross-device/repository session links, open/completed state, group/task filters and atomic audit records |
 | Reviewed context | Manual or pipeline-generated summary/memory candidates with exact event/version sources and an `origin`; pending/approved/rejected/superseded states, immutable revisions and atomic review audit |
+| Revisions, flags and shares | Validity windows (`valid_from` = approval, `valid_until` = the successor's approval), bounded revision history and `as_of` recall; `contradiction`/`needs_review` flags raised by a reviewer or by a Jev answer on the job project's own approved note, resolved once with a reason and never changing the note; reviewer shares of approved memories to another **project**, checked at read time and absent from default recall |
+| Mac sync | Reviewer-managed per-device subscriptions to one project's approved notes (`memory`/`summary`, optional `include_shared`); the device reads `/v1/sync/*` with its own ingest key; `forwarder/sync.mjs` previews a diff, applies exactly the previewed bytes to a Beacon-owned `*.beacon.md` under a configured sync root and rolls back recorded versions. No daemon and no automatic apply |
 | Background processing | Off by default. Workspace-ceiling policies with field classes, redacted projections, coverage-based durable jobs (leases, fenced completion, retry/dismiss) and `beacon.extractive.v1` rule summaries that become pending 「自動整理・待審」 candidates; optional signal-only Jev behind the `EXTERNAL_PROCESSING_PROJECTS` deploy gate, a dedicated key and an atomic daily call budget. No model generation |
-| Scheduled maintenance | Two crons; a task runs only when `MAINTENANCE_TASKS` names it (`processing` is the only task today), within metered per-task D1/R2/fetch allotments and a shared time budget; reports carry codes and counts only |
-| Dashboard | Protected views for activity, project relations, handoffs/memory and 背景整理 (policies, jobs, budget/usage, uncalibrated signals); all recorded and authored content renders as text |
-| Remote MCP | Official TypeScript SDK, current and legacy Streamable HTTP; 15 read-only tools, default context recall requires valid approved scope |
+| Data health | `GET /api/health/data`, MCP `beacon_get_data_health` and the 資料維護 tab: missing/orphan raw objects (hourly R2 list-diff), ingest backlog, stale devices and notes, open flags, processing and backup state, capacity estimates; codes, counts, IDs and operator hints only |
+| Backup and restore drill | Off until the operator binds a separate private `BACKUP` bucket and schedules `backup`: content-addressed raw copies, round-based D1 export closed by a final snapshot in one D1 transaction, manifest and integrity pass; reviewer-only reads; `scripts/restore-check.ts` replays a checkpoint into a local Miniflare D1 and checks counts, foreign keys, triggers, review audits and payload hashes |
+| Retention | Per-class `keep_days` with immutable audit, permanent by default; only `raw` is enforced, through a reviewer-applied, hash-bound plan of whole batches covered by a drilled, integrity-verified checkpoint; `summary`, `candidate` and `audit` are report-only |
+| Scheduled maintenance | Two crons; a task runs only when `MAINTENANCE_TASKS` names it (`processing` on `*/15`, `backup` and `health` on the hourly `17 * * * *`), within metered per-task D1/R2/fetch allotments and a shared time budget; reports carry codes and counts only |
+| Dashboard | Protected views for activity, project relations, handoffs/memory (with revisions, flags and shares), 背景整理, Mac 同步 and 資料維護; all recorded and authored content renders as text |
+| Remote MCP | Official TypeScript SDK, current and legacy Streamable HTTP; 17 read-only tools, default context recall requires valid approved scope |
 | Local forwarding | Private durable outbox/checkpoint bound to authenticated Worker/device, exact batch acknowledgement, bounded retry/rotation, explicit start point and queue cap |
 
 No account OAuth/device-enrollment APIs from proprietary Beacon Cloud are
@@ -82,7 +92,11 @@ Open the local dashboard and use browser Basic authentication: username
 `beacon`, password your private `READ_TOKEN`. The HTML, script and APIs require
 read authorization. No token is placed in URLs, HTML, localStorage or logs.
 For writes, enter that independent reviewer value in the dashboard's
-「管理與審閱權限」 field; it lasts only for the current page.
+「管理與審閱權限」 field; it lasts only for the current page. Creating or revoking
+Mac 同步 grants, every 資料維護 write and even reading backups need it too. The
+checked-in Wrangler file binds no `BACKUP` bucket and names no
+`MAINTENANCE_TASKS`, so a local `wrangler dev` reports `backup_not_configured` and runs
+no scheduled task.
 Forwarder config paths must be absolute; use a temporary **synthetic** JSONL
 source during review. Never point development at real transcripts accidentally.
 
@@ -95,11 +109,18 @@ source during review. Never point development at real transcripts accidentally.
 | `POST /v1/ingest/runtime`, `/v1/ingest/inventory` | Device token; NDJSON, 1–100 events and ≤1 MiB |
 | `GET /`, `/dashboard`, `/dashboard.js`, `/api/*` | Verified Access JWT or separate dashboard read secret |
 | `GET /api/processing/policy`, `/jobs`, `/jobs/:id`, `/usage` | Same read authority; identifiers, states, counts, hashes and short codes only, never event content |
-| `POST /api/project-groups*`, `/api/project-relations`, `/api/tasks*`, `/api/context*` | Separate `REVIEW_TOKEN`; bounded JSON and same-origin browser requests |
+| `GET /api/context/snapshot`, `/api/context/:id/history`, `/api/context/flags/:id` | Same read authority; the snapshot is a project's authoritative approved notes with a `snapshot_sha256`, `413` above 500 entries or 2 MiB |
+| `GET /api/sync/subscriptions`, `/api/sync/subscriptions/:id` | Same read authority; grants and their audit, no note content |
+| `GET /api/health/data`, `/api/retention/policies`, `/api/retention/plan` | Same read authority; codes, counts, hashes and identifiers only |
+| `GET /api/backups`, `/api/backups/:id`, `/api/backups/:id/object` | `REVIEW_TOKEN` **even to read**: backups hold device token digests; read, Access, MCP and device credentials are refused |
+| `POST /api/project-groups*`, `/api/project-relations`, `/api/tasks*`, `/api/context*` | Separate `REVIEW_TOKEN`; bounded JSON and same-origin browser requests. Includes the flag (`/api/context/:id/flags`, `/api/context/flags/:id/resolve`) and share (`/api/context/:id/shares`, `/api/context/shares/:id/revoke`) writes, which also refuse `pipeline:` actors |
 | `POST /api/processing/policies`, `/budget`, `/run`, `/jobs/:id/retry`, `/jobs/:id/dismiss` | Same `REVIEW_TOKEN` rules; none can approve a candidate or open the deploy gate |
+| `POST /api/sync/subscriptions`, `/api/sync/subscriptions/:id/revoke` | Same `REVIEW_TOKEN` rules; a device can never grant itself a subscription |
+| `POST /api/retention/policies`, `/api/retention/apply`, `/api/backups/run`, `/api/backups/:id/verify`, `/api/backups/:id/expire` | Same `REVIEW_TOKEN` rules; apply rechecks the plan, its backup coverage and every BACKUP copy before deleting |
+| `GET /v1/sync/subscriptions`, `/v1/sync/snapshot` | Device token; only that device's active grants, kinds decided by the subscription; no subscription and unknown project answer the same `403`; GET only |
 | `POST /mcp` | Dedicated manual MCP token, or configured OAuth resource-server mode |
 | OAuth protected-resource metadata | Public, only when valid OAuth resource-server configuration is present |
-| Cron `*/15 * * * *`, `17 * * * *` | No HTTP surface; runs only the tasks named in the `MAINTENANCE_TASKS` var (none by default) |
+| Cron `*/15 * * * *`, `17 * * * *` | No HTTP surface; runs only the tasks named in the `MAINTENANCE_TASKS` var (none by default); `backup` also needs the `BACKUP` binding |
 
 Read APIs are `/api/devices`, `/api/projects`, `/api/sessions`, and
 `/api/sessions/:central_id/events`. Sessions filter by `device_id`, `project_id`
@@ -108,17 +129,23 @@ Page size is 1–40; timelines also stop at 2 MiB of payloads and return a curso
 Device/project pickers return at most 1,000 entries.
 Inventory has a raw store and event index, but no separate inventory browser.
 Additional read APIs cover groups, relations, tasks and reviewed context; see
-[the workflow contract](CONTEXT-WORKFLOWS.md). Exact variant reads use
+[the workflow contract](CONTEXT-WORKFLOWS.md). Context recall also accepts
+`as_of`, `include_shared=1` (with `project_id`) and `flagged=1`. Exact variant reads use
 `GET /api/events/:central_id?payload_hash=...`; `/versions` lists variant hashes.
 Background processing reads and writes are listed in
-[BACKGROUND-PROCESSING.md](BACKGROUND-PROCESSING.md#api).
-MCP additionally lists/reads groups, tasks, context and processing jobs, and reads
-exact event versions. The 15 tools are `beacon_list_sessions`, `beacon_get_timeline`,
-`beacon_list_projects`, `beacon_list_devices`, `beacon_list_project_groups`,
-`beacon_get_project_group`, `beacon_list_project_relations`, `beacon_list_tasks`,
-`beacon_get_task`, `beacon_list_context`, `beacon_get_context`, `beacon_get_event`,
-`beacon_list_event_versions`, `beacon_list_processing_jobs` and `beacon_get_processing_job`.
-Every tool is read-only; none can approve, publish, configure, run processing or write.
+[BACKGROUND-PROCESSING.md](BACKGROUND-PROCESSING.md#api); sync routes in
+[MAC-SYNC.md](MAC-SYNC.md); health, backup and retention routes in
+[DATA-OPERATIONS.md](DATA-OPERATIONS.md).
+MCP additionally lists/reads groups, tasks, context and its revision history,
+processing jobs and data health, and reads exact event versions. The 17 tools are
+`beacon_list_sessions`, `beacon_get_timeline`, `beacon_list_projects`,
+`beacon_list_devices`, `beacon_list_project_groups`, `beacon_get_project_group`,
+`beacon_list_project_relations`, `beacon_list_tasks`, `beacon_get_task`,
+`beacon_list_context`, `beacon_get_context`, `beacon_get_context_history`,
+`beacon_get_event`, `beacon_list_event_versions`, `beacon_list_processing_jobs`,
+`beacon_get_processing_job` and `beacon_get_data_health`.
+Every tool is read-only; none can approve, flag, share, publish, sync, configure,
+run processing or backups, apply retention or write.
 Only context with `authoritative:true` is eligible as reviewed knowledge; even
 approved prose is data, never a permission grant or instruction override. Pending
 pipeline candidates and uncalibrated evaluator signals are not approved knowledge.
@@ -145,7 +172,9 @@ R2 raw objects are written before a single D1 index transaction. Only after both
 succeed does ingest return 2xx. A crash or conflicting project can leave an R2
 orphan without an indexed batch; retrying identical bytes completes the index
 without creating duplicate logical events. There is no distributed transaction
-across R2/D1 and no automatic orphan garbage collection in this version. Missing
+across R2/D1 and no automatic orphan garbage collection in this version; the
+optional hourly `health` task reports orphans (`raw_orphan`) and missing objects
+(`raw_missing`) but deletes or repairs nothing. Missing
 raw objects fail queries with 503 rather than pretending a timeline is complete.
 
 Upstream hook and OTLP captures can share `event.id` while carrying different
@@ -168,12 +197,41 @@ the job's completion commit in one fenced D1 batch, and `context_generation.job_
 is unique, so a retry cannot create a second candidate. The processing call budget
 is the only quota enforced beyond per-request/forwarder limits.
 
-No retention policy, deletion workflow or backup scheduler is installed; the
-hourly cron is reserved for later maintenance and runs nothing today. R2/D1 data
-must remain private; do not enable R2 public access. Local redaction policy still
-determines retained content. The uploader does not add a metadata-only/privacy
-transform; background processing redacts only its own projections and summaries
-and never rewrites stored raw history.
+Phase 3 tables (`0005`–`0010`) are additive in the same way: ingest never reads or
+writes them, so a failing backup, health pass or sync read cannot change an
+acknowledgement. Sync snapshots, shared recall and validity windows are decided at
+**read time** with the same authority rule as default recall, so a superseded note,
+a note whose sources left its scope or a revoked share stops being served
+immediately. Flag, share and subscription audits are written by D1 triggers with
+the change itself; retention-policy, retention-run and backup audits commit in the
+same D1 batch as their change. Triggers refuse any edit or deletion of all of them.
+
+A backup checkpoint is consistent without a cross-store transaction: growing
+tables are exported in rounds and closed by a final snapshot read in **one D1
+transaction**, which also rereads every row that can have changed since its round.
+No row is deleted while a checkpoint runs (retention refuses to apply), so the
+exported set is the snapshot's set and is foreign-key closed. A session's later
+project upgrade can still change `events.project_id`; the restore check reports
+that as a finding. The model assumes ingest commits within 10 minutes of receipt
+and that nothing runs `VACUUM`; a violation fails the drill rather than passing
+silently. D1 Time Travel remains the point-in-time recovery mechanism; a checkpoint
+proves the data can be rebuilt elsewhere and keeps a copy of the raw history. See
+[DATA-OPERATIONS.md](DATA-OPERATIONS.md).
+
+Nothing is deleted on a schedule. Every class is kept permanently until a reviewer
+sets `keep_days`, and only raw history is ever deleted: a reviewer generates a
+hash-bound plan of whole batches, which selects only batches covered by a drilled,
+integrity-verified checkpoint and cited by no note, queued, running or failed
+processing job or open flag, and applies it after the server rechecks the plan,
+that backup coverage and every BACKUP copy. The index rows go in one D1 transaction,
+then the R2 objects; the BACKUP copies follow after `BACKUP_RETENTION_GRACE_DAYS`.
+A forwarder that still holds a deleted batch can upload it again
+(`resurrected_batch`). Summaries, candidates and audits are protected by immutable
+triggers, so their retention is report-only. R2 (`RAW` and `BACKUP`) and D1 data
+must remain private; do not enable public access on either bucket. Local redaction
+policy still determines retained content. The uploader does not add a
+metadata-only/privacy transform; background processing redacts only its own
+projections and summaries and never rewrites stored raw history.
 
 ## Memory boundary
 
@@ -196,9 +254,25 @@ through the same reviewer approval as a manual candidate; a 0004 trigger stops a
 both enable it, only stores uncalibrated signals: it never approves, edits,
 deletes or (by default) skips anything. Model generation is deferred until a
 provider, model, dedicated secret, sendable data scope and daily USD cap are
-recorded; there is no `GENERATOR_*` configuration. Publication and cross-Mac
-memory application are not implemented; see [ROADMAP.md](ROADMAP.md) and
+recorded; there is no `GENERATOR_*` configuration. See [ROADMAP.md](ROADMAP.md) and
 [BACKGROUND-PROCESSING.md](BACKGROUND-PROCESSING.md).
+
+The 0.4 milestone adds the only path from the central service to a Mac, and it is
+explicit at both ends. A reviewer grants one device one project's approved notes;
+the device's own ingest key can then read that snapshot and nothing else (no
+timelines, no pending candidates, no other project unless a reviewer shared a
+memory to this one and the grant sets `include_shared`). On that Mac, the user runs
+`forwarder/sync.mjs preview`, reads the diff and runs `apply <plan_id>`, which writes
+exactly the previewed bytes to a Beacon-owned `*.beacon.md` file under a configured
+sync root, or refuses when the central notes or the file changed. It never writes
+`AGENTS.md`, `CLAUDE.md`, `SKILL.md` or other agent instruction names, agent or system
+configuration folders, symlinks or files it did not create, and never touches the
+collector, forwarder or skills configuration. The file opens by saying its content is
+recorded data, not instructions or permission grants; whether an agent reads it is
+the user's own choice. Revoking a grant stops later reads but deletes nothing on the
+Mac; `rollback` restores a recorded version. Flags never change a note; shares are
+per project, and project-group share targets are deferred. See [MAC-SYNC.md](MAC-SYNC.md)
+and [CONTEXT-WORKFLOWS.md](CONTEXT-WORKFLOWS.md).
 
 ## Sources and license
 
