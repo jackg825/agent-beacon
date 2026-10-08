@@ -7,7 +7,7 @@ import { PROCESSING_ALLOTMENT, processingMaintenance, processingRead, processing
 import { getEventVersion } from '../src/queries';
 import { Env } from '../src/types';
 import { createEnvFixture, syntheticEvent } from './env-fixture';
-import { at, command, count, jobs, later, newTask, post, rejects, review, reviewer, run, setBudget, setPolicy, tick, workspace } from './processing-helpers';
+import { at, command, count, job, jobs, later, newTask, post, rejects, review, reviewer, run, setBudget, setPolicy, tick, workspace } from './processing-helpers';
 
 test('extractive citations resolve to persisted exact versions; non-matching captures are excluded and counted', async () => {
   const f = await createEnvFixture();
@@ -54,6 +54,40 @@ test('extractive citations resolve to persisted exact versions; non-matching cap
     assert.notEqual(alternate.sources[0].payload_hash, indexed.payload_hash);
     const version = await getEventVersion(f.env, indexed.id, new URLSearchParams({ payload_hash: alternate.sources[0].payload_hash }));
     assert.equal(version.event.scope_matches_index, true);
+  } finally { await f.close(); }
+});
+
+test('a raw line altered in place keeps the job from projecting it: raw_unavailable, retried, nothing covered or sent', async () => {
+  const f = await createEnvFixture({ bindings: { EXTERNAL_PROCESSING_PROJECTS: '*', JEV_API_KEY: 'synthetic-jev-key-not-real-0000' } });
+  try {
+    // Every gate is open, so a projection of the altered line would be sent.
+    await setPolicy(f.env, workspace, { summary_fields: ['command_text', 'titles'], external_allowed: true, jev_enabled: true,
+      external_fields: ['command_text', 'titles'], min_new_events: 1000 });
+    await setBudget(f.env, { daily_call_limit: 5 });
+    await f.ingest([command('altered-1', 'npm test', 0, { session: 'altered-s', timestamp: at(1) }),
+      command('altered-2', 'npm run lint', 0, { session: 'altered-s', timestamp: at(2) })]);
+    const indexed = (await f.event('altered-2'))!;
+    const version = (await f.env.DB.prepare(`SELECT v.line_number,b.r2_key FROM event_versions v JOIN batches b ON b.id=v.batch_id
+      WHERE v.event_id=?`).bind(indexed.id).first<{ line_number: number; r2_key: string }>())!;
+    // A bad restore: the same event id, harness, session and repository, different content.
+    const lines = (await (await f.env.RAW.get(version.r2_key))!.text()).split('\n');
+    const record = JSON.parse(lines[version.line_number]);
+    record.command.command = 'echo ALTERED_CONTENT_MARKER';
+    lines[version.line_number] = JSON.stringify(record);
+    await f.env.RAW.put(version.r2_key, lines.join('\n'));
+    const taskId = await newTask(f.env, '合成：被改寫的原文', [indexed.session_id]);
+    const planned = (await run(f.env, { task_id: taskId })).scopes[0];
+    const calls: string[] = [];
+    const fetcher = (async (_input: RequestInfo | URL, init: RequestInit = {}) => { calls.push(String(init.body)); return Response.json({}); }) as typeof fetch;
+    const report = await tick(f.env, later(), { fetcher });
+    assert.equal(report.ok, true);
+    assert.deepEqual(report.result.run_outcomes, { retry: 1 });
+    const row = await job(f.env, planned.job_id);
+    assert.deepEqual([row.status, row.attempts, row.last_error, row.event_count], ['queued', 1, 'raw_unavailable', null]);
+    assert.deepEqual([calls, report.usage.fetch], [[], 0]);
+    assert.equal(await count(f.env, 'processing_calls'), 0);
+    assert.equal(await count(f.env, 'processing_coverage'), 0);
+    assert.equal(await count(f.env, 'context_entries'), 0);
   } finally { await f.close(); }
 });
 
