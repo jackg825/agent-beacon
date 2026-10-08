@@ -390,26 +390,43 @@ const objectPath = (config, sha) => join(config.state_dir, 'objects', sha);
 function manifestPath(config, target, destination) {
   return join(config.state_dir, 'targets', `${hash(stableJSON(['beacon.sync.target.v1', config.worker_url, target.project_id, destination]))}.json`);
 }
+const validVersion = (item) => isObject(item) && typeof item.id === 'string' && idPattern.test(item.id) &&
+  (item.sha256 === null || (typeof item.sha256 === 'string' && hashPattern.test(item.sha256)));
+/**
+ * Per-target history. A write is announced as `pending` before the destination is
+ * touched; the next run keeps it only if the file now holds exactly those bytes, so
+ * an interrupted apply or rollback never leaves the history stuck or wrong.
+ */
 async function readManifest(config, target, destination) {
-  const manifest = await readStateJSON(manifestPath(config, target, destination));
-  if (!manifest) return { version: 1, project_id: target.project_id, destination, last_applied_sha256: undefined, versions: [] };
-  if (!isObject(manifest) || manifest.version !== 1 || manifest.project_id !== target.project_id || manifest.destination !== destination ||
-    !Array.isArray(manifest.versions) || manifest.versions.some((item) => !isObject(item) || !idPattern.test(item.id) ||
-      !(item.sha256 === null || hashPattern.test(item.sha256)))) throw fail('CORRUPT_STATE');
+  const manifest = await readStateJSON(manifestPath(config, target, destination.path));
+  if (!manifest) return { version: 1, project_id: target.project_id, destination: destination.path, last_applied_sha256: undefined, versions: [] };
+  if (!isObject(manifest) || manifest.version !== 1 || manifest.project_id !== target.project_id || manifest.destination !== destination.path ||
+    !Array.isArray(manifest.versions) || !manifest.versions.every(validVersion) ||
+    (manifest.pending !== undefined && !validVersion(manifest.pending))) throw fail('CORRUPT_STATE');
+  if (manifest.pending) {
+    if (manifest.pending.sha256 === destination.sha256) settle(manifest);
+    delete manifest.pending;
+    await saveManifest(config, target, manifest);
+  }
   return manifest;
+}
+function settle(manifest) {
+  manifest.versions.push(manifest.pending);
+  manifest.last_applied_sha256 = manifest.pending.sha256;
+  delete manifest.pending;
 }
 async function saveManifest(config, target, manifest) {
   manifest.versions = manifest.versions.slice(-MAX_VERSIONS);
   await atomicWrite(manifestPath(config, target, manifest.destination), JSON.stringify(manifest));
 }
-/** Content-addressed private copies; `null` records that the destination did not exist. */
-async function recordVersion(config, manifest, bytes, reason, extra = {}) {
-  const sha256 = bytes ? hash(bytes) : null;
-  if (bytes && !(await readPrivate(objectPath(config, sha256)))) await atomicWrite(objectPath(config, sha256), bytes);
-  const version = { id: randomBytes(16).toString('hex'), reason, sha256, recorded_at: new Date().toISOString(), ...extra };
-  manifest.versions.push(version);
-  return version;
+/** Content-addressed private copy of a version's bytes. */
+async function storeObject(config, bytes) {
+  const sha256 = hash(bytes);
+  if (!(await readPrivate(objectPath(config, sha256)))) await atomicWrite(objectPath(config, sha256), bytes);
+  return sha256;
 }
+/** `sha256: null` records that the destination did not exist. */
+const versionEntry = (reason, sha256, extra = {}) => ({ id: randomBytes(16).toString('hex'), reason, sha256, recorded_at: new Date().toISOString(), ...extra });
 
 /** Fetch each subscribed snapshot, render it and store a bound plan with the exact bytes. */
 export async function preview(configOrPath, options = {}) {
@@ -467,13 +484,15 @@ export async function apply(configOrPath, planId, options = {}) {
     if (snapshot.snapshot_sha256 !== plan.snapshot_sha256 || stableJSON(snapshot.kinds) !== stableJSON(plan.kinds)) throw fail('STALE_PLAN');
     if (!renderSnapshot(snapshot).equals(rendered)) throw fail('RENDER_MISMATCH');
     if (destination.sha256 !== plan.destination_sha256_before) throw fail('DESTINATION_CHANGED');
-    // Keep what is about to be replaced before the destination is touched.
-    const manifest = await readManifest(config, target, destination.path);
-    const previous = await recordVersion(config, manifest, destination.bytes, 'previous', { plan_id: planId });
+    // Keep what is about to be replaced, and announce the write, before the destination is touched.
+    const manifest = await readManifest(config, target, destination);
+    const previous = versionEntry('previous', destination.bytes ? await storeObject(config, destination.bytes) : null, { plan_id: planId });
+    const applied = versionEntry('applied', await storeObject(config, rendered), { plan_id: planId, snapshot_sha256: plan.snapshot_sha256 });
+    manifest.versions.push(previous);
+    manifest.pending = applied;
     await saveManifest(config, target, manifest);
     await atomicWrite(destination.path, rendered, plan.destination_sha256_before);
-    const applied = await recordVersion(config, manifest, rendered, 'applied', { plan_id: planId, snapshot_sha256: plan.snapshot_sha256 });
-    manifest.last_applied_sha256 = plan.rendered_sha256;
+    settle(manifest);
     await saveManifest(config, target, manifest);
     for (const extension of ['md', 'json']) await fs.rm(planPath(config, planId, extension), { force: true });
     return { applied: true, plan_id: planId, target: plan.target, entries: plan.entries, snapshot_sha256: plan.snapshot_sha256,
@@ -489,13 +508,17 @@ export async function rollback(configOrPath, targetValue, options = {}) {
   return withLock(config, async () => {
     const target = config.targets[index];
     const destination = await resolveDestination(config, target);
-    const manifest = await readManifest(config, target, destination.path);
+    const manifest = await readManifest(config, target, destination);
     if (manifest.last_applied_sha256 === undefined) throw fail('NO_SYNC_HISTORY');
     if (destination.sha256 !== manifest.last_applied_sha256) throw fail('DESTINATION_CHANGED');
     const version = options.version === undefined ? manifest.versions.findLast((item) => item.reason === 'previous')
       : manifest.versions.find((item) => item.id === options.version);
     if (!version) throw fail('VERSION_NOT_FOUND');
     if (version.sha256 === destination.sha256) return { target: index, changed: false, restored_version_id: version.id };
+    // The restored bytes are already stored under their hash (or were absent).
+    const recorded = versionEntry('rollback', version.sha256, { restored_version_id: version.id });
+    manifest.pending = recorded;
+    await saveManifest(config, target, manifest);
     if (version.sha256 === null) {
       if ((await readDestination(destination.path)).sha256 !== destination.sha256) throw fail('DESTINATION_CHANGED');
       await fs.rm(destination.path);
@@ -505,11 +528,7 @@ export async function rollback(configOrPath, targetValue, options = {}) {
       if (!bytes || hash(bytes) !== version.sha256) throw fail('CORRUPT_STATE');
       await atomicWrite(destination.path, bytes, destination.sha256);
     }
-    // The restored bytes are already stored under their hash (or were absent).
-    const recorded = { id: randomBytes(16).toString('hex'), reason: 'rollback', sha256: version.sha256,
-      recorded_at: new Date().toISOString(), restored_version_id: version.id };
-    manifest.versions.push(recorded);
-    manifest.last_applied_sha256 = version.sha256;
+    settle(manifest);
     await saveManifest(config, target, manifest);
     return { target: index, changed: true, restored_version_id: version.id, rollback_version_id: recorded.id, deleted: version.sha256 === null };
   });
@@ -521,7 +540,7 @@ export async function versions(configOrPath, targetValue) {
   return withLock(config, async () => {
     const target = config.targets[index];
     const destination = await resolveDestination(config, target);
-    const manifest = await readManifest(config, target, destination.path);
+    const manifest = await readManifest(config, target, destination);
     return { target: index, current_sha256: destination.sha256, last_applied_sha256: manifest.last_applied_sha256 ?? null,
       versions: manifest.versions.map(({ id, reason, sha256, recorded_at, plan_id, restored_version_id }) =>
         ({ id, reason, sha256, recorded_at, plan_id: plan_id ?? null, restored_version_id: restored_version_id ?? null })) };
@@ -541,7 +560,7 @@ export async function status(configOrPath, options = {}) {
       let destination, inSync = null;
       try {
         const current = await resolveDestination(config, target);
-        const manifest = await readManifest(config, target, current.path);
+        const manifest = await readManifest(config, target, current);
         destination = current.bytes ? 'managed' : 'absent';
         if (manifest.last_applied_sha256 !== undefined) inSync = manifest.last_applied_sha256 === current.sha256;
       } catch (error) {

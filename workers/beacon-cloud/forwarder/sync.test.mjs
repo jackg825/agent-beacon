@@ -184,6 +184,36 @@ test('rollback restores recorded versions, refuses user edits and restores absen
   assert.equal((await fs.readFile(f.tokenFile, 'utf8')).trim(), TOKEN, 'a symlinked destination is never followed');
 });
 
+test('an interrupted apply or rollback is reconciled from what the destination actually holds', async (t) => {
+  const f = await fixture(t);
+  const first = await apply(f.config, (await preview(f.config)).plans[0].plan_id);
+  const v1 = await read(f.destination);
+  f.worker.add(PROJECT, note('memory', '第二版', '合成第二版內容。'));
+  const plan = (await preview(f.config)).plans[0];
+  const rendered = await read(join(f.config.state_dir, 'plans', `${plan.plan_id}.md`));
+  const [manifestName] = await fs.readdir(join(f.config.state_dir, 'targets'));
+  const manifestPath = join(f.config.state_dir, 'targets', manifestName);
+  const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  const announced = { id: 'e'.repeat(32), reason: 'applied', sha256: hash(rendered), recorded_at: '2026-10-08T00:00:00.000Z', plan_id: plan.plan_id };
+  // Interrupted before the rename: the announced write never happened and is dropped.
+  await fs.writeFile(manifestPath, JSON.stringify({ ...manifest, pending: announced }));
+  let history = await versions(f.config, '0');
+  assert.equal(history.last_applied_sha256, hash(v1));
+  assert.ok(!history.versions.some((version) => version.id === announced.id));
+  // Interrupted after the rename: the file holds the announced bytes, so the write is kept.
+  await fs.writeFile(manifestPath, JSON.stringify({ ...manifest, pending: announced }));
+  await fs.writeFile(f.destination, rendered);
+  history = await versions(f.config, '0');
+  assert.equal(history.last_applied_sha256, hash(rendered));
+  assert.equal(history.versions.at(-1).id, announced.id);
+  assert.equal((await status(f.config)).targets[0].matches_last_apply, true);
+  await rollback(f.config, '0', { version: first.applied_version_id });
+  assert.ok((await read(f.destination)).equals(v1));
+  // A malformed announcement is refused rather than trusted.
+  await fs.writeFile(manifestPath, JSON.stringify({ ...JSON.parse(await fs.readFile(manifestPath, 'utf8')), pending: { id: '../x', sha256: null } }));
+  await assert.rejects(versions(f.config, '0'), { message: 'CORRUPT_STATE' });
+});
+
 test('config confines destinations to an allowlisted root and refuses instruction files', async (t) => {
   const f = await fixture(t);
   for (const destination of ['/abs/x.beacon.md', '../x.beacon.md', 'alpha/../x.beacon.md', './x.beacon.md', '.hidden/x.beacon.md',
