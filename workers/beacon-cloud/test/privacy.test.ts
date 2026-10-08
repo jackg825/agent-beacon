@@ -151,6 +151,35 @@ test('home directories become ~/ and paths under the session directory become re
   assert.equal(projectEvent(payload, ['file_path'], { projectRoot: '/elsewhere' }).file_path, '~/work/repo/src/login.ts');
 });
 
+test('Windows user names are removed from serialized classes and from JSON text, whatever the backslash escaping', () => {
+  const path = 'C:\\Users\\synthcarol\\proj\\a.ts';
+  // JSON text doubles each backslash; JSON inside a JSON string doubles them again.
+  assert.equal(redact(JSON.stringify({ path })), '{"path":"~/proj\\\\a.ts"}');
+  assert.equal(redact(JSON.stringify({ inner: JSON.stringify({ path }) })), '{"inner":"{\\"path\\":\\"~/proj\\\\\\\\a.ts\\"}"}');
+  assert.equal(redact(JSON.stringify({ home: 'C:\\Users\\synthcarol' })), '{"home":"~"}');
+  const payload = { event: { action: 'agent.message' }, tool: { input: { path, nested: [{ cwd: 'C:\\Users\\synthcarol' }] } },
+    gen_ai: { tool: { call: { result: { stdout: `wrote ${path}` } } }, output: { messages: [{ text: `see ${path}` }] } },
+    raw: { argv: ['node', path], text: JSON.stringify({ path }) } };
+  const projected = projectEvent(payload, ['tool_input', 'command_output', 'response_text', 'raw']);
+  for (const key of ['tool_input', 'command_output', 'response_text', 'raw'] as const) {
+    assert.ok(projected[key]!.includes('~/proj'), `${key}: ${projected[key]}`);
+    assert.ok(!projected[key]!.includes('synthcarol'), `${key}: ${projected[key]}`);
+  }
+  // A plain string holding JSON text is handled by the doubled-separator rule alone.
+  assert.ok(!projectEvent({ tool: { input: JSON.stringify({ path }) } }, ['tool_input']).tool_input!.includes('synthcarol'));
+});
+
+test('strings inside structured values are redacted before escaping, and their assigned values are hunted elsewhere', () => {
+  // Escaping turns `token="v"` into `token=\"v\"`, which the whole-text rule cannot read past.
+  const projection = projectEvents([
+    { payload: { event: { action: 'tool.invoked' }, tool: { input: { command: 'deploy --token="synthQuoted123456"' } } } },
+    { payload: { event: { action: 'command.executed' }, command: { command: 'echo done', output: 'printed synthQuoted123456' } } },
+  ], ['tool_input', 'command_output']);
+  assert.ok(!JSON.stringify(projection).includes('synthQuoted123456'), JSON.stringify(projection));
+  assert.equal(projection.events[0].tool_input, '{"command":"deploy --token=[REDACTED]""}');
+  assert.equal(projection.events[1].command_output, 'printed [REDACTED]');
+});
+
 const marker = (name: string) => `MARKER_${name}_CONTENT`;
 const rich = {
   vendor: 'beacon', schema_version: '1.0', timestamp: '2026-10-08T01:02:03Z',

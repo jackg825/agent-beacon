@@ -96,7 +96,8 @@
 - 另外移除：本服務的裝置金鑰 `bcn_cf_…`、`bcn_device_…`、`sk-ant-`／`sk-proj-`／`sk-svcacct-`／`sk-admin-`、AWS `AKIA`／`ASIA`、GitHub `gh[pousr]_`／`github_pat_`、Slack `xox[abprs]-`、PEM private key 區塊（包含被截斷的；前面有 `private_key=`、`"private_key": "…"` 等標籤時也整塊移除，標籤規則之前就先處理）、JWT、Google `AIza…`、網址中的帳密，以及本 Worker 自己的 `READ_TOKEN`、`MCP_TOKEN`、`REVIEW_TOKEN`、`JEV_API_KEY`（8 字元以上）。
 - 先遮蔽整個字串再截斷（每個字串最多 1,200 字元），截斷後再遮蔽一次，不會留下金鑰前綴。
 - 在整份投影中收集「被指定給機密 key 的值」，之後在任何事件、任何欄位裸露出現時也一併移除。
-- `/Users/<名稱>/`、`/home/<名稱>/`、`C:\Users\<名稱>\` 換成 `~/`；位在 session 工作目錄下的檔案路徑改成相對路徑。
+- `/Users/<名稱>/`、`/home/<名稱>/`、`C:\Users\<名稱>\` 換成 `~/`（JSON 文字中加倍的反斜線也一樣）；位在 session 工作目錄下的檔案路徑改成相對路徑。
+- 結構化的值（工具輸入、`gen_ai` 訊息與結果、`raw`）在序列化前先逐一遮蔽其中會被跳脫的字串，序列化後整段再遮蔽一次；這些字串中指定給機密 key 的值也會被收集。
 - 整份投影最多 120,000 字元，超過的內容欄位會省略，摘要會註明已截斷。
 
 這是規則式遮蔽，不是完整的 DLP。允許更多欄位類別之前，先用合成資料確認輸出。
