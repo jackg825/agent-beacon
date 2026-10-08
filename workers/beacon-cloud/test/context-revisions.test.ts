@@ -584,6 +584,11 @@ test('the bundled Worker reads history and flags with read credentials and write
     assert.equal(created.status, 201);
     const id = ((await created.json()) as any).context.id as string;
     assert.equal((await worker.write(`/api/context/${id}/review`, { decision: 'approve' })).status, 200);
+    // A second approved entry, approved later and never flagged, so filtered and unfiltered recall differ.
+    const second = ((await (await worker.write('/api/context', { kind: 'memory', project_id: a.project_id, title: 'Synthetic later note',
+      content: 'Synthetic later content.', sources: [pair(a)] })).json()) as any).context.id as string;
+    await sleep(5);
+    assert.equal((await worker.write(`/api/context/${second}/review`, { decision: 'approve' })).status, 200);
     const others = [operationsTokens.read, operationsTokens.mcp, operationsTokens.mbp];
     const writes = [[`/api/context/${id}/flags`, { kind: 'needs_review', evidence: [pair(a)] }], [`/api/context/${id}/shares`, { target_type: 'project', target_id: b.project_id }]] as const;
     for (const [path, body] of writes) {
@@ -617,8 +622,11 @@ test('the bundled Worker reads history and flags with read credentials and write
       const chain = await client.callTool({ name: 'beacon_get_context_history', arguments: { context_id: id } });
       assert.equal(chain.isError, undefined);
       assert.deepEqual((chain.structuredContent as any).entries.map((entry: any) => [entry.id, entry.relation, entry.open_flags]), [[id, 'self', 1]]);
+      // as_of at the first approval, before the second one; flagged keeps only the entry with an open flag.
+      const firstApproval = detail.reviewed_at as string;
       const calls = [
-        { project_id: b.project_id, include_shared: true }, { as_of: '2099-01-01T00:00:00Z' }, { flagged: true }, { project_id: b.project_id, include_shared: false },
+        { project_id: b.project_id, include_shared: true }, { as_of: firstApproval }, { flagged: true }, { project_id: b.project_id, include_shared: false },
+        { project_id: a.project_id }, { as_of: '2099-01-01T00:00:00Z' }, { flagged: false },
       ];
       const results = [];
       for (const args of calls) {
@@ -626,7 +634,7 @@ test('the bundled Worker reads history and flags with read credentials and write
         assert.equal(value.isError, undefined, JSON.stringify(args));
         results.push((value.structuredContent as any).context.map((entry: any) => entry.id));
       }
-      assert.deepEqual(results, [[id], [id], [id], []]);
+      assert.deepEqual(results, [[id], [id], [id], [], [second, id], [second, id], [second, id]]);
       assert.equal((await client.callTool({ name: 'beacon_list_context', arguments: { include_shared: true } })).isError, true);
     } finally { await client.close(); }
 
