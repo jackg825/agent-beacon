@@ -41,9 +41,9 @@ export async function migrationStatements(files?: string[], directory = migratio
  * first and create the same triggers afterwards. Only scripts/restore-check.ts uses it,
  * and only on a local database it created.
  */
-export async function applyMigrationStatements(db: Database, options: { files?: string[]; deferTriggers?: boolean } = {}) {
+export async function applyMigrationStatements(db: Database, options: { files?: string[]; deferTriggers?: boolean; directory?: string } = {}) {
   const deferred: MigrationStatement[] = [];
-  for (const statement of await migrationStatements(options.files)) {
+  for (const statement of await migrationStatements(options.files, options.directory)) {
     if (options.deferTriggers && statement.trigger) { deferred.push(statement); continue; }
     await db.prepare(statement.sql).run();
   }
