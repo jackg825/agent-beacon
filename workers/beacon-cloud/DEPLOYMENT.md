@@ -75,8 +75,10 @@ npx wrangler secret put REVIEW_TOKEN --config .local/wrangler.production.jsonc
 
 Deployment before read secrets produces a protected but unusable dashboard/MCP,
 not an open read endpoint. No devices can upload until their digests are inserted.
-The 0.2 feature branch also requires migrations `0002` and `0003`. They add
-central workflow tables/triggers without changing raw history. Back up the
+The 0.2 and 0.3 changes also require migrations `0002`, `0003` and `0004`. They
+add central workflow and background-processing tables/triggers without changing
+raw history; 0.3 stays inert after deployment until the opt-in steps in
+[Background processing opt-in](#background-processing-opt-in-03) are taken. Back up the
 selected D1 database first; use the existing isolated TEST config for a future
 TEST upgrade, never a shared database or production example by accident.
 Omitting `REVIEW_TOKEN` leaves all workflow writes denied. Never reuse read,
@@ -121,6 +123,99 @@ fragmentation; a local path cannot prove a shared repository by itself.
 Do not run `beacon endpoint connect --dashboard-url`, edit the managed Vector
 credential file, install launchd jobs, or change collector settings as part of
 this runbook unless that separate local configuration change is authorized.
+
+## Background processing opt-in (0.3)
+
+This runbook has **not** been executed in any Cloudflare environment; it describes
+a later, separately approved TEST upgrade. Deploying 0.3 changes nothing until each
+step below is taken. Policies, field classes, coverage, Jev and the budget are
+specified in [BACKGROUND-PROCESSING.md](BACKGROUND-PROCESSING.md).
+
+Prerequisites:
+
+- **Workers Paid on the selected account.** Free crons get 10 ms CPU, 50
+  subrequests and 50 D1 queries, too little for any processing tick. Changing the
+  account plan is a separate owner decision; this runbook never changes a plan or
+  shared subscription. On either plan the code stays inert while
+  `MAINTENANCE_TASKS` is unset (a tick then makes no D1 query).
+- Registered crons count toward the account's cron-trigger limit; check the
+  remaining allowance before adding two.
+- **Dedicated secrets only.** `JEV_API_KEY` (and any later generator key) must be
+  issued for this service alone. Never borrow a key, token or secret from another
+  Cloudflare project, Worker or application, and never reuse read, MCP, review or
+  device values.
+
+Steps, shown for the isolated TEST config; keep the explicit `--config` on every
+remote command:
+
+1. **Back up first.** Pause this project's forwarders and review writes, export D1
+   privately, record a Time Travel bookmark and run the local restore check in
+   [CONTEXT-WORKFLOWS.md](CONTEXT-WORKFLOWS.md). Stop if the restore check is incomplete.
+2. **Migrate before deploying code.** Apply every pending migration (`0002`/`0003`
+   if absent, then `0004`): `npx wrangler d1 migrations apply agent-beacon-cloud-test-db --remote --config .local/wrangler.test.jsonc`.
+   The new context queries read `context_generation`; code deployed before `0004`
+   makes note queries return `503` (ingest is unaffected).
+3. **Register the crons and deploy.** The checked-in `wrangler.jsonc` declares them,
+   but deployments use the private config: add
+   `"triggers": {"crons": ["*/15 * * * *", "17 * * * *"]}` there (the hourly string
+   must stay exactly `17 * * * *`; any other cron runs the frequent schedule), then
+   `npx wrangler deploy --config .local/wrangler.test.jsonc`. Confirm it is inert:
+   `GET /api/processing/policy` shows `"workspace":null`, `GET /api/processing/usage`
+   shows `"allows_calls":false`, and `GET /api/processing/jobs` stays empty after a tick.
+4. **Opt into scheduling.** Add `"MAINTENANCE_TASKS": "processing"` to the private
+   config's `vars` (it is not a secret) and deploy again. Without a workspace policy
+   a tick still plans nothing.
+5. **Reviewer policy.** With `REVIEW_TOKEN`, `POST /api/processing/policies` a
+   workspace row with `enabled:true`, `external_allowed:false`, `jev_enabled:false`
+   and the narrowest useful `summary_fields`, then optional project rows to narrow
+   further. Start with synthetic devices and data only.
+6. **Run and review.** Wait for the next `*/15` tick or `POST /api/processing/run`
+   with one `project_id` or `task_id`. Review the 「自動整理・待審」 candidate with the
+   normal approve/reject flow; check job states with `GET /api/processing/jobs`. The
+   scheduled log line carries task names, durations, usage counts and codes only.
+7. **Controlled Jev test (optional, synthetic data, separate approval).**
+   - `npx wrangler secret put JEV_API_KEY --config .local/wrangler.test.jsonc`
+     through the interactive prompt, with a key issued only for this service. Never
+     put it on a command line, in `vars`, git, fixtures or logs.
+   - Set the `EXTERNAL_PROCESSING_PROJECTS` var to the one synthetic test project ID
+     (not `*`); set `JEV_ENDPOINT`/`JEV_MODEL` only when the defaults are wrong.
+   - Reviewer: the workspace row is a ceiling (flags are ANDed and field lists
+     intersected), so raise it first: workspace `external_allowed:true`,
+     `jev_enabled:true` and the test classes in both `summary_fields` and
+     `external_fields`. `EXTERNAL_PROCESSING_PROJECTS` still limits calls to the one
+     test project, and every other project keeps its own narrower row. Then the test
+     project's row with the same flags, `external_fields` limited to `titles` (add
+     `approved_note_text` only for synthetic approved notes) and
+     `jev_skip_threshold:null`. With only `titles` sendable, Jev is asked something
+     only for a task scope (task relevance), so run the test on a `task_id`, or
+     include `approved_note_text` with synthetic approved notes for a project scope.
+     Put the workspace row back to `external_allowed:false`/`jev_enabled:false`
+     afterwards. A small budget through
+     `POST /api/processing/budget`, e.g.
+     `{"daily_call_limit":5,"daily_token_limit":50000,"daily_usd_ceiling":null,"max_input_chars":20000,"max_output_tokens":256,"timeout_ms":10000}`.
+   - Check `external_gate` in `GET /api/processing/policy?project_id=…`, then after
+     a tick `GET /api/processing/usage` and the job detail (uncalibrated signals,
+     ledger statuses, reported cost). Record counts and codes in a new evidence
+     file; never print the key or provider responses.
+   - Afterwards set the budget limits to 0, remove the project from
+     `EXTERNAL_PROCESSING_PROJECTS` and `npx wrangler secret delete JEV_API_KEY --config .local/wrangler.test.jsonc`
+     unless continued use was separately accepted.
+
+Stopping and rollback:
+
+- **Stop without a code rollback.** The reviewer sets the workspace policy to
+  `enabled:false` (queued jobs then skip with `policy_changed`), or the operator
+  removes `processing` from `MAINTENANCE_TASKS` and redeploys. External calls also
+  stop when the budget is 0, the project leaves `EXTERNAL_PROCESSING_PROJECTS` or
+  `JEV_API_KEY` is deleted. None of these deletes data.
+- **Code rollback.** `npx wrangler rollback` to the previous version keeps the
+  `0004` tables, jobs, coverage, audits and pipeline candidates. `0004` is additive
+  with no down migration; never drop processing tables or delete candidates as a
+  rollback step. An older Worker does not read `context_generation`, so it lists
+  pipeline candidates as ordinary pending candidates; their creation audit actor
+  still reads `pipeline:beacon.extractive@1`. A pre-0.3 version has no scheduled
+  handler, and how rollback interacts with registered crons was not tested here:
+  check the Worker's schedules afterwards and remove them if they remain.
 
 ## Remote acceptance before using real logs
 

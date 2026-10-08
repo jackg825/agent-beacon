@@ -1,5 +1,65 @@
 # Review evidence
 
+## 0.3 background processing — local review
+
+Validated on **2026-10-09 (Asia/Taipei)** in an isolated worktree of
+`claude/beacon-cloud-phase2`, which carries the unmerged 0.2 milestone, the
+maintenance scaffold and roadmap phase 2 on top of main
+`192d6ca1434c0e2f7e604c384bf1119e3caab3f7`. This milestone has **not** been
+migrated, deployed, scheduled or accepted on Cloudflare: no cron fired in the cloud,
+no Jev or other provider was called, and only synthetic events and fake providers
+were used. No installed Beacon logs, collector settings or transcripts were read.
+
+| Check | Current result |
+| --- | --- |
+| `npm run check` | TypeScript passes |
+| `npm test` | **154/154 pass** (118 top-level tests, 36 subtests), zero skipped or cancelled, in two consecutive runs after the review fixes. Phase 2 accounts for 68 top-level tests (privacy, policy, planner/jobs, output, budget, Jev, maintenance and bundled-Worker suites) |
+| Labelled acceptance scenario | `test/processing-output.test.ts`: one synthetic two-Mac task, 7 events → 7 persisted sources; **5/5 labelled items** (failure, fix, approval decision, verification, open lint risk) cited under their expected headings; 6 distinct citations in 511 characters; a fake Jev was asked 4 questions and stored 4 uncalibrated signals; the only contradiction ≥ 0.5 landed on the task note it was about; both notes stayed approved and the candidate stayed pending |
+| `npm run test:workflow-browser` | **2/2 pass** against the actual Worker/D1/R2: the 0.2 workflow, plus a new 背景整理 run — save refused without the reviewer key; workspace policy saved (version 1, `reviewer:` actor); project scope planned (4 sources, queued); Miniflare `scheduled()` frequent tick ran it (`succeeded`, 4 covered, usage D1 33 / R2 7 / fetch 0); the job opens its pending candidate labelled 「自動整理・待審」 (`origin:pipeline`, actor `pipeline:beacon.extractive@1`) while default recall stays empty; 1280/375 px with no horizontal overflow, no page errors and empty browser storage |
+| `npm run test:browser` | **2/2 pass** against the deterministic fixtures |
+| `npm run test:collector` | **1/1 passes** with `GOPROXY=off` (cached modules, no download): shipping hook → JSONL → forwarder → Worker → D1/R2 → query after restart |
+| Official MCP clients | Current and legacy clients discover **15 read-only tools**; the server reports `0.3.0` and its instructions say pending pipeline candidates and uncalibrated evaluator scores are not approved knowledge |
+| Local D1 migrations | `WRANGLER_WRITE_LOGS=false npx wrangler d1 migrations apply agent-beacon-cloud-db --local --persist-to <fresh temp dir>` applies `0001`–`0004` with **14/18/23/59 statements**; Worker fixtures also upgrade a populated `0001` database through `0004` |
+| `npm run deploy:dry-run` | Passes; Worker **1494.46 KiB / gzip 282.60 KiB** (0.2: 1358.20 / 245.39), direct `DB`/`RAW` bindings; no upload |
+| Independent review | Six review dimensions with two adversarial verifiers per finding; 9 confirmed and 6 disputed findings were all fixed with tests (PEM/PGP blocks behind a key label, Windows paths in JSON text, cross-part Jev redaction, CJK punctuation after a secret, retry schedule, Jev timeout never shortened, a planner cursor race between overlapping ticks, and missing tests for lease fences, raw caps and stored-signal reuse) |
+
+The suites exercise: inert defaults (no `MAINTENANCE_TASKS` → nothing runs; no
+workspace policy → open tasks plan nothing and `run` returns 409); ingest still
+acknowledging after every processing table is dropped; 450 events → three jobs
+covering each event once; old-timestamp backfill and late-linked sessions covered
+by the next job; policy or scope changes ending a claimed job as skipped before any
+raw read or call; a lost lease committing nothing; a crash after the candidate
+commit recording the existing candidate instead of a second one; a busy tick staying
+inside its allotment; field-class projection with metadata only by default; the
+redaction table (credential patterns, key vocabulary, bare copies, this Worker's
+own secrets, redact-before-and-after truncation, home paths); pipeline actors unable
+to review and approval still requiring `REVIEW_TOKEN`; every Jev gate condition
+blocking the call on its own; a 307 not followed; a timeout recorded as
+`outcome_unknown` and counted; a limit-1 reservation race and two overlapping ticks
+each letting exactly one call through; and scheduled logs, reports, job errors and
+read APIs carrying no event content, key or provider body.
+
+Not verified here:
+
+- Cloud migration of `0002`–`0004`, the private backup/restore drill, TEST
+  deployment, redeploy persistence and code rollback, including how a rollback
+  treats registered cron triggers.
+- Any cron on Cloudflare: Workers Paid CPU, subrequest and D1 query behaviour,
+  real per-tick duration, D1 rows read at larger event volumes, and the account's
+  remaining cron-trigger allowance.
+- A real Jev/TypeSafe endpoint and dedicated key: wire compatibility, latency,
+  reported tokens and cost, and provider billing after `outcome_unknown`.
+- Real private content: redaction is rule-based and tested only on synthetic
+  patterns; summary quality and omissions on real two-Mac sessions are unmeasured.
+- Model generation (not implemented) and `jev_skip_threshold` calibration.
+- Named-user review: the reviewer actor still identifies a shared role credential.
+- Phase 3 (Mac sync, retention, backups, data health, contradiction flags) is not
+  implemented. `npm audit` and the upstream CLI/packaging suites were not rerun.
+
+Wrangler ran with `WRANGLER_SEND_METRICS=false`, no account configuration and only
+`--local`/`--dry-run`; it still printed an update notice, so its version check
+reached the npm registry. Browser screenshots stayed in a private scratch directory.
+
 ## 0.2 project/task/context milestone — local review
 
 Validated on **2026-10-07 (Asia/Taipei)** in the isolated
@@ -113,7 +173,8 @@ WRANGLER_WRITE_LOGS=false npx wrangler d1 migrations apply agent-beacon-cloud-db
 The optional browser tests require an installed Playwright package and browser.
 Set `BEACON_PLAYWRIGHT_MODULE` to its module path and, when needed,
 `BEACON_CHROMIUM_EXECUTABLE` to the browser binary, then run
-`npm run test:workflow-browser` for the real Worker workflow helper or
+`npm run test:workflow-browser` for the real Worker workflow and 背景整理 checks
+(set `BEACON_WORKFLOW_SCREENSHOT_DIR` to keep screenshots) or
 `npm run test:browser` for fixture interaction
 coverage. The normal Node suite deliberately does not require browser downloads.
 The CI workflow runs only local tests/dry run and the isolated shipping-hook

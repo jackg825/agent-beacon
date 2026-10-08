@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { insertCandidate } from '../src/context';
 import { runMaintenance } from '../src/maintenance';
 import { PROCESSING_ALLOTMENT, processingMaintenance, processingWrite } from '../src/processing';
-import { planTick } from '../src/processing-planner';
+import { MAX_ATTEMPTS, planTick } from '../src/processing-planner';
+import { BACKOFF_MINUTES, EXTERNAL_TIMEOUT_MS, LEASE_MIN_MS } from '../src/processing-runner';
 import { SelectionStage } from '../src/processing-stage';
 import { projectWrite } from '../src/project-workflows';
 import { Env } from '../src/types';
@@ -73,6 +74,43 @@ test('timing rules: minimum new events, quiet minutes plus settle lag, and idemp
     await f.ingest(syntheticEvent('due-other', { repo: 'beta', session: 'beta-session' }));
     const beta = (await f.event('due-other'))!.project_id;
     assert.equal((await run(f.env, { project_id: beta })).scopes[0].status, 'planned');
+  } finally { await f.close(); }
+});
+
+/** A database on which another invocation runs `overlap` to completion just before this one's cursor swap. */
+function overlapBeforeSwap(db: D1Database, overlap: () => Promise<unknown>): D1Database {
+  let fired = false;
+  return { prepare: (sql: string) => {
+    const statement = db.prepare(sql);
+    if (fired || !sql.startsWith('UPDATE processing_scan_cursor')) return statement;
+    fired = true;
+    return { bind: (...values: unknown[]) => {
+      const bound = statement.bind(...values);
+      return { run: async () => { await overlap(); return bound.run(); } };
+    } } as unknown as D1PreparedStatement;
+  }, batch: (statements: D1PreparedStatement[]) => db.batch(statements) } as unknown as D1Database;
+}
+
+test('overlapping planners: the one that loses the cursor swap plans nothing, also when the cursor would not move', async () => {
+  const f = await createEnvFixture();
+  try {
+    await setPolicy(f.env, workspace, { min_new_events: 1000 });
+    for (const repo of ['cas-a', 'cas-b', 'cas-c']) await f.ingest(syntheticEvent(`${repo}-1`, { repo, session: `${repo}-s` }));
+    const now = later(60);
+    const overlapped = async (limit: number) => {
+      let inner: Awaited<ReturnType<typeof planTick>> | undefined;
+      const outer = await planTick({ ...f.env, DB: overlapBeforeSwap(f.env.DB, async () => { inner = await planTick(f.env, now, limit); }) } as Env,
+        now, limit);
+      return [inner!.scanned, inner!.cursor_conflict ?? false, outer.scanned, outer.cursor_conflict ?? false];
+    };
+    // Three scopes, two per tick: the overlapping invocation moved the cursor first, so this one plans nothing.
+    assert.deepEqual(await overlapped(2), [2, false, 0, true]);
+    // Five per tick: both read the same cursor and would wrap round to the same key, so the key alone
+    // cannot tell them apart. The second must still lose.
+    assert.deepEqual(await overlapped(5), [3, false, 0, true]);
+    // Without an overlap, ticks keep planning.
+    assert.equal((await planTick(f.env, now, 5)).scanned, 3);
+    assert.equal((await planTick(f.env, now, 5)).scanned, 3);
   } finally { await f.close(); }
 });
 
@@ -166,10 +204,14 @@ test('claim, backoff, max attempts, failed jobs blocking their scope, reviewer r
       assert.equal(current.next_attempt_at, at(elapsed + backoff).toISOString());
       elapsed += backoff;
     }
-    report = await tick(f.env, at(elapsed));
+    // The fourth failure ends the job: three retries (1, 5 and 30 minutes) and no fourth backoff.
+    assert.deepEqual([BACKOFF_MINUTES, MAX_ATTEMPTS], [[1, 5, 30], 4]);
+    report = await tick(f.env, at(elapsed + 3));
     assert.deepEqual(report.result!.run_outcomes, { failed: 1 });
     current = await job(f.env, current.id);
     assert.equal(current.status, 'failed'); assert.equal(current.attempts, 4); assert.equal(current.last_error, 'raw_unavailable');
+    // Nothing will retry it, so it keeps the time it was last due rather than showing a future attempt.
+    assert.equal(current.next_attempt_at, at(elapsed).toISOString());
     // A failed job keeps its scope blocked until a reviewer acts.
     assert.deepEqual((await tick(f.env, at(elapsed + 200))).result!.plan_outcomes, { live_job: 1 });
     const change = (id: string, action: string, body: unknown = {}) => processingWrite(post(`/api/processing/jobs/${id}/${action}`, body), f.env, reviewer);
@@ -244,6 +286,32 @@ test('expired leases are reclaimed, and a completion from a lost lease commits n
     assert.equal(await count(f.env, 'processing_job_fence'), 0);
     await assert.rejects(f.env.DB.prepare('INSERT INTO processing_job_fence(job_id,lease_owner,attempts) VALUES(?,?,?)')
       .bind(stolen.id, 'crashed', 1).run(), /processing_lease_lost/);
+  } finally { await f.close(); }
+});
+
+test('a claim holds its lease for the invocation plus the longest call and a minute, and an overlapping tick leaves it alone', async () => {
+  const f = await createEnvFixture();
+  try {
+    await setPolicy(f.env, workspace, { min_new_events: 1000 });
+    const base = later(60), held: { lease_until: string; overlap: any }[] = [];
+    // While the job runs, another invocation starts five minutes later and must find nothing to claim.
+    const stage: SelectionStage = async ({ env, job_id }) => {
+      const row = await env.DB.prepare('SELECT lease_until FROM processing_jobs WHERE id=?').bind(job_id).first<{ lease_until: string }>();
+      held.push({ lease_until: row!.lease_until, overlap: await tick(f.env, new Date(base.getTime() + 5 * 60_000)) });
+      return { decision: 'continue', signals: [] };
+    };
+    for (const [index, budgetMs] of [25_000, 600_000].entries()) {
+      await f.ingest(command(`hold-${index}`, 'npm test', 0, { repo: `hold-${index}`, session: `hold-${index}` }));
+      await run(f.env, { project_id: (await f.event(`hold-${index}`))!.project_id });
+      // A fixed clock: remaining() is exactly the invocation budget when the job is claimed.
+      const report = await runMaintenance({ ...f.env, MAINTENANCE_TASKS: 'processing' } as Env,
+        { now: base, tasks: staged(stage), budgetMs, clock: () => 0 });
+      assert.deepEqual(report.processing.result!.run_outcomes, { succeeded: 1 });
+    }
+    // At least ten minutes; otherwise remaining time + the 30 s longest call + 60 s.
+    assert.deepEqual(held.map((item) => Date.parse(item.lease_until) - base.getTime()), [LEASE_MIN_MS, 600_000 + EXTERNAL_TIMEOUT_MS + 60_000]);
+    assert.deepEqual([LEASE_MIN_MS, EXTERNAL_TIMEOUT_MS], [10 * 60_000, 30_000]);
+    for (const { overlap } of held) assert.deepEqual([overlap.ok, overlap.result.expired, overlap.result.claimed], [true, 0, 0]);
   } finally { await f.close(); }
 });
 

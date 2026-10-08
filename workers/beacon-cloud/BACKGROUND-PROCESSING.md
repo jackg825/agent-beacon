@@ -26,7 +26,7 @@
 ## 逐步開啟
 
 1. 套用 0004 並部署（見上）。這時什麼都不會發生。
-2. 在 Worker vars 加入 `MAINTENANCE_TASKS=processing`。沒有這個名稱，排程不執行任何查詢。
+2. 在 Worker vars 加入 `MAINTENANCE_TASKS=processing`。沒有這個名稱，排程不執行任何查詢；寫錯或尚未提供的名稱不會執行任何東西，排程紀錄會以 `unknown_task` 標出。
 3. 用審閱金鑰設定工作區政策。工作區列是上限，沒有它就等於全部關閉：
 
    ```text
@@ -93,10 +93,11 @@
 每個放進投影或摘要的字串都經過遮蔽：
 
 - 移植上游 `pkg/asymptoteobserve/privacy.go` 的規則（指定值、`Authorization: Bearer`、bearer、`sk-`），並擴充 key 名稱（`passwd`、`pwd`、`credential(s)`、`private_key`、`access_key`、`secret_access_key`、`AWS_SECRET_ACCESS_KEY`、`client_secret`、`cookie`、`session`）與 JSON 寫法（`"api_key": "…"`）。
-- 另外移除：本服務的裝置金鑰 `bcn_cf_…`、`bcn_device_…`、`sk-ant-`／`sk-proj-`／`sk-svcacct-`／`sk-admin-`、AWS `AKIA`／`ASIA`、GitHub `gh[pousr]_`／`github_pat_`、Slack `xox[abprs]-`、PEM private key 區塊（包含被截斷的）、JWT、Google `AIza…`、網址中的帳密，以及本 Worker 自己的 `READ_TOKEN`、`MCP_TOKEN`、`REVIEW_TOKEN`、`JEV_API_KEY`（8 字元以上）。
+- 另外移除：本服務的裝置金鑰 `bcn_cf_…`、`bcn_device_…`、`sk-ant-`／`sk-proj-`／`sk-svcacct-`／`sk-admin-`、AWS `AKIA`／`ASIA`、GitHub `gh[pousr]_`／`github_pat_`、Slack `xox[abprs]-`、PEM 與 PGP private key 區塊（包含被截斷的；前面有 `private_key=`、`"private_key": "…"` 等標籤時也整塊移除，標籤規則之前就先處理）、JWT、Google `AIza…`、網址中的帳密，以及本 Worker 自己的 `READ_TOKEN`、`MCP_TOKEN`、`REVIEW_TOKEN`、`JEV_API_KEY`（8 字元以上）。指定給機密 key 的值在引號、逗號、空白或中日韓／全形標點處結束，所以 `api_key=X；說明` 只把 X 當成機密，其他地方出現的 X 也會一起移除。
 - 先遮蔽整個字串再截斷（每個字串最多 1,200 字元），截斷後再遮蔽一次，不會留下金鑰前綴。
 - 在整份投影中收集「被指定給機密 key 的值」，之後在任何事件、任何欄位裸露出現時也一併移除。
-- `/Users/<名稱>/`、`/home/<名稱>/`、`C:\Users\<名稱>\` 換成 `~/`；位在 session 工作目錄下的檔案路徑改成相對路徑。
+- `/Users/<名稱>/`、`/home/<名稱>/`、`C:\Users\<名稱>\` 換成 `~/`（JSON 文字中加倍的反斜線也一樣）；位在 session 工作目錄下的檔案路徑改成相對路徑。
+- 結構化的值（工具輸入、`gen_ai` 訊息與結果、`raw`）在序列化前先逐一遮蔽其中會被跳脫的字串，序列化後整段再遮蔽一次；這些字串中指定給機密 key 的值也會被收集。
 - 整份投影最多 120,000 字元，超過的內容欄位會省略，摘要會註明已截斷。
 
 這是規則式遮蔽，不是完整的 DLP。允許更多欄位類別之前，先用合成資料確認輸出。
@@ -114,7 +115,7 @@
 - Mac 睡眠或斷線後補送的事件，即使時間戳比已整理的更早，仍會進入下一份工作。
 - 事後才連結到任務的 session，它的舊事件也會在下一份任務工作中整理。
 - 範圍到期的條件：未涵蓋事件至少 `min_new_events` 個，而且最新一個未涵蓋事件所在批次的 `received_at` 早於「現在 − `quiet_minutes` − 2 分鐘」。多出的 2 分鐘是批次寫入 D1 前就打上時間的緩衝。
-- 每次排程最多檢查 5 個範圍，依穩定順序輪替；輪替位置以 compare-and-swap 前進，重疊的排程不會重複規劃。
+- 每次排程最多檢查 5 個範圍，依穩定順序輪替；輪替位置以 compare-and-swap 前進（同時比較位置與每次都往前推的 `updated_at`，範圍不超過 5 個、位置繞回原處時也一樣），重疊的排程不會重複規劃。
 - 規劃只查 D1，不讀 R2。
 - 一個範圍有排隊中、執行中或失敗的工作時不再規劃；有一份尚未審閱的自動整理候選時也先延後。下一份會涵蓋這段期間的所有新事件。
 - `POST /api/processing/run` 只略過最少事件數與安靜時間；政策關閉、已有工作或待審候選的規則仍然適用，執行仍在下一次排程。
@@ -135,7 +136,7 @@
 | `dismissed` | 審閱者放棄；不涵蓋任何事件 |
 
 - 領取是一個原子的 `UPDATE … RETURNING`，選擇最早到期的排隊工作或租約已過期的執行中工作，嘗試次數加一，租約至少 10 分鐘（排程剩餘時間＋外部逾時＋1 分鐘）。
-- 失敗會在 1、5、30、120 分鐘後重試，最多 4 次後變成 `failed`；最後一次嘗試中斷而租約過期的工作由排程標成 `failed`（`lease_expired`）。
+- 失敗會在 1、5、30 分鐘後重試，第 4 次嘗試失敗後變成 `failed`（不再排定下次時間，只能由審閱者重試或放棄）；最後一次嘗試中斷而租約過期的工作由排程標成 `failed`（`lease_expired`）。
 - 每個完成動作都先寫入 `processing_job_fence`：只有仍持有同一租約（owner＋嘗試次數）的執行者才能完成，否則整個 D1 batch 回滾。
 - 成功是一個 D1 batch：候選、來源、密封、建立稽核、`context_generation`、涵蓋、工作完成。`context_generation.job_id` 是 UNIQUE，同一份工作不可能有第二份候選；領取後若發現這份工作已有候選，只會補記錄，不會重做。
 - **執行前重新檢查。** 領取後、讀取任何原文之前，重新計算生效政策；`policy_hash` 不同就以 `policy_changed` 略過。接著重新讀取每個來源事件目前的專案、session 與任務連結；事件離開專案、任務已完成、或專案範圍的 session 被連到進行中任務，就以 `scope_changed` 略過。這兩種略過不寫涵蓋，排程會重新規劃；若之後政策或範圍改回相同內容，同一份工作會重新排入。
@@ -154,7 +155,7 @@
 
 審閱者可以 `POST /api/processing/jobs/:id/retry`（`failed` → `queued`，嘗試次數歸零）或 `POST /api/processing/jobs/:id/dismiss`（`failed`／`queued` → `dismissed`），可附 `reason`，都會留在 `processing_job_audit`。放棄不會涵蓋事件：相同來源不會再自動處理，有新事件時會規劃包含舊事件的新工作。
 
-已知限制：放棄的工作若已經是 `max_events_per_job` 個來源，最舊的未涵蓋事件不會因新事件而改變，該範圍會停在同一組來源，直到政策改變（例如調整 `max_events_per_job`）。同理，R2 原文永久遺失但 D1 索引仍在的事件，會讓包含它的工作一再失敗。目前沒有「人工確認略過這些事件」的操作；遇到時先用資料健康檢查修復原文，或調整政策。
+已知限制：放棄的工作若已經是 `max_events_per_job` 個來源，最舊的未涵蓋事件不會因新事件而改變，該範圍會停在同一組來源，直到政策改變（例如調整 `max_events_per_job`）。同理，R2 原文永久遺失但 D1 索引仍在的事件，會讓包含它的工作一再失敗。目前沒有「人工確認略過這些事件」的操作，這一版也還沒有資料健康檢查：調整政策只對前一種（已放棄且來源數達上限）有效；原文遺失時，只能從私人備份把 R2 物件放回原處，或把該專案的政策改成 `enabled:false` 暫停整理。
 
 ## 規則式摘要 `beacon.extractive.v1`
 
@@ -188,7 +189,7 @@ Jev（TypeSafe System One）只回答三種問題：新活動是否有已核准�
 - `state.events`：執行時依當時政策建立的遮蔽投影，再收窄到 `external_fields`。中繼資料（動作、類型、時間、harness、結束碼、核准決定、usage 數字）一律包含；`file_path` 不在 `external_fields` 時只送副檔名。
 - `state.approved_notes`：只有 `approved_note_text` 在 `external_fields` 時才送，最多 10 則屬於該範圍專案的現行 authoritative 筆記（任務範圍包含該任務與全專案筆記，依建立時間由新到舊），從不包含其他專案或分享進來的筆記。每則有 ID、種類、遮蔽後最多 2,000 字元的內容與原文 SHA-256；標題只在 `titles` 允許時才送。
 - `state.scope`：範圍類型；`titles` 允許時加上任務標題與專案名稱。
-- 整份 request 先在所有字串中收集「指定給機密 key 的值」，再一起遮蔽，並移除本 Worker 自己的 secrets（包括 `JEV_API_KEY`）。
+- 送出前先從尚未遮蔽的筆記內容與標題、任務標題、專案名稱與事件（包括只在本機整理的欄位）收集「指定給機密 key 的值」；筆記、標題與事件都用這些值和本 Worker 自己的 secrets（包括 `JEV_API_KEY`）遮蔽之後才截斷，所以一處指定的值不會在另一處裸露，也不會在截斷處留下前綴。
 - 超過預算的 `max_input_chars` 時，依上游方式保留開頭與結尾的事件並插入省略標記，必要時再從最舊的筆記開始移除（連同它的矛盾問題）。只會整個移除事件或筆記，不會切斷字串；連一個事件都放不下就不呼叫。
 
 ### 問題與 wire contract
@@ -219,7 +220,7 @@ Jev 只是參考：呼叫失敗時工作照常用規則摘要完成，並在工�
 | `jev_previous_outcome_unknown`／`jev_previous_failed` | 同一份工作先前已呼叫過，重試時不再重送 |
 | `jev_budget:<代碼>` | 預約被拒絕：`budget_disabled`、`daily_call_limit`、`daily_token_limit`、`usd_ceiling`、`input_too_large`、`lease_lost` |
 | `jev_input_too_large` | 連一個事件都放不進輸入上限 |
-| `jev_no_time` | 本次排程剩餘時間不足一次呼叫 |
+| `jev_no_time` | 本次排程剩餘時間不足一次完整呼叫（`timeout_ms` 加 2 秒）；不預約、不送出，逾時也不會為了配合剩餘時間而縮短 |
 | `jev_skip_overridden` | 低於門檻，但有高訊號事件或矛盾訊號，照常產生候選 |
 
 ## 外部呼叫與預算
@@ -243,7 +244,7 @@ Jev 只是參考：呼叫失敗時工作照常用規則摘要完成，並在工�
 | `daily_usd_ceiling` | 每日供應商回報金額上限；`null` 代表不設定 | 0–10,000 或 `null` |
 | `max_input_chars` | 每次 request 的字元上限 | 1,000–200,000 |
 | `max_output_tokens` | 每次輸出 token 的預估值 | 1–8,192 |
-| `timeout_ms` | 每次呼叫的逾時 | 1,000–30,000 |
+| `timeout_ms` | 每次呼叫的逾時；排程剩餘時間（`MAINTENANCE_BUDGET_MS`，預設 25 秒）至少要再多 2 秒才會呼叫 | 1,000–30,000 |
 
 - **先預約再呼叫。** 每次呼叫前用一個 `INSERT … SELECT` 原子地確認：工作租約仍屬於這次執行、輸入未超過 `max_input_chars`、今日呼叫數低於上限、今日計入 token（有回報用回報值，否則用預估 `ceil(輸入字元/3)+max_output_tokens`）加上這次預估不超過上限、今日回報金額低於美元上限。D1 逐一執行這個陳述式，同時發生的預約不會一起超過上限（測試：上限 1、八個同時預約只成功一個）。
 - **每個預約都算數**，不論結果。逾時或連線中斷記成 `outcome_unknown`，不當成成功，也不表示供應商只收一次費用；本機防重只代表這裡不會重送。

@@ -8,13 +8,16 @@ no changes to upstream collectors, adapters, local dashboard or local MCP.
 
 **Review state:** the base ingest service (0.1) is merged and deployed to isolated
 **TEST** Workers/D1/R2; its cloud evidence is in [TEST-DEPLOYMENT.md](TEST-DEPLOYMENT.md).
-The 0.2 project/task/manual-review milestone is a separate reviewable change,
-validated locally; it has not been migrated or deployed to Cloudflare.
+The 0.2 project/task/manual-review milestone and the 0.3 background-processing
+milestone built on it are reviewable changes validated **locally only** with
+synthetic data. Neither has been migrated (`0002`–`0004`) or deployed to
+Cloudflare, no cron has run in the cloud, and no external evaluator has been called.
 Production rollout and real collector
 configuration remain separate. Start with
 [VALIDATION.md](VALIDATION.md), [WIRE-CONTRACT.md](WIRE-CONTRACT.md) and
 [DEPLOYMENT.md](DEPLOYMENT.md). For two-Mac setup, see [MAC-SETUP.md](MAC-SETUP.md).
 For central task handoffs and reviewed notes, see [CONTEXT-WORKFLOWS.md](CONTEXT-WORKFLOWS.md);
+for the opt-in background pipeline, see [BACKGROUND-PROCESSING.md](BACKGROUND-PROCESSING.md);
 the staged remaining work is in [ROADMAP.md](ROADMAP.md).
 
 ## What is implemented
@@ -29,9 +32,11 @@ the staged remaining work is in [ROADMAP.md](ROADMAP.md).
 | Projects | SSH/HTTPS Git remote normalization, `.git` suffix and default ports; path-only records use explicit mappings or a device-local namespace |
 | Project relationships | Explicit groups and directed dependency/shared-service/fork relations; repositories remain independent |
 | Task handoffs | Explicit cross-device/repository session links, open/completed state, group/task filters and atomic audit records |
-| Reviewed context | Manual summary/memory candidates with exact event/version sources; pending/approved/rejected/superseded states, immutable revisions and atomic review audit |
-| Dashboard | Three protected views for activity, project relations and handoffs/memory; all recorded and authored content renders as text |
-| Remote MCP | Official TypeScript SDK, current and legacy Streamable HTTP; 13 read-only tools, default context recall requires valid approved scope |
+| Reviewed context | Manual or pipeline-generated summary/memory candidates with exact event/version sources and an `origin`; pending/approved/rejected/superseded states, immutable revisions and atomic review audit |
+| Background processing | Off by default. Workspace-ceiling policies with field classes, redacted projections, coverage-based durable jobs (leases, fenced completion, retry/dismiss) and `beacon.extractive.v1` rule summaries that become pending 「自動整理・待審」 candidates; optional signal-only Jev behind the `EXTERNAL_PROCESSING_PROJECTS` deploy gate, a dedicated key and an atomic daily call budget. No model generation |
+| Scheduled maintenance | Two crons; a task runs only when `MAINTENANCE_TASKS` names it (`processing` is the only task today), within metered per-task D1/R2/fetch allotments and a shared time budget; reports carry codes and counts only |
+| Dashboard | Protected views for activity, project relations, handoffs/memory and 背景整理 (policies, jobs, budget/usage, uncalibrated signals); all recorded and authored content renders as text |
+| Remote MCP | Official TypeScript SDK, current and legacy Streamable HTTP; 15 read-only tools, default context recall requires valid approved scope |
 | Local forwarding | Private durable outbox/checkpoint bound to authenticated Worker/device, exact batch acknowledgement, bounded retry/rotation, explicit start point and queue cap |
 
 No account OAuth/device-enrollment APIs from proprietary Beacon Cloud are
@@ -89,9 +94,12 @@ source during review. Never point development at real transcripts accidentally.
 | `GET /v1/ingest/health` | Device token |
 | `POST /v1/ingest/runtime`, `/v1/ingest/inventory` | Device token; NDJSON, 1–100 events and ≤1 MiB |
 | `GET /`, `/dashboard`, `/dashboard.js`, `/api/*` | Verified Access JWT or separate dashboard read secret |
+| `GET /api/processing/policy`, `/jobs`, `/jobs/:id`, `/usage` | Same read authority; identifiers, states, counts, hashes and short codes only, never event content |
 | `POST /api/project-groups*`, `/api/project-relations`, `/api/tasks*`, `/api/context*` | Separate `REVIEW_TOKEN`; bounded JSON and same-origin browser requests |
+| `POST /api/processing/policies`, `/budget`, `/run`, `/jobs/:id/retry`, `/jobs/:id/dismiss` | Same `REVIEW_TOKEN` rules; none can approve a candidate or open the deploy gate |
 | `POST /mcp` | Dedicated manual MCP token, or configured OAuth resource-server mode |
 | OAuth protected-resource metadata | Public, only when valid OAuth resource-server configuration is present |
+| Cron `*/15 * * * *`, `17 * * * *` | No HTTP surface; runs only the tasks named in the `MAINTENANCE_TASKS` var (none by default) |
 
 Read APIs are `/api/devices`, `/api/projects`, `/api/sessions`, and
 `/api/sessions/:central_id/events`. Sessions filter by `device_id`, `project_id`
@@ -102,10 +110,18 @@ Inventory has a raw store and event index, but no separate inventory browser.
 Additional read APIs cover groups, relations, tasks and reviewed context; see
 [the workflow contract](CONTEXT-WORKFLOWS.md). Exact variant reads use
 `GET /api/events/:central_id?payload_hash=...`; `/versions` lists variant hashes.
-MCP additionally lists/reads groups, tasks and context, and reads exact event
-versions. Every tool is read-only; none can approve, publish, configure or write.
+Background processing reads and writes are listed in
+[BACKGROUND-PROCESSING.md](BACKGROUND-PROCESSING.md#api).
+MCP additionally lists/reads groups, tasks, context and processing jobs, and reads
+exact event versions. The 15 tools are `beacon_list_sessions`, `beacon_get_timeline`,
+`beacon_list_projects`, `beacon_list_devices`, `beacon_list_project_groups`,
+`beacon_get_project_group`, `beacon_list_project_relations`, `beacon_list_tasks`,
+`beacon_get_task`, `beacon_list_context`, `beacon_get_context`, `beacon_get_event`,
+`beacon_list_event_versions`, `beacon_list_processing_jobs` and `beacon_get_processing_job`.
+Every tool is read-only; none can approve, publish, configure, run processing or write.
 Only context with `authoritative:true` is eligible as reviewed knowledge; even
-approved prose is data, never a permission grant or instruction override.
+approved prose is data, never a permission grant or instruction override. Pending
+pipeline candidates and uncalibrated evaluator signals are not approved knowledge.
 
 The dashboard can verify Cloudflare Access assertions against a configured
 team issuer/JWKS and exact application audience. A header alone never grants
@@ -142,10 +158,22 @@ Do not interpret dedup as proof all payloads were identical.
 Session project attribution upgrades unknown→path→remote and cannot downgrade a
 remote. Conflicting remotes for the same native session return 409 atomically.
 
-No retention policy, deletion workflow, backups scheduler or quota enforcement
-beyond per-request/forwarder limits is installed. R2/D1 data must remain private;
-do not enable R2 public access. Local redaction policy still determines retained
-content. The uploader does not add a metadata-only/privacy transform.
+Background processing tables (`0004`) are additive and separate from ingest:
+ingest never reads or writes them, so a failing job, evaluator or dropped
+processing table cannot change an acknowledgement. Jobs track **coverage** per
+scope instead of a timestamp watermark, so backfilled or late-linked events are
+still summarized; planning reads only D1 and a job reads R2 only after claiming
+its lease and rechecking policy and scope. A candidate, its sources, coverage and
+the job's completion commit in one fenced D1 batch, and `context_generation.job_id`
+is unique, so a retry cannot create a second candidate. The processing call budget
+is the only quota enforced beyond per-request/forwarder limits.
+
+No retention policy, deletion workflow or backup scheduler is installed; the
+hourly cron is reserved for later maintenance and runs nothing today. R2/D1 data
+must remain private; do not enable R2 public access. Local redaction policy still
+determines retained content. The uploader does not add a metadata-only/privacy
+transform; background processing redacts only its own projections and summaries
+and never rewrites stored raw history.
 
 ## Memory boundary
 
@@ -157,10 +185,20 @@ scope is excluded from default recall, and lost/corrupt raw evidence blocks appr
 
 Review writes require a separate secret; Access/read/device/MCP authorization
 does not confer review authority. The shared secret identifies a reviewer role,
-not a named person's identity or cryptographic proof of human review. The UI is a
-manual review workflow. Jev classification, paid AI compact, automatic extraction,
-publication and cross-Mac memory application are not implemented. Those require
-the later opt-in pipeline described in [ROADMAP.md](ROADMAP.md).
+not a named person's identity or cryptographic proof of human review.
+
+The 0.3 milestone adds the opt-in background pipeline. Its output is always a
+**pending** `summary` candidate (`origin:"pipeline"`, actor
+`pipeline:beacon.extractive@1`, no `supersedes_id`) built by local rules from the
+redacted projection with numbered citations to exact source versions. It goes
+through the same reviewer approval as a manual candidate; a 0004 trigger stops any
+`pipeline:` actor from approving or rejecting. Jev, when an operator and reviewer
+both enable it, only stores uncalibrated signals: it never approves, edits,
+deletes or (by default) skips anything. Model generation is deferred until a
+provider, model, dedicated secret, sendable data scope and daily USD cap are
+recorded; there is no `GENERATOR_*` configuration. Publication and cross-Mac
+memory application are not implemented; see [ROADMAP.md](ROADMAP.md) and
+[BACKGROUND-PROCESSING.md](BACKGROUND-PROCESSING.md).
 
 ## Sources and license
 

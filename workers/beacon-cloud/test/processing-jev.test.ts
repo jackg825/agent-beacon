@@ -6,11 +6,12 @@ import { extractiveGenerator, Generator } from '../src/generator';
 import worker from '../src/index';
 import { runMaintenance } from '../src/maintenance';
 import { processingMaintenance, processingRead, processingTick } from '../src/processing';
+import { sweepStaleReservations } from '../src/processing-budget';
 import { effectivePolicy, EffectivePolicy } from '../src/processing-policy';
 import { makeScope } from '../src/processing-planner';
-import type { StageResult } from '../src/processing-stage';
-import type { ProjectedEvent } from '../src/privacy';
-import { jevStage } from '../src/jev';
+import type { SelectionStage, StageResult } from '../src/processing-stage';
+import { projectEvents } from '../src/privacy';
+import { defaultStage, jevStage } from '../src/jev';
 import { Env } from '../src/types';
 import { createEnvFixture, syntheticEvent } from './env-fixture';
 import { command, count, job, jobs, newTask, review, reviewer, run, setBudget, setPolicy, tick, workspace } from './processing-helpers';
@@ -20,7 +21,7 @@ const reviewToken = 'synthetic-review-token-value-00000000';
 const external = { external_allowed: true, jev_enabled: true, summary_fields: ['command_text', 'titles'], external_fields: ['titles'],
   min_new_events: 1000 };
 const gated = (env: Env, extra: Partial<Env> = {}) => ({ ...env, EXTERNAL_PROCESSING_PROJECTS: '*', JEV_API_KEY: key, ...extra }) as Env;
-/** A fixed future UTC noon, so every reservation in one test lands on the same ledger day. */
+/** A fixed future UTC noon, so every reservation in one test lands on the same ledger day; read it once per test. */
 const noon = () => new Date(Math.ceil((Date.now() + 3 * 3_600_000) / 86_400_000) * 86_400_000 + 12 * 3_600_000);
 const sha = (text: string) => createHash('sha256').update(text).digest('hex');
 type Fixture = Awaited<ReturnType<typeof createEnvFixture>>;
@@ -119,11 +120,13 @@ test('each gate condition alone keeps the stage from reserving budget or sending
     const allowed = await effectivePolicy(f.env, event.project_id);
     const scope = await makeScope('task', taskId, event.project_id);
     const jev = fakeJev();
-    const projection: ProjectedEvent[] = [{ action: 'command.executed', kind: 'agent_runtime', timestamp: '2026-10-07T08:00:00.000Z',
-      harness: 'codex_cli', exit_code: 1, command_text: 'npm test' }];
+    // The stage's input exactly as the runner builds it from this job's one source.
+    const sources = [{ payload: command('gate-1', 'npm test', 1, { repo: 'gate', session: 'gate-session' }), timestamp: '2026-10-07T08:00:00.000Z' }];
+    const projection = projectEvents(sources, allowed.summary_fields).events;
     const attempt = (env: Env, options: { policy?: Partial<EffectivePolicy>; owner?: string; remaining?: number; taskTitle?: string | null } = {}) =>
       jevStage({ env, ctx: { now, remaining: () => options.remaining ?? 20_000, usage: () => ({ d1: 0, r2: 0, fetch: 0 }), fetch: jev.fetcher },
         job_id: planned.job_id, attempt: 1, lease_owner: options.owner ?? 'gate-owner', scope, policy: { ...allowed, ...options.policy }, projection,
+        reproject: (fields, assigned) => projectEvents(sources, fields, { assigned }),
         labels: { task_title: options.taskTitle === undefined ? '合成任務 gate' : options.taskTitle, project_name: 'gate' } });
     const expectBlocked = async (name: string, result: Promise<StageResult>, note?: string) => {
       assert.deepEqual(await result, { decision: 'continue', signals: [], ...(note ? { note } : {}) }, name);
@@ -145,6 +148,8 @@ test('each gate condition alone keeps the stage from reserving budget or sending
     await expectBlocked('titles without a task title', attempt(gated(f.env), { policy: { external_fields: ['titles'] }, taskTitle: null }));
     await expectBlocked('note text without notes', attempt(gated(f.env), { policy: { external_fields: ['approved_note_text'] } }));
     await expectBlocked('no time left', attempt(gated(f.env), { remaining: 2500 }), 'jev_no_time');
+    // Time for a shortened call is not enough: the whole 5 s timeout plus 2 s must fit.
+    await expectBlocked('no time for the whole timeout', attempt(gated(f.env), { remaining: 6_999 }), 'jev_no_time');
     await expectBlocked('lease held elsewhere', attempt(gated(f.env), { owner: 'other-owner' }), 'jev_budget:lease_lost');
     for (const [name, limits, note] of [['zero calls', { daily_call_limit: 0 }, 'jev_budget:budget_disabled'],
       ['zero tokens', { daily_token_limit: 0 }, 'jev_budget:budget_disabled'], ['token limit below one call', { daily_token_limit: 100 }, 'jev_budget:daily_token_limit'],
@@ -152,12 +157,45 @@ test('each gate condition alone keeps the stage from reserving budget or sending
       await setBudget(f.env, { daily_call_limit: 50, ...limits });
       await expectBlocked(name, attempt(gated(f.env)), note);
     }
-    // With every condition met, exactly one request goes out; the job never sends a second.
+    // With every condition met, and just enough time, exactly one request goes out; the job never sends a second.
     await setBudget(f.env, { daily_call_limit: 50 });
-    assert.deepEqual(await attempt(gated(f.env)), { decision: 'continue', signals: [] });
+    assert.deepEqual(await attempt(gated(f.env), { remaining: 7_000 }), { decision: 'continue', signals: [] });
     assert.deepEqual(Object.keys(jev.calls[0].body.questions), ['task_related']);
     assert.deepEqual(await attempt(gated(f.env)), { decision: 'continue', signals: [] });
     assert.deepEqual([jev.calls.length, await count(f.env, 'processing_calls'), await count(f.env, 'processing_signals')], [1, 1, 1]);
+  } finally { await f.close(); }
+});
+
+test('an answer that arrives after the lease moved commits nothing; the sweep later records the call as outcome_unknown', async () => {
+  const f = await createEnvFixture();
+  try {
+    await setPolicy(f.env, workspace, external);
+    await setBudget(f.env, { daily_call_limit: 5 });
+    const record = command('fence-1', 'npm test', 0, { repo: 'fence', session: 'fence-s' });
+    await f.ingest(record);
+    const event = (await f.event('fence-1'))!;
+    const taskId = await newTask(f.env, '合成任務 fence', [event.session_id]);
+    const planned = (await run(f.env, { task_id: taskId })).scopes[0];
+    const now = noon();
+    await f.env.DB.prepare(`UPDATE processing_jobs SET status='running',attempts=1,lease_owner='fence-owner',lease_until=? WHERE id=?`)
+      .bind(new Date(now.getTime() + 600_000).toISOString(), planned.job_id).run();
+    // Another invocation reclaims the job while the request is in flight.
+    const jev = fakeJev(async () => {
+      await f.env.DB.prepare(`UPDATE processing_jobs SET lease_owner='other-invocation',attempts=2 WHERE id=?`).bind(planned.job_id).run();
+      return Response.json({ answers: { task_related: { noul: 0.9 } }, usage: { input_tokens: 10, output_tokens: 1 } });
+    });
+    const policy = await effectivePolicy(f.env, event.project_id), sources = [{ payload: record }];
+    await assert.rejects(jevStage({ env: gated(f.env), ctx: { now, remaining: () => 20_000, usage: () => ({ d1: 0, r2: 0, fetch: 0 }), fetch: jev.fetcher },
+      job_id: planned.job_id, attempt: 1, lease_owner: 'fence-owner', scope: await makeScope('task', taskId, event.project_id), policy,
+      projection: projectEvents(sources, policy.summary_fields).events, reproject: (fields, assigned) => projectEvents(sources, fields, { assigned }),
+      labels: { task_title: '合成任務 fence', project_name: 'fence' } }), /processing_lease_lost/);
+    assert.equal(jev.calls.length, 1);
+    assert.equal(await count(f.env, 'processing_signals'), 0);
+    const call = () => f.env.DB.prepare('SELECT status,error_code,input_tokens FROM processing_calls WHERE job_id=?').bind(planned.job_id).first<any>();
+    assert.deepEqual(await call(), { status: 'reserved', error_code: null, input_tokens: null });
+    // Older than the longest timeout plus a minute, with no live lease for its attempt: the sweep records it, still counted.
+    assert.equal(await sweepStaleReservations(f.env, new Date(now.getTime() + 91_000)), 1);
+    assert.deepEqual(await call(), { status: 'outcome_unknown', error_code: 'stale_reservation', input_tokens: null });
   } finally { await f.close(); }
 });
 
@@ -236,6 +274,80 @@ test('the request carries only external fields, redacted, with this project\'s a
   } finally { await f.close(); }
 });
 
+test('a task scope sends the ten newest authoritative notes of its task and project, never another task\'s or a stale one', async () => {
+  const f = await createEnvFixture();
+  try {
+    const fields = ['command_text', 'titles', 'approved_note_text'];
+    await setPolicy(f.env, workspace, { ...external, summary_fields: fields, external_fields: fields });
+    await setBudget(f.env, { daily_call_limit: 10 });
+    await f.ingest([command('scoped-1', 'npm test', 0, { session: 'scoped-s1' }), command('other-1', 'npm test', 0, { session: 'scoped-s2' }),
+      command('left-1', 'npm test', 0, { session: 'scoped-s3' })]);
+    const [one, other, left] = await Promise.all(['scoped-1', 'other-1', 'left-1'].map(async (id) => (await f.event(id))!));
+    const taskOne = await newTask(f.env, '合成任務一', [one.session_id, left.session_id]);
+    const taskTwo = await newTask(f.env, '合成任務二', [other.session_id]);
+    // Notes with fixed creation times, so "newest" is exact.
+    const note = async (event: typeof one, day: number, second: number, title: string, taskId?: string) => {
+      const id = await insertCandidate(f.env, { kind: 'memory', project_id: event.project_id, ...(taskId ? { task_id: taskId } : {}), title,
+        content: `Synthetic note ${title}.`, sources: [{ event_id: event.id, payload_hash: event.payload_hash }] }, reviewer,
+        { now: new Date(Date.UTC(2026, 9, day, 0, 0, second)).toISOString() });
+      await review(f.env, id, 'approve');
+      return id;
+    };
+    const projectWide: string[] = [];
+    for (let index = 0; index < 11; index++) projectWide.push(await note(one, 1, index, `project ${index}`));
+    const ownTask = await note(one, 2, 0, 'task one', taskOne);
+    const otherTask = await note(other, 4, 0, 'task two', taskTwo);
+    const stale = await note(left, 5, 0, 'left task one', taskOne);
+    // The source session leaves task one: that note is no longer authoritative.
+    await f.env.DB.prepare('DELETE FROM task_sessions WHERE task_id=? AND session_id=?').bind(taskOne, left.session_id).run();
+    const planned = (await run(f.env, { task_id: taskOne })).scopes[0];
+    assert.equal(planned.status, 'planned');
+    const jev = fakeJev();
+    assert.equal((await tick(gated(f.env), noon(), { fetcher: jev.fetcher })).ok, true);
+    assert.equal(jev.calls.length, 1);
+    const sent = jev.calls[0].body;
+    const expected = [ownTask, ...projectWide.slice(2).reverse()];
+    assert.deepEqual(sent.state.approved_notes.map((item: any) => item.id), expected);
+    assert.deepEqual(Object.keys(sent.questions).sort(), ['new_information', 'task_related', ...expected.map((id) => 'contradiction:' + id)].sort());
+    assert.deepEqual(hasAny(jev.calls[0].text, [otherTask, stale, projectWide[0], projectWide[1], 'task two', 'left task one']), []);
+  } finally { await f.close(); }
+});
+
+test('a value assigned to a secret key in any part of the request is removed from every other part, before any cut', async () => {
+  const f = await createEnvFixture();
+  try {
+    const fields = ['command_text', 'titles', 'approved_note_text'];
+    // Command output is summarized locally but never sent; a value assigned there is still removed from what is sent.
+    await setPolicy(f.env, workspace, { ...external, summary_fields: [...fields, 'command_output'], external_fields: fields });
+    await setBudget(f.env, { daily_call_limit: 10 });
+    const fromNote = 'NOTEASSIGNED98765', fromEvent = 'EVENTASSIGNED54321', fromTitle = 'TITLEASSIGNED77777', fromOutput = 'OUTPUTASSIGNED4242';
+    await f.ingest([command('cross-1', `echo ${fromNote} ${fromTitle} ${fromOutput}`, 0, { session: 'cross-s', timestamp: '2026-10-07T08:00:01Z' }),
+      command('cross-2', '', 0, { session: 'cross-s', timestamp: '2026-10-07T08:00:02Z',
+        extra: { command: { command: `export API_KEY=${fromEvent}`, exit_code: 0, output: `token=${fromOutput}` } } }),
+      // The note's value sits across this command's 1,200-character cut: only redacting first leaves no prefix.
+      command('cross-3', 'x'.repeat(1180) + ' ' + fromNote + ' ' + 'y'.repeat(100), 0, { session: 'cross-s', timestamp: '2026-10-07T08:00:03Z' })]);
+    const event = (await f.event('cross-1'))!;
+    // Event → title and note; title → event; note → event.
+    const taskId = await newTask(f.env, `合成 ${fromEvent} token=${fromTitle}`, [event.session_id]);
+    const note = await approvedNote(f, 'cross-1', `筆記 ${fromEvent}`, `部署用 api_key=${fromNote} 已設定；舊值 ${fromEvent} 已停用。`, taskId);
+    const planned = (await run(f.env, { task_id: taskId })).scopes[0];
+    const jev = fakeJev();
+    assert.equal((await tick(gated(f.env), noon(), { fetcher: jev.fetcher })).ok, true);
+    assert.equal(jev.calls.length, 1);
+    const [sent] = jev.calls;
+    assert.deepEqual(hasAny(sent.text, [fromNote, fromEvent, fromTitle, fromOutput, fromNote.slice(0, 5)]), []);
+    assert.ok(sent.body.state.events.every((item: any) => !('command_output' in item)));
+    // Everything else is still there, and the notes keep their identity.
+    assert.deepEqual(sent.body.state.events.map((item: any) => item.command_text.slice(0, 18)),
+      ['echo [REDACTED] [R', 'export API_KEY=[RE', 'x'.repeat(18)]);
+    assert.match(sent.body.state.events[2].command_text, /^x{1180} \[REDA\.\.\.\[truncated\]$/);
+    assert.equal(sent.body.state.scope.task_title, '合成 [REDACTED] token=[REDACTED]');
+    assert.deepEqual(sent.body.state.approved_notes.map((item: any) => [item.id, item.title, item.content]),
+      [[note, '筆記 [REDACTED]', '部署用 api_key=[REDACTED] 已設定；舊值 [REDACTED] 已停用。']]);
+    assert.equal((await job(f.env, planned.job_id)).status, 'succeeded');
+  } finally { await f.close(); }
+});
+
 test('a Jev skip needs the policy threshold and is overridden by failures or a contradiction', async () => {
   const f = await createEnvFixture();
   try {
@@ -256,8 +368,9 @@ test('a Jev skip needs the policy threshold and is overridden by failures or a c
       await approvedNote(f, `${name}-1`, `${name} note`, `Synthetic note for ${name}.`);
       planned[name] = (await run(f.env, { project_id: (await f.event(`${name}-1`))!.project_id })).scopes[0].job_id;
     }
-    const report = await tick(gated(f.env), noon(), { fetcher: jev.fetcher });
-    await tick(gated(f.env), new Date(noon().getTime() + 60_000), { fetcher: jev.fetcher });
+    const start = noon();
+    const report = await tick(gated(f.env), start, { fetcher: jev.fetcher });
+    await tick(gated(f.env), new Date(start.getTime() + 60_000), { fetcher: jev.fetcher });
     assert.equal(report.ok, true);
     assert.equal(jev.calls.length, 3);
     const quiet = await job(f.env, planned.quiet);
@@ -274,8 +387,55 @@ test('a Jev skip needs the policy threshold and is overridden by failures or a c
       external_fields: ['command_text', 'approved_note_text'], jev_skip_threshold: null });
     await f.ingest(command('quiet-3', 'echo quiet', 0, { repo: 'quiet', session: 'quiet-s' }));
     const again = (await run(f.env, { project_id: quiet.project_id })).scopes[0];
-    await tick(gated(f.env), new Date(noon().getTime() + 120_000), { fetcher: jev.fetcher });
+    await tick(gated(f.env), new Date(start.getTime() + 120_000), { fetcher: jev.fetcher });
     assert.deepEqual([(await job(f.env, again.job_id)).status, (await job(f.env, again.job_id)).note], ['succeeded', null]);
+  } finally { await f.close(); }
+});
+
+test('a retry after a successful call decides from the stored answers: a skip stays a skip, an override stays an override', async () => {
+  const f = await createEnvFixture();
+  try {
+    const fields = ['command_text', 'approved_note_text'];
+    await setPolicy(f.env, workspace, { ...external, summary_fields: fields, external_fields: fields, jev_skip_threshold: 0.3 });
+    await setBudget(f.env, { daily_call_limit: 10 });
+    // Both answer new_information below the threshold; only 'contra' contradicts its note.
+    const jev = fakeJev((body) => {
+      const contradicted = body.state.events.some((event: any) => event.command_text === 'echo contra');
+      return Response.json({ answers: Object.fromEntries(Object.keys(body.questions).map((id) =>
+        [id, { noul: id.startsWith('contradiction:') && contradicted ? 0.9 : 0.1 }])) });
+    });
+    const planned: Record<string, string> = {};
+    for (const name of ['quiet', 'contra']) {
+      await f.ingest(command(`${name}-1`, 'echo ' + name, 0, { repo: name, session: `${name}-s` }));
+      await approvedNote(f, `${name}-1`, `${name} note`, `Synthetic note for ${name}.`);
+      planned[name] = (await run(f.env, { project_id: (await f.event(`${name}-1`))!.project_id })).scopes[0].job_id;
+    }
+    // Each job's attempt fails once after its Jev call committed: 'quiet' just after the
+    // stage decided to skip, 'contra' in the generator.
+    let skipFailures = 0, generated = 0;
+    const stage: SelectionStage = async (input) => {
+      const decision = await defaultStage(input);
+      if (decision.decision === 'skip' && skipFailures++ === 0) throw new Error('synthetic failure after the Jev call');
+      return decision;
+    };
+    const generator: Generator = { ...extractiveGenerator, async generate(input) {
+      if (generated++ === 0) throw new Error('synthetic generator failure');
+      return extractiveGenerator.generate(input);
+    } };
+    const tasks = [{ ...processingMaintenance[0], run: (env: Env, ctx: any) => processingTick(env, ctx, { stage, generator }) }];
+    const start = noon();
+    const first = await runMaintenance({ ...gated(f.env), MAINTENANCE_TASKS: 'processing' } as Env, { now: start, tasks, fetcher: jev.fetcher });
+    assert.deepEqual(first.processing.result!.run_outcomes, { retry: 2 });
+    assert.equal(jev.calls.length, 2);
+    // One minute later each retry reads its stored answers instead of asking again.
+    const retried = await runMaintenance({ ...gated(f.env), MAINTENANCE_TASKS: 'processing' } as Env,
+      { now: new Date(start.getTime() + 60_000), tasks, fetcher: jev.fetcher });
+    assert.deepEqual(retried.processing.result!.run_outcomes, { skipped: 1, succeeded: 1 });
+    assert.deepEqual([jev.calls.length, retried.processing.usage.fetch], [2, 0]);
+    const quiet = await job(f.env, planned.quiet), contra = await job(f.env, planned.contra);
+    assert.deepEqual([quiet.status, quiet.attempts, quiet.skip_reason, quiet.result_context_id], ['skipped', 2, 'jev_no_new_information', null]);
+    assert.deepEqual([contra.status, contra.attempts, contra.note], ['succeeded', 2, 'jev_skip_overridden']);
+    for (const id of [quiet.id, contra.id]) assert.equal(await count(f.env, 'processing_calls WHERE job_id=?', id), 1);
   } finally { await f.close(); }
 });
 
