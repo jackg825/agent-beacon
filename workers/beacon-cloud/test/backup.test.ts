@@ -337,6 +337,54 @@ test('the integrity pass verifies each shared raw copy once, checks the newest c
   } finally { await fixture.close(); }
 });
 
+test('the integrity pass reports every kind of change to a completed checkpoint', async () => {
+  const fixture = await createEnvFixture({ backup: true });
+  try {
+    const env = fixture.env, start = later(15).getTime(), day = (n: number) => new Date(start + n * 25 * 3600_000);
+    const flip = (bytes: Uint8Array) => bytes.map((byte, index) => index === 0 ? byte ^ 0x01 : byte);
+    const bytesOf = async (key: string) => new Uint8Array(await (await env.BACKUP!.get(key))!.arrayBuffer());
+    await fixture.ingest([syntheticEvent('integrity-base')]);
+    assert.ok((await completeCheckpoint(env, day(0))).integrity_verified_at);
+    // Each case: a fresh checkpoint left unchecked, one change, then the next tick's verdict.
+    const cases: [string, (cp: Checkpoint, manifest: Manifest, raw: { key: string; size: number; sha256: string }) => Promise<() => Promise<unknown>>][] = [
+      ['manifest_missing', async (cp) => { await env.BACKUP!.delete(cp.manifest_key!); return async () => {}; }],
+      ['manifest_mismatch', async (cp) => { await env.BACKUP!.put(cp.manifest_key!, flip(await bytesOf(cp.manifest_key!))); return async () => {}; }],
+      ['chunk_missing', async (_cp, manifest) => { await env.BACKUP!.delete(manifest.chunks.find(chunk => chunk.kind !== 'raw_list')!.key); return async () => {}; }],
+      // Same size, and R2 stores a checksum of the new bytes: only the recorded SHA-256 catches it.
+      ['chunk_mismatch', async (_cp, manifest) => {
+        const chunk = manifest.chunks.find(item => item.kind !== 'raw_list')!, changed = flip(await bytesOf(chunk.key));
+        await env.BACKUP!.put(chunk.key, changed, { sha256: sha(changed) });
+        return async () => {};
+      }],
+      ['raw_missing', async (_cp, _manifest, raw) => {
+        const original = await bytesOf(raw.key);
+        await env.BACKUP!.delete(raw.key);
+        return () => env.BACKUP!.put(raw.key, original, { sha256: raw.sha256 });
+      }],
+      ['raw_mismatch', async (_cp, _manifest, raw) => {
+        const original = await bytesOf(raw.key), changed = flip(original);
+        await env.BACKUP!.put(raw.key, changed, { sha256: sha(changed) });
+        return () => env.BACKUP!.put(raw.key, original, { sha256: raw.sha256 });
+      }],
+    ];
+    for (const [index, [code, change]] of cases.entries()) {
+      const { batch_id } = await fixture.ingest([syntheticEvent('integrity-' + code, { session: code })]);
+      await backupTick(env, day(index + 1), { integrityPerTick: 0 });
+      const cp = (await latestCheckpoint(env))!;
+      assert.deepEqual([cp.status, cp.integrity_cursor], ['completed', null], code);
+      const manifest = JSON.parse(await objectText(env, cp.manifest_key!)) as Manifest;
+      // The copy of this case's new batch has not been verified by any earlier pass.
+      const entries = (await objectText(env, manifest.chunks.find(chunk => chunk.kind === 'raw_list')!.key)).split('\n').filter(Boolean).map(text => JSON.parse(text));
+      assert.equal((await env.DB.prepare('SELECT verified_at FROM backup_raw_objects WHERE batch_id=?').bind(batch_id).first<any>()).verified_at, null, code);
+      const restore = await change(cp, manifest, entries.find(entry => entry.batch_id === batch_id));
+      await backupTick(env, day(index + 1));
+      const after = (await env.DB.prepare('SELECT integrity_error,integrity_verified_at FROM backup_checkpoints WHERE id=?').bind(cp.id).first<any>());
+      assert.deepEqual([after.integrity_error, after.integrity_verified_at], [code, null], code);
+      await restore();
+    }
+  } finally { await fixture.close(); }
+});
+
 test('checkpoint progress is leased, bounded and fails with codes', async (t) => {
   const fixture = await createEnvFixture({ backup: true });
   try {
