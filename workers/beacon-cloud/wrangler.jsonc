@@ -6,6 +6,9 @@
   "workers_dev": false,
   "preview_urls": false,
   "observability": {"enabled": false},
+  // Background maintenance runs only the tasks named in MAINTENANCE_TASKS (none by
+  // default): processing on the frequent cron, backup and health on the hourly one.
+  "triggers": {"crons": ["*/15 * * * *", "17 * * * *"]},
   "d1_databases": [{
     "binding": "DB",
     "database_name": "agent-beacon-cloud-db",

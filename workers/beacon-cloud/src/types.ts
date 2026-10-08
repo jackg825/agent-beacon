@@ -9,6 +9,22 @@ export interface Env {
   ACCESS_TEAM_DOMAIN?: string;
   ACCESS_AUD?: string;
   PUBLIC_URL?: string;
+  /** Optional separate private bucket for scheduled backups; absent means backups stay disabled. */
+  BACKUP?: R2Bucket;
+  /** Comma-separated maintenance task names the operator opted into; empty means none run. */
+  MAINTENANCE_TASKS?: string;
+  /** Shared wall-clock budget for one scheduled invocation, 1000–600000 ms (default 25000). */
+  MAINTENANCE_BUDGET_MS?: string;
+  BACKUP_INTERVAL_HOURS?: string;
+  /**
+   * Deploy-time gate for any outbound model call: comma-separated central project IDs or `*`.
+   * Absent means no external call happens, whatever the stored processing policy says.
+   */
+  EXTERNAL_PROCESSING_PROJECTS?: string;
+  /** Optional TypeSafe Jev System One evaluator; used only when the gate, policy and budget allow. */
+  JEV_API_KEY?: string;
+  JEV_ENDPOINT?: string;
+  JEV_MODEL?: string;
 }
 
 export type RecordData = Record<string, unknown>;

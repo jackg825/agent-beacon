@@ -6,7 +6,30 @@ import { mcpChallenge, mcpMetadata } from './mcp-auth';
 import { getEventVersion, listEventVersions, getTimeline, listDevices, listProjects, listSessions } from './queries';
 import { projectRead, projectWrite } from './project-workflows';
 import { contextRead, contextWrite } from './context';
+import { processingRead, processingWrite } from './processing';
+import { syncDeviceRead, syncRead, syncWrite } from './sync';
+import { operationsRead, operationsReviewerRead, operationsWrite } from './operations';
+import { HOURLY_CRON, runMaintenance } from './maintenance';
 import { Env, HttpError, json } from './types';
+
+type Handler = (request: Request, env: Env) => Promise<Response | null>;
+type ActorHandler = (request: Request, env: Env, actor: string) => Promise<Response | null>;
+// Handlers return null for paths they do not own; the first match answers. Sync
+// owns /api/context/snapshot, so it precedes the /api/context/:id detail route.
+const readHandlers: Handler[] = [syncRead, projectRead, contextRead, processingRead, operationsRead];
+const writeHandlers: ActorHandler[] = [projectWrite, contextWrite, processingWrite, syncWrite, operationsWrite];
+const writePaths = /^\/api\/(?:project-groups|project-relations|tasks|context|processing|sync|retention|backups)(?:\/|$)/;
+// Backups hold device token digests, so even reading them needs review authority.
+const reviewerReadPaths = /^\/api\/backups(?:\/|$)/;
+
+async function first<T extends unknown[]>(handlers: ((request: Request, env: Env, ...rest: T) => Promise<Response | null>)[],
+  request: Request, env: Env, ...rest: T): Promise<Response | null> {
+  for (const handler of handlers) {
+    const response = await handler(request, env, ...rest);
+    if (response) return response;
+  }
+  return null;
+}
 
 async function route(request: Request, env: Env): Promise<Response> {
   const url=new URL(request.url), path=url.pathname;
@@ -23,14 +46,27 @@ async function route(request: Request, env: Env): Promise<Response> {
       return ingest(request,env,device,path.split('/').at(-1)!);
     throw new HttpError(405,'Unsupported ingest route or method');
   }
+  if (path.startsWith('/v1/sync/')) {
+    const device=await deviceAuth(request,env);
+    if (request.method!=='GET') throw new HttpError(405,'Sync is read-only');
+    const response=await syncDeviceRead(request,env,device);
+    if (response) return response;
+    throw new HttpError(404,'Not found');
+  }
   if (path==='/mcp') {
     await readAuth(request,env,true);
     return handleMcp(request,env);
   }
   if (path==='/' || path==='/dashboard' || path==='/dashboard.js' || path.startsWith('/api/')) {
-    if (request.method==='POST' && /^\/api\/(?:project-groups|project-relations|tasks|context)(?:\/|$)/.test(path)) {
+    if (request.method==='POST' && writePaths.test(path)) {
       const actor = await reviewAuth(request, env);
-      const response = await projectWrite(request, env, actor) || await contextWrite(request, env, actor);
+      const response = await first(writeHandlers, request, env, actor);
+      if (response) return response;
+      throw new HttpError(404, 'Not found');
+    }
+    if (request.method==='GET' && reviewerReadPaths.test(path)) {
+      const actor = await reviewAuth(request, env);
+      const response = await operationsReviewerRead(request, env, actor);
       if (response) return response;
       throw new HttpError(404, 'Not found');
     }
@@ -41,7 +77,7 @@ async function route(request: Request, env: Env): Promise<Response> {
     if (path==='/api/sessions') return json(await listSessions(env,url.searchParams));
     if (path==='/api/projects') return json(await listProjects(env));
     if (path==='/api/devices') return json(await listDevices(env));
-    const workflow = await projectRead(request, env) || await contextRead(request, env);
+    const workflow = await first(readHandlers, request, env);
     if (workflow) return workflow;
     const eventMatch=/^\/api\/events\/([a-f0-9]{64})(\/versions)?$/.exec(path);
     if (eventMatch) return json(await (eventMatch[2] ? listEventVersions(env,eventMatch[1],url.searchParams) : getEventVersion(env,eventMatch[1],url.searchParams)));
@@ -69,5 +105,13 @@ export default {
     headers.set('Referrer-Policy','no-referrer');
     headers.set('X-Frame-Options','DENY');
     return new Response(response.body,{status:response.status,headers});
+  },
+  // Background work is discovered from the committed index, never from the ingest
+  // request, so a failing task cannot change an ingest acknowledgement.
+  async scheduled(controller: ScheduledController, env: Env): Promise<void> {
+    const report=await runMaintenance(env,{now:new Date(controller.scheduledTime),
+      schedule:controller.cron===HOURLY_CRON?'hourly':'frequent'});
+    // Task names, durations and short codes only; results can carry counts but never content.
+    console.log(JSON.stringify({maintenance:Object.fromEntries(Object.entries(report).map(([name,value])=>[name,{ok:value.ok,error:value.error,duration_ms:value.duration_ms,usage:value.usage}]))}));
   }
 };

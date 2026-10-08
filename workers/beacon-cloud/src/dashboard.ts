@@ -1,3 +1,7 @@
+import { panels } from './dashboard-panels';
+
+const panelTabs = panels.map((panel) => `<button type="button" id="tab-${panel.tab}" role="tab" aria-selected="false" aria-controls="view-${panel.tab}">${panel.label}</button>`).join('');
+const panelSections = panels.map((panel) => `<section id="view-${panel.tab}" role="tabpanel" aria-labelledby="tab-${panel.tab}" hidden>${panel.html}</section>\n`).join('');
 const HTML = `<!doctype html>
 <html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Agent Beacon · 工作紀錄</title>
@@ -7,7 +11,7 @@ const HTML = `<!doctype html>
 <body><header><h1>Agent Beacon <span class="tag">私人工作區</span></h1><p class="muted">查閱兩台 Mac 的活動、串起跨專案任務，並審閱有來源的交接筆記。</p></header>
 <main>
 <details class="write-access" id="write-access"><summary>管理與審閱權限</summary><p class="muted">查閱使用登入權限；新增關聯、任務或筆記及核准內容，需要另外輸入審閱金鑰。金鑰只在這個頁面暫存，關閉頁面後清除。</p><div class="row"><label>審閱金鑰<input id="review-token" type="password" autocomplete="off" spellcheck="false" aria-describedby="review-note"></label><button type="button" id="lock-review">清除金鑰</button></div><p class="muted" id="review-note">不會寫入網址或瀏覽器儲存空間。請勿在筆記內容貼上金鑰。</p></details>
-<nav class="tabs" role="tablist" aria-label="工作區頁面"><button type="button" id="tab-activity" role="tab" aria-selected="true" aria-controls="view-activity">活動紀錄</button><button type="button" id="tab-projects" role="tab" aria-selected="false" aria-controls="view-projects">專案關聯</button><button type="button" id="tab-context" role="tab" aria-selected="false" aria-controls="view-context">交接與記憶</button></nav>
+<nav class="tabs" role="tablist" aria-label="工作區頁面"><button type="button" id="tab-activity" role="tab" aria-selected="true" aria-controls="view-activity">活動紀錄</button><button type="button" id="tab-projects" role="tab" aria-selected="false" aria-controls="view-projects">專案關聯</button><button type="button" id="tab-context" role="tab" aria-selected="false" aria-controls="view-context">交接與記憶</button>${panelTabs}</nav>
 <p id="status" role="status" aria-live="polite">正在讀取活動紀錄…</p>
 <section id="view-activity" role="tabpanel" aria-labelledby="tab-activity">
 <form id="filters"><label>裝置<select id="device" name="device_id" aria-label="裝置"><option value="">所有裝置</option></select></label><label>專案<select id="project" name="project_id" aria-label="專案"><option value="">所有專案</option></select></label><label>專案群組<select aria-label="專案群組" id="activity-group" name="project_group_id"><option value="">所有群組</option></select></label><label>任務<select aria-label="任務" id="activity-task" name="task_id"><option value="">所有任務</option></select></label><label>Agent<input id="harness" name="harness" placeholder="例如 codex_cli" maxlength="128"></label><button type="submit" class="primary">套用篩選</button><button type="button" id="refresh">重新整理</button></form>
@@ -27,7 +31,7 @@ const HTML = `<!doctype html>
 <section class="panel section-gap"><div class="panel-title"><h2>交接筆記與長期記憶</h2><p class="muted">預設只顯示已核准內容。待審內容尚未採用。</p></div><div class="panel-body"><form id="context-filters"><label>筆記專案<select aria-label="筆記專案" id="context-project" name="project_id"><option value="">所有專案</option></select></label><label>筆記任務<select aria-label="筆記任務" id="context-task" name="task_id"><option value="">所有任務</option></select></label><label>筆記類型<select name="kind"><option value="">所有類型</option><option value="summary">交接摘要</option><option value="memory">長期記憶</option></select></label><label>審閱狀態<select aria-label="審閱狀態" id="context-status" name="status"><option value="approved">已核准</option><option value="pending">待審・尚未採用</option><option value="rejected">已拒絕</option><option value="superseded">已由新版取代</option></select></label><button type="submit" class="primary">查詢筆記</button></form><div class="layout section-gap"><div><div id="context-list" class="list"></div><button type="button" id="more-context" class="pagination" hidden>載入更多筆記</button></div><div id="context-detail"><p class="empty">選擇一份筆記查看內容與原始來源。</p></div></div></div></section>
 <details class="panel section-gap" id="draft-panel"><summary class="panel-title">撰寫有來源的筆記</summary><div class="panel-body"><p class="muted">先在活動時間線勾選原始事件，再填寫內容。送出後一律待審，不會直接採用。</p><p id="draft-revision" class="notice" hidden></p><ul id="draft-sources" class="sources"></ul><button type="button" id="clear-sources">清除來源與新版設定</button><form id="context-create" class="vertical"><div class="row"><label>筆記所屬專案<select aria-label="筆記所屬專案" id="draft-project" required><option value="">選擇專案</option></select></label><label>筆記所屬任務（選填）<select aria-label="筆記所屬任務（選填）" id="draft-task"><option value="">不指定任務</option></select></label><label>內容類型<select aria-label="內容類型" id="draft-kind"><option value="summary">交接摘要</option><option value="memory">長期記憶候選</option></select></label></div><label>筆記標題<input id="draft-title" required maxlength="160" placeholder="例如登入修復：已完成與待確認"></label><label>筆記內容<textarea id="draft-content" rows="7" required maxlength="12000" placeholder="已完成什麼、如何驗證、哪些事項尚未確認。請區分紀錄中的事實與自己的推測。"></textarea></label><button type="submit" class="primary">送交審閱</button></form></div></details>
 </section>
-<footer>事件與筆記可能含有私人資料，請只在受信任的環境查閱。原始事件維持保存；筆記版本與審閱不會改寫原始事件。核准內容仍只存在中央服務，不會自動寫入兩台 Mac 的 memory。</footer></main></body></html>`;
+${panelSections}<footer>事件與筆記可能含有私人資料，請只在受信任的環境查閱。原始事件維持保存；筆記版本與審閱不會改寫原始事件。核准內容仍只存在中央服務，不會自動寫入兩台 Mac 的 memory。</footer></main></body></html>`;
 
 // Identity, transcript and user-authored text only enter textContent. No stored secret or embedded data.
 const SCRIPT = String.raw`'use strict';
@@ -62,13 +66,16 @@ const SCRIPT = String.raw`'use strict';
   const failure = (error) => status(error.message || '讀取失敗，請稍後重試。');
   const stateLabels = { pending: '待審・尚未採用', approved: '已核准', rejected: '已拒絕', superseded: '已由新版取代' };
   const relationLabels = { depends_on: '依賴', shares_service: '共用服務', fork_of: '分支自' };
+  const tabs = ['activity', 'projects', 'context', ...${JSON.stringify(panels.map((panel) => panel.tab))}];
+  const panelLoaders = {};
   function showTab(name) {
-    for (const tab of ['activity', 'projects', 'context']) {
+    for (const tab of tabs) {
       byId('view-' + tab).hidden = tab !== name;
       byId('tab-' + tab).setAttribute('aria-selected', String(tab === name));
       byId('tab-' + tab).tabIndex = tab === name ? 0 : -1;
     }
     if (name === 'context' && state.initialized) loadContext().catch(failure);
+    if (panelLoaders[name] && state.initialized) panelLoaders[name]().catch(failure);
   }
   async function api(path, body) {
     const headers = { Accept: 'application/json' };
@@ -470,7 +477,6 @@ const SCRIPT = String.raw`'use strict';
     byId('context-project').value = ''; byId('context-task').value = '';
     await loadContext(); renderContext(result.context); status('筆記已送交審閱，目前尚未採用。');
   });
-  const tabs = ['activity', 'projects', 'context'];
   for (const tab of tabs) {
     byId('tab-' + tab).tabIndex = tab === 'activity' ? 0 : -1;
     byId('tab-' + tab).addEventListener('click', () => showTab(tab));
@@ -495,6 +501,7 @@ const SCRIPT = String.raw`'use strict';
   byId('open-draft').addEventListener('click', () => { showTab('context'); byId('draft-panel').open = true; byId('draft-panel').scrollIntoView({ block: 'start' }); });
   byId('clear-sources').addEventListener('click', () => { state.sources.clear(); state.supersedes = null; document.querySelectorAll('input[data-source-key]').forEach((input) => { input.checked = false; }); renderSources(); });
   renderSources();
+${panels.map((panel) => panel.script).join('\n')}
   Promise.all([api('/api/devices'), api('/api/projects')]).then(async ([devices, projects]) => {
     options('device', devices.devices);
     for (const id of ['project', 'member-project', 'relation-from', 'relation-to', 'context-project', 'draft-project']) options(id, projects.projects);
@@ -502,6 +509,8 @@ const SCRIPT = String.raw`'use strict';
     await Promise.all([loadGroups(), loadRelations(), loadTasks()]);
     state.initialized = true;
     if (!byId('view-context').hidden) await loadContext();
+    const open = tabs.find((tab) => !byId('view-' + tab).hidden);
+    if (panelLoaders[open]) await panelLoaders[open]();
   }).catch(failure);
 })();`;
 

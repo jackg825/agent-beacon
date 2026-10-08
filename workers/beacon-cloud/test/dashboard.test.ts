@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Script } from 'node:vm';
 import { dashboardResponse, dashboardScriptResponse } from '../src/dashboard';
+import { panels } from '../src/dashboard-panels';
 
 test('dashboard shell keeps data private and constrains script and network origins', async () => {
   const response = dashboardResponse();
@@ -22,4 +23,18 @@ test('dashboard delivers valid JavaScript separately from its HTML', async () =>
   assert.equal(response.headers.get('Cache-Control'), 'no-store');
   const script = await response.text();
   assert.doesNotThrow(() => new Script(script));
+});
+
+test('every registered panel renders a tab, a hidden tabpanel and a loader', async () => {
+  const html = await dashboardResponse().text();
+  const script = await dashboardScriptResponse().text();
+  const tabs = new Set(['activity', 'projects', 'context']);
+  for (const panel of panels) {
+    assert.match(panel.tab, /^[a-z][a-z-]{1,31}$/);
+    assert.ok(!tabs.has(panel.tab), `duplicate tab ${panel.tab}`);
+    tabs.add(panel.tab);
+    assert.match(html, new RegExp(`id="tab-${panel.tab}" role="tab"`));
+    assert.match(html, new RegExp(`<section id="view-${panel.tab}" role="tabpanel" aria-labelledby="tab-${panel.tab}" hidden>`));
+    assert.match(script, new RegExp(`panelLoaders(?:\\.${panel.tab}|\\[['"]${panel.tab}['"]\\])\\s*=`));
+  }
 });
