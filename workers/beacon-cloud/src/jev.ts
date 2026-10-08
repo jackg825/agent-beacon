@@ -164,7 +164,8 @@ async function currentNotes(env: Env, input: StageInput): Promise<NoteRow[]> {
  * answered below it, and nothing in the source set is high-signal (non-zero exit,
  * denial, policy enforcement, or any contradiction answer ≥ 0.5).
  */
-export function jevDecision(input: Pick<StageInput, 'policy' | 'projection'>, signals: Pick<StageSignal, 'question_id' | 'probability'>[],
+export function jevDecision(input: { policy: { jev_skip_threshold: number | null }; projection: ProjectedEvent[] },
+  signals: Pick<StageSignal, 'question_id' | 'probability'>[],
   note?: string): StageResult {
   const fresh = signals.find((signal) => signal.question_id === 'new_information')?.probability;
   const threshold = input.policy.jev_skip_threshold;

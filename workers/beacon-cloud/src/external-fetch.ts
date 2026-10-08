@@ -26,7 +26,12 @@ export async function externalFetch(fetcher: typeof fetch, url: string, init: Re
   const signal = AbortSignal.timeout(limits.timeoutMs);
   let response: Response;
   try { response = await fetcher(url, { ...init, redirect: 'manual', signal }); }
-  catch (error) { return { ok: false, outcome: 'outcome_unknown', code: aborted(error, signal) ? 'timeout' : 'network_error' }; }
+  catch (error) {
+    // The metered ctx.fetch refuses before anything is sent when the task's allotment is used up.
+    const code = (error as { code?: unknown })?.code;
+    if (typeof code === 'string' && /^budget_exhausted:[a-z0-9]+$/.test(code)) return { ok: false, outcome: 'failed', code };
+    return { ok: false, outcome: 'outcome_unknown', code: aborted(error, signal) ? 'timeout' : 'network_error' };
+  }
   // workerd types omit 'opaqueredirect', but other runtimes (and fakes) can return it.
   if ((response.type as string) === 'opaqueredirect' || (response.status >= 300 && response.status < 400)) {
     await discard(response);
@@ -43,10 +48,16 @@ export async function externalFetch(fetcher: typeof fetch, url: string, init: Re
   }
   const chunks: Uint8Array[] = [];
   let total = 0;
+  // Every read races the deadline, whether or not the runtime ties the body to the signal.
+  const deadline = new Promise<never>((_, reject) => {
+    if (signal.aborted) reject(signal.reason);
+    signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+  });
+  deadline.catch(() => {});
+  const reader = response.body?.getReader();
   try {
-    const reader = response.body?.getReader();
     while (reader) {
-      const { done, value } = await reader.read();
+      const { done, value } = await Promise.race([reader.read(), deadline]);
       if (done) break;
       total += value.byteLength;
       if (total > limits.maxBytes) {
@@ -56,6 +67,7 @@ export async function externalFetch(fetcher: typeof fetch, url: string, init: Re
       chunks.push(value);
     }
   } catch (error) {
+    reader?.cancel().catch(() => {});
     // The provider answered and then the body stalled or broke: it may have acted.
     return { ok: false, outcome: 'outcome_unknown', code: aborted(error, signal) ? 'timeout' : 'network_error', status: response.status };
   }
@@ -73,7 +85,7 @@ export async function externalFetch(fetcher: typeof fetch, url: string, init: Re
  */
 export function externalEndpoint(value: string | undefined, fallback: string, publicUrl?: string): string | null {
   const raw = (value ?? '').trim() || fallback;
-  if (raw.length > 512 || /[\s?#@\\]/.test(raw)) return null;
+  if (raw.length > 512 || /[\s?#@\\]/.test(raw) || !/^https:\/\/[^/]/i.test(raw)) return null;
   let url: URL;
   try { url = new URL(raw); } catch { return null; }
   if (url.protocol !== 'https:' || !url.hostname || url.username || url.password || url.search || url.hash) return null;
