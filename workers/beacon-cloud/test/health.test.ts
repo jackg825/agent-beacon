@@ -15,7 +15,8 @@ import { SelectionStage, ruleFilter } from '../src/processing-stage';
 import { Env, HttpError } from '../src/types';
 import { createEnvFixture, migrationsExcept, syntheticEvent } from './env-fixture';
 import { applyMigrations } from './migrations';
-import { createContext, createContextFlagsStandIn, get, later, post, reviewer, verifiedCheckpoint } from './operations-fixture';
+import { revisionsWrite } from '../src/context-revisions';
+import { createContext, get, later, post, reviewer, verifiedCheckpoint } from './operations-fixture';
 import { job, setPolicy as setProcessingPolicy, staged, workspace } from './processing-helpers';
 
 const HOUR = 3600_000, DAY = 24 * HOUR;
@@ -153,16 +154,25 @@ test('findings cover devices, backlog, stale notes, flags and backups without co
       const text = JSON.stringify(month);
       for (const secret of ['synthetic-secret-marker', 'Synthetic stale', 'Synthetic aging', '/synthetic/']) assert.ok(!text.includes(secret), secret);
     });
-    await t.test("open flags appear only once Track R's table exists (a stand-in until its migration)", async () => {
+    await t.test("open flags are counted from Track R's table and leave the report once a reviewer closes them", async () => {
       let health = await dataHealth(env, { now });
-      assert.deepEqual([health.schema.context_flags, health.flags], [false, { available: false }]);
-      await createContextFlagsStandIn(env);
-      await env.DB.prepare("INSERT INTO context_flags VALUES('flag-1','open','[]',?),('flag-2','resolved','[]',?)").bind(recent, recent).run();
+      assert.deepEqual([health.schema.context_flags, health.flags], [true, { available: true, open: 0 }]);
+      assert.equal(finding(health, 'open_flags'), undefined);
+      const fresh = (await fixture.event('fresh-1'))!;
+      const note = await createContext(env, { kind: 'memory', project_id: fresh.project_id, title: 'Synthetic flagged title',
+        content: 'Synthetic flagged content.', sources: [{ event_id: fresh.id, payload_hash: fresh.payload_hash }] }, 'approve');
+      const flag = async () => {
+        const response = await revisionsWrite(post(`/api/context/${note}/flags`, { kind: 'needs_review', note: 'synthetic-secret-marker' }), env, reviewer);
+        assert.equal(response!.status, 201);
+        return ((await response!.json()) as any).flag.id as string;
+      };
+      const [open, closed] = [await flag(), await flag()];
+      assert.equal((await revisionsWrite(post(`/api/context/flags/${closed}/resolve`, { resolution: 'dismissed', reason: 'Synthetic' }), env, reviewer))!.status, 200);
       health = await dataHealth(env, { now });
       assert.deepEqual(health.flags, { available: true, open: 1 });
-      assert.deepEqual(finding(health, 'open_flags')!.sample_ids, ['flag-1']);
-      // The stand-in has no committed migration, so a restore drill would rightly refuse it.
-      await env.DB.prepare('DROP TABLE context_flags').run();
+      assert.deepEqual(finding(health, 'open_flags')!.sample_ids, [open]);
+      assert.ok(!JSON.stringify(health).includes('synthetic-secret-marker'));
+      // The rows stay for the backup subtest below, whose restore drill reloads them.
     });
     await t.test('backup configuration, freshness, verification and raw copy lag', async () => {
       const unbound = await dataHealth({ ...env, BACKUP: undefined } as Env, { now });
@@ -213,8 +223,8 @@ test('findings cover devices, backlog, stale notes, flags and backups without co
 });
 
 test('without migration 0004 the processing queue is unavailable, and a foreign table layout degrades to a code', async () => {
-  // Explicitly the schema of a deployment that applied Track D but never Track P.
-  const fixture = await createEnvFixture({ migrations: await migrationsExcept('0004') });
+  // Explicitly the schema of a deployment that applied Track D but never Track P (nor Track R, whose flags build on it).
+  const fixture = await createEnvFixture({ migrations: await migrationsExcept('0004', '0007') });
   try {
     const env = fixture.env;
     let health = await dataHealth(env);
