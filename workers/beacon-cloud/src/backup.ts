@@ -31,6 +31,11 @@ export interface BackupLimits {
   pruneBatch: number;
   /** R2 reads/heads the integrity pass may spend per tick. */
   integrityPerTick: number;
+  /**
+   * Share of the tick's allotment and remaining time the integrity pass may use before the
+   * running checkpoint advances, so chunking can never starve it; it may use the rest afterwards.
+   */
+  integrityShare: number;
   /** Checkpoint steps per tick (tests use 1 to stop between steps). */
   maxSteps: number;
   leaseMs: number;
@@ -38,7 +43,7 @@ export interface BackupLimits {
 }
 export const BACKUP_LIMITS: BackupLimits = {
   allotment: BACKUP_ALLOTMENT, chunkBatches: 100, tailBatches: 200, finalMaxRows: 60_000, finalMaxBytes: 24 * 1024 * 1024, objectMaxBytes: 4 * 1024 * 1024,
-  rawListPage: 5000, rawCopyPerTick: 500, missingRetryPerTick: 50, pruneBatch: 200, integrityPerTick: 1500, maxSteps: 1000,
+  rawListPage: 5000, rawCopyPerTick: 500, missingRetryPerTick: 50, pruneBatch: 200, integrityPerTick: 1500, integrityShare: 0.4, maxSteps: 1000,
   leaseMs: 20 * 60_000,
   settleMs: SETTLE_MS,
 };
@@ -480,17 +485,27 @@ async function advanceCheckpoint(env: Env, ctx: MaintenanceContext, limits: Back
 
 // ---- integrity pass ------------------------------------------------------------------
 
-type IntegrityCursor = { stage: 'manifest' } | { stage: 'chunks'; seq: number } | { stage: 'raw'; seq: number; index: number };
+type IntegrityCursor = { stage: 'manifest' } | { stage: 'chunks'; seq: number; index?: number };
+/** Calls and time one integrity pass may use: a slice of the tick before the checkpoint advances, the rest after. */
+type IntegrityBudget = { allotment: Allotment; minimumMs: number; reads: { left: number } };
+const RAW_VERIFY_GROUP = 1000;
 
-/** Re-hash every manifest-listed object in BACKUP (raw copies by size and stored SHA-256), bounded per tick. */
-async function checkIntegrity(env: Env, ctx: MaintenanceContext, limits: BackupLimits, result: Row) {
-  if (!room(ctx, limits.allotment, { d1: 4, r2: 1 })) return;
+/**
+ * Re-hash the manifest and every chunk object of the newest completed checkpoint that has not
+ * passed yet, and HEAD (size and stored SHA-256) the raw copies its raw lists name that no
+ * earlier pass verified. Copies are content-addressed and shared, so each is verified once
+ * (backup_raw_objects.verified_at, reset whenever it is written again).
+ */
+async function checkIntegrity(env: Env, ctx: MaintenanceContext, budget: IntegrityBudget, result: Row) {
+  if (budget.reads.left <= 0 || !room(ctx, budget.allotment, { d1: 4, r2: 1 }, budget.minimumMs)) return;
+  // Newest first: retention can only rely on the newest verified checkpoint within BACKUP_MAX_AGE_DAYS.
   const cp = await env.DB.prepare(`SELECT * FROM backup_checkpoints WHERE status IN ('completed','verified')
-    AND integrity_verified_at IS NULL AND integrity_error IS NULL ORDER BY completed_at,id LIMIT 1`).first<Checkpoint>();
+    AND integrity_verified_at IS NULL AND integrity_error IS NULL ORDER BY completed_at DESC,id DESC LIMIT 1`).first<Checkpoint>();
   if (!cp) return;
   let cursor: IntegrityCursor = cp.integrity_cursor ? JSON.parse(cp.integrity_cursor) : { stage: 'manifest' };
-  let spent = 0, failure: string | null = null, done = false;
-  const affordable = () => spent < limits.integrityPerTick && room(ctx, limits.allotment, { d1: 3, r2: 1 });
+  if (Array.isArray((cursor as { seq?: unknown }).seq) || (cursor as { stage: string }).stage === 'raw') cursor = { stage: 'chunks', seq: 0 };
+  let spent = 0, verified = 0, failure: string | null = null, done = false;
+  const affordable = (d1 = 3) => spent < budget.reads.left && room(ctx, budget.allotment, { d1, r2: 1 }, budget.minimumMs);
   const fetchBytes = async (key: string) => { spent++; const object = await env.BACKUP!.get(key); return object ? new Uint8Array(await object.arrayBuffer()) : null; };
   outer: while (!failure && !done && affordable()) {
     if (cursor.stage === 'manifest') {
@@ -498,41 +513,66 @@ async function checkIntegrity(env: Env, ctx: MaintenanceContext, limits: BackupL
       if (!bytes) { failure = 'manifest_missing'; break; }
       if (await digest(bytes) !== cp.manifest_sha256) { failure = 'manifest_mismatch'; break; }
       cursor = { stage: 'chunks', seq: 0 };
-    } else if (cursor.stage === 'chunks') {
-      const chunks = await env.DB.prepare('SELECT seq,key,sha256,bytes FROM backup_chunks WHERE checkpoint_id=? AND seq>? ORDER BY seq LIMIT 50')
-        .bind(cp.id, cursor.seq).all<{ seq: number; key: string; sha256: string; bytes: number }>();
-      if (!chunks.results.length) { cursor = { stage: 'raw', seq: 0, index: 0 }; continue; }
-      for (const chunk of chunks.results) {
-        if (!affordable()) break outer;
-        const bytes = await fetchBytes(chunk.key);
-        if (!bytes) { failure = 'chunk_missing'; break outer; }
-        if (bytes.byteLength !== chunk.bytes || await digest(bytes) !== chunk.sha256) { failure = 'chunk_mismatch'; break outer; }
-        cursor = { stage: 'chunks', seq: chunk.seq };
-      }
-    } else {
-      const chunk = await env.DB.prepare(`SELECT seq,key,sha256 FROM backup_chunks WHERE checkpoint_id=? AND kind='raw_list' AND seq>=?
-        ORDER BY seq LIMIT 1`).bind(cp.id, cursor.seq).first<{ seq: number; key: string; sha256: string }>();
-      if (!chunk) { done = true; break; }
+      continue;
+    }
+    const chunks = await env.DB.prepare('SELECT seq,kind,key,sha256,bytes FROM backup_chunks WHERE checkpoint_id=? AND seq>? ORDER BY seq LIMIT 50')
+      .bind(cp.id, cursor.seq).all<{ seq: number; kind: string; key: string; sha256: string; bytes: number }>();
+    if (!chunks.results.length) { done = true; break; }
+    for (const chunk of chunks.results) {
+      if (!affordable()) break outer;
       const bytes = await fetchBytes(chunk.key);
-      if (!bytes || await digest(bytes) !== chunk.sha256) { failure = 'chunk_mismatch'; break; }
-      const entries = new TextDecoder().decode(bytes).split('\n').filter(Boolean).map(text => JSON.parse(text) as { key: string; size: number; sha256: string });
-      let index = cursor.seq === chunk.seq ? cursor.index : 0;
-      for (; index < entries.length; index++) {
-        if (!affordable()) { cursor = { stage: 'raw', seq: chunk.seq, index }; break outer; }
-        spent++;
-        const head = await env.BACKUP!.head(entries[index].key);
-        if (!head) { failure = 'raw_missing'; break outer; }
-        if (head.size !== entries[index].size || hex(head.checksums.sha256) !== entries[index].sha256) { failure = 'raw_mismatch'; break outer; }
+      if (!bytes) { failure = 'chunk_missing'; break outer; }
+      if (bytes.byteLength !== chunk.bytes || await digest(bytes) !== chunk.sha256) { failure = 'chunk_mismatch'; break outer; }
+      if (chunk.kind === 'raw_list') {
+        const entries = new TextDecoder().decode(bytes).split('\n').filter(Boolean)
+          .map(text => JSON.parse(text) as { batch_id: string; key: string; size: number; sha256: string });
+        let index = cursor.index ?? 0;
+        while (index < entries.length) {
+          // One lookup per group, one HEAD per copy not verified yet, one update per group.
+          if (!affordable(4)) { cursor = { stage: 'chunks', seq: cursor.seq, index }; break outer; }
+          const group = entries.slice(index, index + RAW_VERIFY_GROUP);
+          const known = await env.DB.prepare(`SELECT batch_id FROM backup_raw_objects WHERE status='copied' AND verified_at IS NOT NULL
+            AND batch_id IN (SELECT value FROM json_each(?))`).bind(JSON.stringify(group.map(entry => entry.batch_id))).all<{ batch_id: string }>();
+          const skip = new Set(known.results.map(row => row.batch_id)), checked: string[] = [];
+          let position = 0;
+          for (; position < group.length; position++) {
+            const entry = group[position];
+            if (skip.has(entry.batch_id)) continue;
+            if (!affordable(2)) break;
+            spent++;
+            const head = await env.BACKUP!.head(entry.key);
+            if (!head) { failure = 'raw_missing'; break; }
+            if (head.size !== entry.size || hex(head.checksums.sha256) !== entry.sha256) { failure = 'raw_mismatch'; break; }
+            checked.push(entry.batch_id);
+          }
+          if (checked.length) {
+            await env.DB.prepare(`UPDATE backup_raw_objects SET verified_at=? WHERE status='copied' AND verified_at IS NULL
+              AND batch_id IN (SELECT value FROM json_each(?))`).bind(iso(ctx.now), JSON.stringify(checked)).run();
+            verified += checked.length;
+          }
+          index += position;
+          if (failure) break outer;
+          if (position < group.length) { cursor = { stage: 'chunks', seq: cursor.seq, index }; break outer; }
+        }
       }
-      cursor = { stage: 'raw', seq: chunk.seq + 1, index: 0 };
+      cursor = { stage: 'chunks', seq: chunk.seq };
     }
   }
+  budget.reads.left -= spent;
   const now = iso(ctx.now);
   const update = await env.DB.prepare(`UPDATE backup_checkpoints SET integrity_cursor=?,integrity_verified_at=?,integrity_error=?,updated_at=?
     WHERE id=? AND integrity_cursor IS ? AND integrity_verified_at IS NULL AND integrity_error IS NULL`)
     .bind(JSON.stringify(cursor), done ? now : null, failure, now, cp.id, cp.integrity_cursor).run();
-  result.integrity = { id: cp.id, checked: spent, ...(done ? { verified: true } : {}), ...(failure ? { error: failure } : {}),
-    ...(update.meta.changes ? {} : { conflict: true }) };
+  const previous = (result.integrity as { id?: string; checked?: number; raw_verified?: number } | undefined);
+  const carried = previous?.id === cp.id ? previous : undefined;
+  result.integrity = { id: cp.id, checked: spent + (carried?.checked ?? 0), raw_verified: verified + (carried?.raw_verified ?? 0),
+    ...(done ? { verified: true } : {}), ...(failure ? { error: failure } : {}), ...(update.meta.changes ? {} : { conflict: true }) };
+}
+
+/** The part of the tick's remaining allotment and time a pass may use; share 1 leaves the whole tick. */
+function slice(ctx: MaintenanceContext, allotment: Allotment, share: number, reads: { left: number }): IntegrityBudget {
+  const used = ctx.usage(), part = (kind: keyof Allotment) => used[kind] + Math.floor(Math.max(0, allotment[kind] - used[kind]) * share);
+  return { allotment: { d1: part('d1'), r2: part('r2'), fetch: part('fetch') }, minimumMs: Math.max(1000, Math.floor(ctx.remaining() * (1 - share))), reads };
 }
 
 /** Build the backup task; tests pass smaller limits to exercise multi-tick behavior. */
@@ -545,12 +585,14 @@ export function createBackupTask(overrides: Partial<BackupLimits> = {}): Mainten
       // Code deployed before migration 0008 was applied: report it rather than a generic failure.
       if (!await env.DB.prepare("SELECT 1 AS present FROM sqlite_master WHERE type='table' AND name='backup_raw_generations'").first())
         throw new MaintenanceError('backup_schema_missing');
-      const result: Row = {};
+      const result: Row = {}, reads = { left: limits.integrityPerTick };
       await pruneRetained(env, ctx, limits, result);
       await copyRaw(env, ctx, limits, result);
       await retryMissing(env, ctx, limits, result);
+      // Integrity gets its share first, so a long-running checkpoint cannot starve it, then whatever is left.
+      await checkIntegrity(env, ctx, slice(ctx, limits.allotment, limits.integrityShare, reads), result);
       await advanceCheckpoint(env, ctx, limits, result);
-      await checkIntegrity(env, ctx, limits, result);
+      await checkIntegrity(env, ctx, slice(ctx, limits.allotment, 1, reads), result);
       return result;
     },
   };

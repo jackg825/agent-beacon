@@ -288,6 +288,55 @@ test('a raw source missing at copy time is copied once it reappears, so the next
   } finally { await fixture.close(); }
 });
 
+test('the integrity pass verifies each shared raw copy once, checks the newest checkpoint first and keeps a share of every tick', async (t) => {
+  const fixture = await createEnvFixture({ backup: true });
+  try {
+    const env = fixture.env, start = later(15).getTime(), day = (n: number) => new Date(start + n * 25 * 3600_000);
+    for (let index = 0; index < 5; index++) await fixture.ingest([syntheticEvent('shared-' + index, { session: 'shared-' + index })]);
+    let heads = 0;
+    const counting = { ...env, BACKUP: new Proxy(env.BACKUP!, { get(target, property) {
+      const value = Reflect.get(target, property, target);
+      if (property === 'head') return (...args: unknown[]) => { heads++; return (value as (...values: unknown[]) => unknown).apply(target, args); };
+      return typeof value === 'function' ? value.bind(target) : value;
+    } }) } as Env;
+    const verifiedCopies = async () => (await env.DB.prepare("SELECT COUNT(*) AS n FROM backup_raw_objects WHERE status='copied' AND verified_at IS NOT NULL")
+      .first<{ n: number }>())!.n;
+    await t.test('a copy verified by one checkpoint is not checked again by the next', async () => {
+      assert.ok((await completeCheckpoint(counting, day(0))).integrity_verified_at);
+      assert.deepEqual([heads, await verifiedCopies()], [5, 5]);
+      await fixture.ingest([syntheticEvent('shared-new', { session: 'shared-new' })]);
+      heads = 0;
+      const second = await completeCheckpoint(counting, day(1));
+      assert.ok(second.integrity_verified_at);
+      assert.equal(second.raw_object_count, 6);
+      assert.deepEqual([heads, await verifiedCopies()], [1, 6], 'only the new copy is checked');
+    });
+    await t.test('the newest completed checkpoint is checked first', async () => {
+      const unverified: Checkpoint[] = [];
+      for (const n of [2, 3]) {
+        await fixture.ingest([syntheticEvent('shared-day-' + n, { session: 'shared-day-' + n })]);
+        await backupTick(env, day(n), { integrityPerTick: 0 });
+        unverified.push((await latestCheckpoint(env))!);
+      }
+      assert.ok(unverified.every(cp => cp.status === 'completed' && !cp.integrity_cursor));
+      await backupTick(env, day(3), { integrityPerTick: 1 });
+      const [older, newer] = await Promise.all(unverified.map(cp => env.DB.prepare('SELECT * FROM backup_checkpoints WHERE id=?').bind(cp.id).first<Checkpoint>()));
+      assert.equal(older!.integrity_cursor, null);
+      assert.deepEqual(JSON.parse(newer!.integrity_cursor!), { stage: 'chunks', seq: 0 });
+    });
+    await t.test('a checkpoint with plenty of chunk work still leaves the integrity pass its share', async () => {
+      for (let index = 0; index < 30; index++) await fixture.ingest([syntheticEvent('busy-' + index, { session: 'busy-' + index })]);
+      const pending = (await env.DB.prepare(`SELECT * FROM backup_checkpoints WHERE integrity_verified_at IS NULL AND status='completed'
+        ORDER BY completed_at DESC LIMIT 1`).first<Checkpoint>())!;
+      const tick = await backupTick(env, day(4), { chunkBatches: 1, allotment: { d1: 60, r2: 2500, fetch: 0 } });
+      assert.equal(tick.ok, true, JSON.stringify(tick));
+      assert.equal((await latestCheckpoint(env))!.status, 'running', 'the new checkpoint is still chunking');
+      const after = (await env.DB.prepare('SELECT * FROM backup_checkpoints WHERE id=?').bind(pending.id).first<Checkpoint>())!;
+      assert.notEqual(after.integrity_cursor, pending.integrity_cursor, 'the integrity pass made progress');
+    });
+  } finally { await fixture.close(); }
+});
+
 test('checkpoint progress is leased, bounded and fails with codes', async (t) => {
   const fixture = await createEnvFixture({ backup: true });
   try {

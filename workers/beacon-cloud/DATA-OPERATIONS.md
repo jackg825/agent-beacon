@@ -82,7 +82,11 @@ D1 用量的量級：`health` 每小時最多讀 50 頁 R2 清單（每頁最多
 
 上限：最終快照最多 60,000 列、24 MiB，尾端最多 200 個批次。尾端太大時先多做一輪分塊；其他 table 太大時 checkpoint 以 `final_snapshot_too_large` 失敗，需要調整設計，不會靜默截斷。
 
-**完整性檢查**：checkpoint 完成後，`backup` 任務分次重新讀取並雜湊 manifest 與每個分塊，並以大小和 R2 保存的 SHA-256 核對清單中的每個原文複本；通過後寫入 `integrity_verified_at`，失敗則記錄 `manifest_mismatch`、`chunk_missing`、`chunk_mismatch`、`raw_missing` 或 `raw_mismatch`。
+**完整性檢查**：checkpoint 完成後，`backup` 任務分次重新讀取並雜湊 manifest 與這個 checkpoint 的每個分塊（含原文清單），並以大小和 R2 保存的 SHA-256 核對清單中**還沒驗證過**的原文複本；通過後寫入 `integrity_verified_at`，失敗則記錄 `manifest_missing`、`manifest_mismatch`、`chunk_missing`、`chunk_mismatch`、`raw_missing` 或 `raw_mismatch`。
+
+- 原文複本以內容定址、所有 checkpoint 共用，所以每個複本只驗證一次（`backup_raw_objects.verified_at`，重新寫入時清除）。之後的 checkpoint 只檢查新複本，每次的工作量跟新批次數量成正比，不會隨歷史總量增加。代價是：驗證過的複本之後若在 BACKUP 裡被改動，完整性檢查不會再發現；保存期限套用前仍會逐一確認複本的大小與 SHA-256，還原演練也會重新下載並雜湊每個複本。
+- 一律先檢查**最新**完成、尚未通過的 checkpoint，因為保存期限只依靠 `BACKUP_MAX_AGE_DAYS` 內最新的已驗證 checkpoint；較舊的會在之後輪到。
+- 每次排程先把剩餘配額與時間的 40% 留給完整性檢查，再推進進行中的 checkpoint，最後把剩下的再給完整性檢查，所以大型 checkpoint 的分塊工作不會讓它永遠排不到。
 
 ### 審閱者操作
 
