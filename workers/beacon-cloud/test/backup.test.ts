@@ -3,14 +3,15 @@ import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { promisify } from 'node:util';
-import { chmod, mkdtemp, readdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { chmod, mkdir, mkdtemp, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BACKUP_BOOKKEEPING } from '../src/operations-shared';
 import { Manifest, backupTask, backupsReviewerRead, backupsWrite, createBackupTask, expireCheckpoint } from '../src/backup';
 import { runMaintenance } from '../src/maintenance';
 import { Env } from '../src/types';
-import { RestoreError, bucketSource, dirSource, httpSource, parseArgs, readReviewToken, reportSha256, restoreCheck, verifyRequest, workerUrl }
+import { RestoreError, bucketSource, dirSource, httpSource, parseArgs, readReviewToken, reportSha256, restoreCheck, runCli, verifyRequest, workerUrl }
   from '../scripts/restore-check';
 import { createEnvFixture, syntheticEvent } from './env-fixture';
 import { addTrackMigration, backupTick, completeCheckpoint, createContext, drill, get, later, latestCheckpoint, operationsTokens, operationsWorker, post,
@@ -420,6 +421,34 @@ test('the bundled Worker keeps every backup route behind review authority and ru
       await assert.rejects(redirecting.get('x'), (error: any) => error.code === 'redirect_rejected');
       const unauthorized = httpSource(new URL('http://localhost'), operationsTokens.read, checkpoint.id, fetcher);
       await assert.rejects(unauthorized.manifestSha256(), (error: any) => error.code === 'http_403');
+    });
+    await t.test('the CLI keeps --out private, removes its temporary directory and never prints the token', async () => {
+      const fetcher = ((input: RequestInfo | URL, init?: RequestInit) => worker.mf.dispatchFetch(String(input), init as never)) as unknown as typeof fetch;
+      const directory = await mkdtemp(join(tmpdir(), 'beacon-cli-run-')), previous = process.env.TMPDIR;
+      try {
+        const tokenPath = join(directory, 'review-token'), out = join(directory, 'out'), scratch = join(directory, 'tmp');
+        await writeFile(tokenPath, operationsTokens.review + '\n', { mode: 0o600 });
+        await mkdir(scratch, { mode: 0o700 });
+        const lines: string[] = [], errors: string[] = [];
+        const io = { fetch: fetcher, log: (text: string) => lines.push(text), error: (text: string) => errors.push(text) };
+        const remote = ['--url', 'http://localhost', '--review-token-file', tokenPath, '--checkpoint', checkpoint.id];
+        assert.equal(await runCli([...remote, '--out', out], io), 0);
+        assert.equal(JSON.parse(lines[0]).report.result, 'passed');
+        assert.ok(['checkpoint.json', 'objects'].every(name => existsSync(join(out, name))));
+        assert.equal((await stat(out)).mode & 0o777, 0o700);
+        assert.equal(await runCli([...remote, '--out', out], io), 2);
+        process.env.TMPDIR = scratch;
+        assert.equal(await runCli(['--dir', out, '--checkpoint', checkpoint.id], io), 0);
+        assert.deepEqual(await readdir(scratch), [], 'the temporary work directory is removed');
+        await writeFile(tokenPath, operationsTokens.read + '\n', { mode: 0o600 });
+        assert.equal(await runCli(remote, io), 2);
+        assert.deepEqual(errors.map(text => JSON.parse(text).error), ['out_not_empty', 'http_403']);
+        const printed = lines.concat(errors).join('\n');
+        for (const secret of [operationsTokens.review, operationsTokens.read, tokenPath]) assert.ok(!printed.includes(secret));
+      } finally {
+        if (previous === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = previous;
+        await rm(directory, { recursive: true, force: true });
+      }
     });
   } finally { await worker.close(); }
 });

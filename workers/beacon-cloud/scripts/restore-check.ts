@@ -351,37 +351,45 @@ export function parseArgs(argv: string[]) {
   return options;
 }
 
-async function main(argv: string[]) {
-  const options = parseArgs(argv), checkpointId = options.checkpoint;
-  let workDir: string, keep = false, source: BackupSource, expected: string;
-  if (options.dir) {
-    const saved = JSON.parse(await readFile(join(options.dir, 'checkpoint.json'), 'utf8')) as { checkpoint_id?: string; manifest_sha256?: string };
-    if (saved.checkpoint_id !== checkpointId || !HASH.test(saved.manifest_sha256 ?? '')) throw new RestoreError('invalid_local_backup');
-    source = dirSource(options.dir); expected = saved.manifest_sha256!;
-    workDir = await mkdtemp(join(tmpdir(), 'beacon-restore-'));
-  } else {
-    const remote = httpSource(workerUrl(options.url), await readReviewToken(options['review-token-file']), checkpointId);
-    source = remote; expected = await remote.manifestSha256();
-    if (options.out) {
-      try { if ((await readdir(options.out)).length) throw new RestoreError('out_not_empty'); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
-      await mkdir(options.out, { recursive: true, mode: 0o700 });
-      workDir = options.out; keep = true;
-    } else workDir = await mkdtemp(join(tmpdir(), 'beacon-restore-'));
-  }
-  await chmod(workDir, 0o700);
+/**
+ * The command itself, with its output and fetch injectable for tests. Exit codes: 0 passed,
+ * 1 failed checks, 2 refused or unable to run. Only codes, counts and hashes are written.
+ */
+export async function runCli(argv: string[], io: { fetch?: typeof fetch; log?: (text: string) => void; error?: (text: string) => void } = {}): Promise<number> {
+  const log = io.log ?? (text => console.log(text)), fail = io.error ?? (text => console.error(text));
   try {
-    const report = await restoreCheck({ checkpointId, source, expectedManifestSha256: expected, workDir });
-    if (keep) await writeFile(join(workDir, 'checkpoint.json'), JSON.stringify({ checkpoint_id: checkpointId, manifest_sha256: expected }), { mode: 0o600 });
-    console.log(JSON.stringify({ report, report_sha256: reportSha256(report), verify_request: verifyRequest(report) }, null, 2));
-    return report.result === 'passed' ? 0 : 1;
-  } finally { if (!keep) await rm(workDir, { recursive: true, force: true }); }
+    const options = parseArgs(argv), checkpointId = options.checkpoint;
+    let workDir: string, keep = false, source: BackupSource, expected: string;
+    if (options.dir) {
+      const saved = JSON.parse(await readFile(join(options.dir, 'checkpoint.json'), 'utf8')) as { checkpoint_id?: string; manifest_sha256?: string };
+      if (saved.checkpoint_id !== checkpointId || !HASH.test(saved.manifest_sha256 ?? '')) throw new RestoreError('invalid_local_backup');
+      source = dirSource(options.dir); expected = saved.manifest_sha256!;
+      workDir = await mkdtemp(join(tmpdir(), 'beacon-restore-'));
+    } else {
+      const remote = httpSource(workerUrl(options.url), await readReviewToken(options['review-token-file']), checkpointId, io.fetch);
+      source = remote; expected = await remote.manifestSha256();
+      if (options.out) {
+        let entries: string[] = [];
+        try { entries = await readdir(options.out); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+        if (entries.length) throw new RestoreError('out_not_empty');
+        await mkdir(options.out, { recursive: true, mode: 0o700 });
+        workDir = options.out; keep = true;
+      } else workDir = await mkdtemp(join(tmpdir(), 'beacon-restore-'));
+    }
+    await chmod(workDir, 0o700);
+    try {
+      const report = await restoreCheck({ checkpointId, source, expectedManifestSha256: expected, workDir });
+      if (keep) await writeFile(join(workDir, 'checkpoint.json'), JSON.stringify({ checkpoint_id: checkpointId, manifest_sha256: expected }), { mode: 0o600 });
+      log(JSON.stringify({ report, report_sha256: reportSha256(report), verify_request: verifyRequest(report) }, null, 2));
+      return report.result === 'passed' ? 0 : 1;
+    } finally { if (!keep) await rm(workDir, { recursive: true, force: true }); }
+  } catch (error) {
+    // Codes only: never echo arguments, paths or the token.
+    fail(JSON.stringify({ error: error instanceof RestoreError ? error.code : 'restore_check_failed' }));
+    return 2;
+  }
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
-  main(process.argv.slice(2)).then(code => { process.exitCode = code; }, error => {
-    // Codes only: never echo arguments, paths or the token.
-    console.error(JSON.stringify({ error: error instanceof RestoreError ? error.code : 'restore_check_failed' }));
-    process.exitCode = 2;
-  });
+  runCli(process.argv.slice(2)).then(code => { process.exitCode = code; });
 }
