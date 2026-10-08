@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { insertCandidate } from '../src/context';
 import { runMaintenance } from '../src/maintenance';
 import { PROCESSING_ALLOTMENT, processingMaintenance, processingWrite } from '../src/processing';
-import { planTick } from '../src/processing-planner';
+import { MAX_ATTEMPTS, planTick } from '../src/processing-planner';
+import { BACKOFF_MINUTES } from '../src/processing-runner';
 import { SelectionStage } from '../src/processing-stage';
 import { projectWrite } from '../src/project-workflows';
 import { Env } from '../src/types';
@@ -166,10 +167,14 @@ test('claim, backoff, max attempts, failed jobs blocking their scope, reviewer r
       assert.equal(current.next_attempt_at, at(elapsed + backoff).toISOString());
       elapsed += backoff;
     }
-    report = await tick(f.env, at(elapsed));
+    // The fourth failure ends the job: three retries (1, 5 and 30 minutes) and no fourth backoff.
+    assert.deepEqual([BACKOFF_MINUTES, MAX_ATTEMPTS], [[1, 5, 30], 4]);
+    report = await tick(f.env, at(elapsed + 3));
     assert.deepEqual(report.result!.run_outcomes, { failed: 1 });
     current = await job(f.env, current.id);
     assert.equal(current.status, 'failed'); assert.equal(current.attempts, 4); assert.equal(current.last_error, 'raw_unavailable');
+    // Nothing will retry it, so it keeps the time it was last due rather than showing a future attempt.
+    assert.equal(current.next_attempt_at, at(elapsed).toISOString());
     // A failed job keeps its scope blocked until a reviewer acts.
     assert.deepEqual((await tick(f.env, at(elapsed + 200))).result!.plan_outcomes, { live_job: 1 });
     const change = (id: string, action: string, body: unknown = {}) => processingWrite(post(`/api/processing/jobs/${id}/${action}`, body), f.env, reviewer);

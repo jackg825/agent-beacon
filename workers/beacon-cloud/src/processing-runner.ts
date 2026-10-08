@@ -14,7 +14,8 @@ import { Env, HttpError } from './types';
 export const LEASE_MIN_MS = 10 * 60_000;
 /** Largest external call timeout a job may make (the budget's timeout_ms cap), added to every lease. */
 export const EXTERNAL_TIMEOUT_MS = MAX_CALL_TIMEOUT_MS;
-export const BACKOFF_MINUTES = [1, 5, 30, 120];
+/** Wait before attempts 2, 3 and 4; the fourth failure (MAX_ATTEMPTS) leaves the job failed. */
+export const BACKOFF_MINUTES = [1, 5, 30];
 export const MAX_JOBS_PER_TICK = 2;
 /**
  * Platform calls a single job may need: claim, checks, versions, ≤20 verifications and
@@ -238,8 +239,10 @@ async function runClaimed(env: Env, ctx: MaintenanceContext, lease: Lease, optio
 
 async function fail(env: Env, lease: Lease, code: string, now: Date): Promise<JobOutcome> {
   const { job } = lease, last = job.attempts >= job.max_attempts;
-  const next = new Date(now.getTime() + BACKOFF_MINUTES[Math.min(job.attempts, BACKOFF_MINUTES.length) - 1] * 60_000).toISOString();
-  const result = await env.DB.prepare(`UPDATE processing_jobs SET status=?,next_attempt_at=?,last_error=?,lease_owner=NULL,lease_until=NULL,
+  // A failed job waits for a reviewer, so it keeps the time it was last due instead of a retry time.
+  const next = last ? null
+    : new Date(now.getTime() + BACKOFF_MINUTES[Math.min(job.attempts, BACKOFF_MINUTES.length) - 1] * 60_000).toISOString();
+  const result = await env.DB.prepare(`UPDATE processing_jobs SET status=?,next_attempt_at=COALESCE(?,next_attempt_at),last_error=?,lease_owner=NULL,lease_until=NULL,
     updated_at=? ${fenced}`).bind(last ? 'failed' : 'queued', next, code, now.toISOString(), job.id, lease.owner, job.attempts).run();
   return !result.meta.changes ? 'lease_lost' : last ? 'failed' : 'retry';
 }

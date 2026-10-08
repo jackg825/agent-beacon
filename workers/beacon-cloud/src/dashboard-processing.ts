@@ -21,7 +21,7 @@ const html = `<p class="notice">背景整理預設關閉。啟用後，排程只
 <form id="processing-run-form" class="section-gap"><label>立即整理的任務<select id="processing-task" aria-label="立即整理的任務"><option value="">不指定任務（整理上方選擇的專案）</option></select></label><button type="submit">立即排入整理</button></form>
 <p class="muted">立即整理只略過最少事件數與安靜時間；政策關閉的範圍仍會拒絕。實際執行在下一次排程。</p>
 </div></section>
-<section class="panel"><div class="panel-title"><h2>整理工作</h2><p class="muted">失敗會自動重試，最多 4 次；之後需要人工重試或放棄。</p></div><div class="panel-body">
+<section class="panel"><div class="panel-title"><h2>整理工作</h2><p class="muted">失敗會在 1、5、30 分鐘後自動重試，最多執行 4 次；之後需要人工重試或放棄。</p></div><div class="panel-body">
 <form id="processing-job-filter"><label>工作狀態<select id="processing-status" aria-label="工作狀態"><option value="">所有狀態</option><option value="queued">排隊中</option><option value="running">執行中</option><option value="succeeded">已產生候選</option><option value="skipped">已略過</option><option value="failed">失敗・待處理</option><option value="dismissed">已放棄</option></select></label><button type="submit">篩選工作</button></form>
 <div id="processing-jobs" class="list section-gap"></div><button type="button" id="processing-more" class="pagination" hidden>載入更多工作</button>
 <div id="processing-job-detail" class="section-gap"></div></div></section></div>
@@ -154,7 +154,8 @@ const script = String.raw`
     container.append(heading);
     const facts = text('ul', '', 'compact-list');
     facts.append(text('li', '來源 ' + job.source_count + ' 個；實際整理 ' + (job.event_count ?? '尚未執行') + ' 個；排除 ' + (job.excluded_count ?? 0) + ' 個；已涵蓋 ' + job.covered_count + ' 個'));
-    facts.append(text('li', '嘗試 ' + job.attempts + '／' + job.max_attempts + ' · 下次 ' + date(job.next_attempt_at)));
+    // Only a queued job has a next attempt; a failed one waits for a reviewer.
+    facts.append(text('li', '嘗試 ' + job.attempts + '／' + job.max_attempts + (job.status === 'queued' ? ' · 下次 ' + date(job.next_attempt_at) : '')));
     if (job.first_event_at) facts.append(text('li', '事件時間 ' + date(job.first_event_at) + ' – ' + date(job.last_event_at)));
     if (job.skip_reason) facts.append(text('li', '略過原因：' + processingCode(job.skip_reason)));
     if (job.last_error) facts.append(text('li', '最近錯誤：' + processingCode(job.last_error)));
