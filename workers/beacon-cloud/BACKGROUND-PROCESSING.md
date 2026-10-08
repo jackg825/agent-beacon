@@ -220,7 +220,7 @@ Jev 只是參考：呼叫失敗時工作照常用規則摘要完成，並在工�
 | `jev_previous_outcome_unknown`／`jev_previous_failed` | 同一份工作先前已呼叫過，重試時不再重送 |
 | `jev_budget:<代碼>` | 預約被拒絕：`budget_disabled`、`daily_call_limit`、`daily_token_limit`、`usd_ceiling`、`input_too_large`、`lease_lost` |
 | `jev_input_too_large` | 連一個事件都放不進輸入上限 |
-| `jev_no_time` | 本次排程剩餘時間不足一次呼叫 |
+| `jev_no_time` | 本次排程剩餘時間不足一次完整呼叫（`timeout_ms` 加 2 秒）；不預約、不送出，逾時也不會為了配合剩餘時間而縮短 |
 | `jev_skip_overridden` | 低於門檻，但有高訊號事件或矛盾訊號，照常產生候選 |
 
 ## 外部呼叫與預算
@@ -244,7 +244,7 @@ Jev 只是參考：呼叫失敗時工作照常用規則摘要完成，並在工�
 | `daily_usd_ceiling` | 每日供應商回報金額上限；`null` 代表不設定 | 0–10,000 或 `null` |
 | `max_input_chars` | 每次 request 的字元上限 | 1,000–200,000 |
 | `max_output_tokens` | 每次輸出 token 的預估值 | 1–8,192 |
-| `timeout_ms` | 每次呼叫的逾時 | 1,000–30,000 |
+| `timeout_ms` | 每次呼叫的逾時；排程剩餘時間（`MAINTENANCE_BUDGET_MS`，預設 25 秒）至少要再多 2 秒才會呼叫 | 1,000–30,000 |
 
 - **先預約再呼叫。** 每次呼叫前用一個 `INSERT … SELECT` 原子地確認：工作租約仍屬於這次執行、輸入未超過 `max_input_chars`、今日呼叫數低於上限、今日計入 token（有回報用回報值，否則用預估 `ceil(輸入字元/3)+max_output_tokens`）加上這次預估不超過上限、今日回報金額低於美元上限。D1 逐一執行這個陳述式，同時發生的預約不會一起超過上限（測試：上限 1、八個同時預約只成功一個）。
 - **每個預約都算數**，不論結果。逾時或連線中斷記成 `outcome_unknown`，不當成成功，也不表示供應商只收一次費用；本機防重只代表這裡不會重送。

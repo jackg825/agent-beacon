@@ -147,6 +147,8 @@ test('each gate condition alone keeps the stage from reserving budget or sending
     await expectBlocked('titles without a task title', attempt(gated(f.env), { policy: { external_fields: ['titles'] }, taskTitle: null }));
     await expectBlocked('note text without notes', attempt(gated(f.env), { policy: { external_fields: ['approved_note_text'] } }));
     await expectBlocked('no time left', attempt(gated(f.env), { remaining: 2500 }), 'jev_no_time');
+    // Time for a shortened call is not enough: the whole 5 s timeout plus 2 s must fit.
+    await expectBlocked('no time for the whole timeout', attempt(gated(f.env), { remaining: 6_999 }), 'jev_no_time');
     await expectBlocked('lease held elsewhere', attempt(gated(f.env), { owner: 'other-owner' }), 'jev_budget:lease_lost');
     for (const [name, limits, note] of [['zero calls', { daily_call_limit: 0 }, 'jev_budget:budget_disabled'],
       ['zero tokens', { daily_token_limit: 0 }, 'jev_budget:budget_disabled'], ['token limit below one call', { daily_token_limit: 100 }, 'jev_budget:daily_token_limit'],
@@ -154,9 +156,9 @@ test('each gate condition alone keeps the stage from reserving budget or sending
       await setBudget(f.env, { daily_call_limit: 50, ...limits });
       await expectBlocked(name, attempt(gated(f.env)), note);
     }
-    // With every condition met, exactly one request goes out; the job never sends a second.
+    // With every condition met, and just enough time, exactly one request goes out; the job never sends a second.
     await setBudget(f.env, { daily_call_limit: 50 });
-    assert.deepEqual(await attempt(gated(f.env)), { decision: 'continue', signals: [] });
+    assert.deepEqual(await attempt(gated(f.env), { remaining: 7_000 }), { decision: 'continue', signals: [] });
     assert.deepEqual(Object.keys(jev.calls[0].body.questions), ['task_related']);
     assert.deepEqual(await attempt(gated(f.env)), { decision: 'continue', signals: [] });
     assert.deepEqual([jev.calls.length, await count(f.env, 'processing_calls'), await count(f.env, 'processing_signals')], [1, 1, 1]);

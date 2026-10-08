@@ -187,8 +187,10 @@ export const jevStage: SelectionStage = async (input) => {
   if (prior.length) return proceed(prior.some((call) => call.status === 'failed') ? 'jev_previous_failed' : 'jev_previous_outcome_unknown');
   const budget = await readBudget(env);
   if (!budget || !budget.daily_call_limit || !budget.daily_token_limit) return proceed('jev_budget:budget_disabled');
-  const timeoutMs = Math.min(budget.timeout_ms, ctx.remaining() - 2_000);
-  if (timeoutMs < 1_000) return proceed('jev_no_time');
+  // The whole configured timeout, plus 2 s to record the outcome, must fit in what is
+  // left of this invocation. It is never shortened to fit: a cut-short call would use
+  // the job's only evaluation and its budget on an answer that cannot arrive in time.
+  if (ctx.remaining() - 2_000 < budget.timeout_ms) return proceed('jev_no_time');
 
   const rows = notesAllowed ? await currentNotes(env, input) : [];
   // Values assigned to secret keys anywhere in the request, collected from the stored
@@ -216,7 +218,7 @@ export const jevStage: SelectionStage = async (input) => {
   const asked = Object.keys(fit.request.questions);
   const result = await externalFetch(ctx.fetch, config.endpoint, { method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'application/json', Authorization: 'Bearer ' + env.JEV_API_KEY }, body: fit.body },
-    { timeoutMs, maxBytes: MAX_JEV_RESPONSE_BYTES });
+    { timeoutMs: budget.timeout_ms, maxBytes: MAX_JEV_RESPONSE_BYTES });
   const finished = ctx.now.toISOString();
   let outcome: CallOutcome, signals: StageSignal[] = [], note: string | undefined;
   if (!result.ok) {
