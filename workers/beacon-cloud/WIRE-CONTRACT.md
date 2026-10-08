@@ -112,6 +112,49 @@ repository attribution is not a Git ownership proof. SSH URLs in configuration
 must use `git` as the username, and HTTPS URLs must have no credentials, query
 or fragment. Never embed tokens in a repository URL.
 
+## Device sync read contract (0.4)
+
+This is a Worker-defined contract, not an upstream Beacon one: upstream has no
+equivalent, and only `forwarder/sync.mjs` consumes it. It is the one capability a
+device key has beyond ingest, and it is read-only. Every request uses the same
+bearer device key as ingest and is `GET`; another method answers `405`, an unknown
+`/v1/sync/` path `404`, and a missing or revoked key `401`. Read, MCP and review
+credentials cannot use these paths, and a device key cannot use `/api/*`.
+
+`GET /v1/sync/subscriptions` takes no query (any parameter answers `400`) and
+returns `{"device_id": ..., "subscriptions": [...]}`: only this device's active
+grants, at most 100, ordered by creation time then ID, each
+`{id, project_id, kinds, include_shared, created_at}`. `kinds` is a non-empty subset
+of `["memory","summary"]` in that order.
+
+`GET /v1/sync/snapshot?project_id=<64 lowercase hex>` accepts only `project_id`;
+`kind` or any other parameter answers `400`, because the subscription alone decides
+the kinds and whether shared memories are included. No active grant for this device
+and project, a grant belonging to another device, a revoked grant and a project that
+does not exist all answer the **same** `403` body. A snapshot above 500 entries or
+2 MiB of UTF-8 title plus content answers `413` before any content is read; it is
+never truncated. A successful response is
+`{"snapshot": {schema, project_id, kinds, include_shared, entry_count, content_bytes, reviewed_through, snapshot_sha256, entries, subscription_id}}`:
+
+| Field | Meaning |
+| --- | --- |
+| `schema` | `beacon.context.snapshot.v1` |
+| `entries` | The project's approved, authoritative notes of the granted kinds (the same set default recall returns), decided at read time, ordered by `kind`, creation time, then `id`. Each is `{id, kind, title, content, content_sha256, task_id, supersedes_id, reviewed_at, valid_from}`, with `valid_from` equal to `reviewed_at` |
+| Shared entries | Only when the grant has `include_shared`: memories a reviewer shared to this project from another one, while the share is active and the note is still approved with valid sources. They carry two extra fields, `shared_from_project_id` (never this project) and `share_id`; own entries never carry them, and summaries are never shared |
+| `content_sha256` | Lowercase hex SHA-256 of the entry's `content` as UTF-8 |
+| `snapshot_sha256` | Lowercase hex SHA-256 of the UTF-8 sorted-key JSON (the same `stableJSON` used for batch IDs: object keys sorted, arrays in order, scalars as `JSON.stringify`) of `{schema, project_id, kinds, entries}` |
+| `reviewed_through` | The newest `reviewed_at` among the entries, or `null` |
+
+`include_shared`, `entry_count`, `content_bytes`, `reviewed_through` and
+`subscription_id` are outside the hash. Because own entries keep exactly this shape,
+a snapshot with no shared entry hashes the same whether or not the grant includes
+shared memories. A new pending candidate leaves the hash unchanged; an approval, a
+supersession, a source-scope change and, under an `include_shared` grant, a new or
+revoked share alter it. The sync tool
+recomputes every `content_sha256` and the `snapshot_sha256`, rejects a shared marker
+that is malformed, names this project or sits on a summary, and refuses redirects.
+Reviewers create and revoke grants through `/api/sync/*`; see [MAC-SYNC.md](MAC-SYNC.md).
+
 ## Boundaries
 
 The adapter is an explicitly started process alongside the existing collector.
@@ -120,8 +163,10 @@ listener or local dashboard behavior is changed. It forwards content already
 retained by Beacon; it does not implement a new redaction or metadata-only
 policy. Review collection policy before pointing it at real logs.
 
-Central context is a separate workflow: the 0.2 feature branch adds manually
-authored candidates, exact event-version sources and explicit reviewer approval.
-See [CONTEXT-WORKFLOWS.md](CONTEXT-WORKFLOWS.md). Raw JSONL ingestion does not
-generate or approve a candidate. AI generation, file publication and
-machine-to-machine memory synchronization remain unimplemented.
+Central context is a separate workflow: manually authored or rule-generated
+candidates, exact event-version sources and explicit reviewer approval. See
+[CONTEXT-WORKFLOWS.md](CONTEXT-WORKFLOWS.md). Raw JSONL ingestion does not
+generate or approve a candidate. AI generation and automatic publication remain
+unimplemented; the only machine-bound copy of approved notes is the explicit,
+user-run sync above, which writes a Beacon-owned `.beacon.md` file and never an
+agent instruction file or collector setting.
