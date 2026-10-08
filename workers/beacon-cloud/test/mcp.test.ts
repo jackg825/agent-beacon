@@ -27,7 +27,7 @@ test('official current MCP client discovers and lists only read-only tools', asy
       'beacon_get_timeline', 'beacon_list_devices', 'beacon_list_projects', 'beacon_list_sessions',
       'beacon_list_project_groups', 'beacon_get_project_group', 'beacon_list_project_relations',
       'beacon_list_tasks', 'beacon_get_task', 'beacon_list_context', 'beacon_get_context',
-      'beacon_get_event', 'beacon_list_event_versions',
+      'beacon_get_event', 'beacon_list_event_versions', 'beacon_get_data_health',
     ].sort());
     for (const tool of tools) {
       assert.equal(tool.annotations?.readOnlyHint, true);
@@ -44,7 +44,7 @@ test('official legacy MCP client can initialize and list the same tools', async 
   try {
     await client.connect(transport);
     assert.equal(client.getProtocolEra(), 'legacy');
-    assert.equal((await client.listTools()).tools.length, 13);
+    assert.equal((await client.listTools()).tools.length, 14);
   } finally { await client.close(); }
 });
 
