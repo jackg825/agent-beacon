@@ -402,25 +402,35 @@ const validVersion = (item) => isObject(item) && typeof item.id === 'string' && 
   (item.sha256 === null || (typeof item.sha256 === 'string' && hashPattern.test(item.sha256)));
 /**
  * Per-target history. A write is announced as `pending` before the destination is
- * touched; the next run keeps it only if the file now holds exactly those bytes, so
- * an interrupted apply or rollback never leaves the history stuck or wrong.
+ * touched, together with the version it replaces (`pending.previous`); the next run
+ * records both only if the file now holds exactly the announced bytes, so an
+ * interrupted apply or rollback never leaves the history stuck or wrong.
  */
 async function readManifest(config, target, destination) {
   const manifest = await readStateJSON(manifestPath(config, target, destination.path));
   if (!manifest) return { version: 1, project_id: target.project_id, destination: destination.path, last_applied_sha256: undefined, versions: [] };
   if (!isObject(manifest) || manifest.version !== 1 || manifest.project_id !== target.project_id || manifest.destination !== destination.path ||
     !Array.isArray(manifest.versions) || !manifest.versions.every(validVersion) ||
-    (manifest.pending !== undefined && !validVersion(manifest.pending))) throw fail('CORRUPT_STATE');
+    (manifest.pending !== undefined && (!validVersion(manifest.pending) ||
+      (manifest.pending.previous !== undefined && !validVersion(manifest.pending.previous))))) throw fail('CORRUPT_STATE');
   if (manifest.pending) {
     if (manifest.pending.sha256 === destination.sha256) settle(manifest);
-    delete manifest.pending;
+    else {
+      // Written before `previous` travelled inside `pending`: drop the replaced-version
+      // record that an unfinished apply announced, so it never becomes a rollback target.
+      const last = manifest.versions.at(-1);
+      if (manifest.pending.plan_id && last?.reason === 'previous' && last.plan_id === manifest.pending.plan_id) manifest.versions.pop();
+      delete manifest.pending;
+    }
     await saveManifest(config, target, manifest);
   }
   return manifest;
 }
 function settle(manifest) {
-  manifest.versions.push(manifest.pending);
-  manifest.last_applied_sha256 = manifest.pending.sha256;
+  const { previous, ...written } = manifest.pending;
+  if (previous) manifest.versions.push(previous);
+  manifest.versions.push(written);
+  manifest.last_applied_sha256 = written.sha256;
   delete manifest.pending;
 }
 async function saveManifest(config, target, manifest) {
@@ -492,12 +502,12 @@ export async function apply(configOrPath, planId, options = {}) {
     if (snapshot.snapshot_sha256 !== plan.snapshot_sha256 || stableJSON(snapshot.kinds) !== stableJSON(plan.kinds)) throw fail('STALE_PLAN');
     if (!renderSnapshot(snapshot).equals(rendered)) throw fail('RENDER_MISMATCH');
     if (destination.sha256 !== plan.destination_sha256_before) throw fail('DESTINATION_CHANGED');
-    // Keep what is about to be replaced, and announce the write, before the destination is touched.
+    // Keep what is about to be replaced, and announce the write together with it, before
+    // the destination is touched; both enter the history only once the write has happened.
     const manifest = await readManifest(config, target, destination);
     const previous = versionEntry('previous', destination.bytes ? await storeObject(config, destination.bytes) : null, { plan_id: planId });
     const applied = versionEntry('applied', await storeObject(config, rendered), { plan_id: planId, snapshot_sha256: plan.snapshot_sha256 });
-    manifest.versions.push(previous);
-    manifest.pending = applied;
+    manifest.pending = { ...applied, previous };
     await saveManifest(config, target, manifest);
     await atomicWrite(destination.path, rendered, plan.destination_sha256_before);
     settle(manifest);

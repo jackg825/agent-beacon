@@ -193,24 +193,47 @@ test('an interrupted apply or rollback is reconciled from what the destination a
   const rendered = await read(join(f.config.state_dir, 'plans', `${plan.plan_id}.md`));
   const [manifestName] = await fs.readdir(join(f.config.state_dir, 'targets'));
   const manifestPath = join(f.config.state_dir, 'targets', manifestName);
-  const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
-  const announced = { id: 'e'.repeat(32), reason: 'applied', sha256: hash(rendered), recorded_at: '2026-10-08T00:00:00.000Z', plan_id: plan.plan_id };
-  // Interrupted before the rename: the announced write never happened and is dropped.
-  await fs.writeFile(manifestPath, JSON.stringify({ ...manifest, pending: announced }));
-  let history = await versions(f.config, '0');
-  assert.equal(history.last_applied_sha256, hash(v1));
-  assert.ok(!history.versions.some((version) => version.id === announced.id));
-  // Interrupted after the rename: the file holds the announced bytes, so the write is kept.
-  await fs.writeFile(manifestPath, JSON.stringify({ ...manifest, pending: announced }));
-  await fs.writeFile(f.destination, rendered);
-  history = await versions(f.config, '0');
-  assert.equal(history.last_applied_sha256, hash(rendered));
-  assert.equal(history.versions.at(-1).id, announced.id);
-  assert.equal((await status(f.config)).targets[0].matches_last_apply, true);
-  await rollback(f.config, '0', { version: first.applied_version_id });
+  const settled = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  // A real apply that fails after it announced the write: the folder refuses the temp file.
+  await fs.chmod(join(f.syncRoot, 'alpha'), 0o555);
+  try { await assert.rejects(apply(f.config, plan.plan_id), { code: 'EACCES' }); }
+  finally { await fs.chmod(join(f.syncRoot, 'alpha'), 0o755); }
   assert.ok((await read(f.destination)).equals(v1));
+  const crashed = await fs.readFile(manifestPath, 'utf8'), announced = JSON.parse(crashed);
+  assert.deepEqual(announced.versions, settled.versions, 'nothing enters the history before the write happens');
+  assert.equal(announced.pending.plan_id, plan.plan_id);
+  assert.equal(announced.pending.previous.sha256, hash(v1));
+  // Interrupted after the rename (the same announced state, but the file holds the new bytes):
+  // the write and the version it replaced are both recorded.
+  await fs.writeFile(f.destination, rendered);
+  let history = await versions(f.config, '0');
+  assert.equal(history.last_applied_sha256, hash(rendered));
+  assert.deepEqual(history.versions.map((version) => version.reason), ['previous', 'applied', 'previous', 'applied']);
+  assert.equal(history.versions[2].sha256, hash(v1));
+  assert.equal((await status(f.config)).targets[0].matches_last_apply, true);
+  assert.ok((await rollback(f.config, '0')).changed);
+  assert.ok((await read(f.destination)).equals(v1), 'the default rollback restores the version the apply replaced');
+  // Interrupted before the rename: the next command drops the unwritten version and the
+  // version it would have replaced, so the default rollback still restores what existed
+  // before the last real apply (no file at all).
+  await fs.writeFile(manifestPath, crashed, { mode: 0o600 });
+  history = await versions(f.config, '0');
+  assert.equal(history.last_applied_sha256, hash(v1));
+  assert.deepEqual(history.versions.map((version) => version.reason), ['previous', 'applied']);
+  const undone = await rollback(f.config, '0');
+  assert.deepEqual([undone.changed, undone.deleted, undone.restored_version_id], [true, true, first.previous_version_id]);
+  assert.equal(await exists(f.destination), false);
+  await rollback(f.config, '0', { version: first.applied_version_id });
+  // A history written before `previous` travelled inside `pending` is repaired the same way.
+  const current = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  const legacy = { ...current, versions: [...current.versions, { id: 'd'.repeat(32), reason: 'previous', sha256: hash(v1), recorded_at: '2026-10-08T00:00:00.000Z',
+    plan_id: plan.plan_id }], pending: { id: 'e'.repeat(32), reason: 'applied', sha256: hash(rendered), recorded_at: '2026-10-08T00:00:00.000Z', plan_id: plan.plan_id } };
+  await fs.writeFile(manifestPath, JSON.stringify(legacy));
+  assert.deepEqual((await versions(f.config, '0')).versions.map((version) => version.id), current.versions.map((version) => version.id));
   // A malformed announcement is refused rather than trusted.
-  await fs.writeFile(manifestPath, JSON.stringify({ ...JSON.parse(await fs.readFile(manifestPath, 'utf8')), pending: { id: '../x', sha256: null } }));
+  await fs.writeFile(manifestPath, JSON.stringify({ ...current, pending: { id: '../x', sha256: null } }));
+  await assert.rejects(versions(f.config, '0'), { message: 'CORRUPT_STATE' });
+  await fs.writeFile(manifestPath, JSON.stringify({ ...current, pending: { ...legacy.pending, previous: { id: 'x', sha256: null } } }));
   await assert.rejects(versions(f.config, '0'), { message: 'CORRUPT_STATE' });
 });
 
