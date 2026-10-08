@@ -10,6 +10,12 @@ No forwarding is started by installing this package or running its tests.
 Production deployment and changing real local forwarding settings remain
 separate steps requiring authorization.
 
+`sync.mjs` in this directory is a separate, optional tool that goes the other way:
+it reads the approved notes a reviewer granted this device and writes them, only
+after an explicit preview and apply, to a Beacon-owned `.beacon.md` file. It has its
+own configuration and state and never changes the forwarder; see
+[MAC-SYNC.md](../MAC-SYNC.md).
+
 ## Configure outside the checkout
 
 1. Copy `config.example.json` to a private configuration directory outside the
