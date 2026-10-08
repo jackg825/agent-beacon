@@ -2,14 +2,20 @@
 // The hourly `health` task (opt-in via MAINTENANCE_TASKS) keeps a rolling R2/D1 list-diff
 // in health_state; everything else is computed on request from O(1) or bounded queries,
 // and every table added by another track is looked up in sqlite_master first.
-import type { Allotment, MaintenanceTask } from './maintenance';
+import type { Allotment, MaintenanceContext, MaintenanceTask } from './maintenance';
 import { MaintenanceError } from './maintenance-error';
 import { Env, HttpError, json } from './types';
-import { backupIntervalHours, backupMaxAgeDays, iso, quoted, scheduledTask, tableSet, userTables } from './operations-shared';
+import { backupIntervalHours, backupMaxAgeDays, iso, quoted, room, scheduledTask, tableSet, userTables } from './operations-shared';
 
-export const HEALTH_ALLOTMENT: Allotment = { d1: 20, r2: 2, fetch: 0 };
-export interface HealthLimits { listPage: number; orphanGraceMs: number }
-export const HEALTH_LIMITS: HealthLimits = { listPage: 1000, orphanGraceMs: 3600_000 };
+export const HEALTH_ALLOTMENT: Allotment = { d1: 60, r2: 50, fetch: 0 };
+export interface HealthLimits {
+  listPage: number;
+  /** List pages (each one R2 list and one D1 range read) one tick may diff before it saves its position. */
+  maxPages: number;
+  /** Ingest writes R2 before its D1 commit: younger unindexed objects, and younger indexed rows the listing missed, are in flight. */
+  orphanGraceMs: number;
+}
+export const HEALTH_LIMITS: HealthLimits = { listPage: 1000, maxPages: 50, orphanGraceMs: 3600_000 };
 const HOUR = 3600_000, DAY = 24 * HOUR, SAMPLE = 20;
 export const STALE_DEVICE_HOURS = 48, BACKLOG_SECONDS = 3600, CONTEXT_AGING_DAYS = 30;
 
@@ -21,10 +27,12 @@ const tally = (): Tally => ({ count: 0, sample: [] });
 function add(target: Tally, id: string) { target.count++; if (target.sample.length < SAMPLE) target.sample.push(id); }
 
 /**
- * One list-diff tick: list ≤ listPage keys under batches/ from the stored position and read
- * the same key range from the batches.r2_key index, then diff both ways.
+ * One list-diff tick: up to maxPages times, list <= listPage keys under batches/ from the stored
+ * position and read the same key range from the batches.r2_key index, then diff both ways.
+ * The position and the running totals are saved once, by compare-and-swap, at the end.
  */
-async function listDiff(env: Env, now: Date, limits: HealthLimits): Promise<Record<string, unknown>> {
+async function listDiff(env: Env, ctx: MaintenanceContext, limits: HealthLimits): Promise<Record<string, unknown>> {
+  const now = ctx.now;
   let state: { revision: number; scan: string | null; last_pass: string | null } | null;
   try { state = await env.DB.prepare('SELECT revision,scan,last_pass FROM health_state WHERE id=1').first(); }
   catch (error) {
@@ -35,37 +43,45 @@ async function listDiff(env: Env, now: Date, limits: HealthLimits): Promise<Reco
   if (!state) throw new MaintenanceError('health_schema_missing');
   const scan: Scan = state.scan ? JSON.parse(state.scan) : { started_at: iso(now), start_after: null, ticks: 0, listed: 0, bytes: 0, batches: 0,
     missing: tally(), orphans: tally() };
-  const listing = await env.RAW.list({ prefix: 'batches/', limit: limits.listPage, ...(scan.start_after ? { startAfter: scan.start_after } : {}) });
-  let objects = listing.objects, truncated = listing.truncated && objects.length > 0;
-  // '0' sorts right after '/', so this bound covers every key under the prefix.
-  let upper = truncated ? objects.at(-1)!.key : 'batches0';
-  const rows = await env.DB.prepare('SELECT id,r2_key FROM batches WHERE r2_key>? AND r2_key<=? ORDER BY r2_key LIMIT ?')
-    .bind(scan.start_after ?? 'batches/', upper, limits.listPage + 1).all<{ id: string; r2_key: string }>();
-  let indexed = rows.results;
-  if (indexed.length > limits.listPage) {
-    // More index rows than one page: stop this tick at the last row read so both sides stay bounded.
-    indexed = indexed.slice(0, limits.listPage); upper = indexed.at(-1)!.r2_key; truncated = true;
-    objects = objects.filter(object => object.key <= upper);
+  const young = now.getTime() - limits.orphanGraceMs;
+  let pages = 0, listedTick = 0, indexedTick = 0, done = false;
+  // Keep one D1 call for the final compare-and-swap.
+  while (!done && pages < limits.maxPages && (pages === 0 || room(ctx, HEALTH_ALLOTMENT, { d1: 2, r2: 1 }))) {
+    const listing = await env.RAW.list({ prefix: 'batches/', limit: limits.listPage, ...(scan.start_after ? { startAfter: scan.start_after } : {}) });
+    let objects = listing.objects, truncated = listing.truncated && objects.length > 0;
+    // '0' sorts right after '/', so this bound covers every key under the prefix.
+    let upper = truncated ? objects.at(-1)!.key : 'batches0';
+    const rows = await env.DB.prepare('SELECT id,r2_key,received_at FROM batches WHERE r2_key>? AND r2_key<=? ORDER BY r2_key LIMIT ?')
+      .bind(scan.start_after ?? 'batches/', upper, limits.listPage + 1).all<{ id: string; r2_key: string; received_at: string }>();
+    let indexed = rows.results;
+    if (indexed.length > limits.listPage) {
+      // More index rows than one page: stop this page at the last row read so both sides stay bounded.
+      indexed = indexed.slice(0, limits.listPage); upper = indexed.at(-1)!.r2_key; truncated = true;
+      objects = objects.filter(object => object.key <= upper);
+    }
+    const listed = new Set(objects.map(object => object.key)), keys = new Set(indexed.map(row => row.r2_key));
+    // The index is read after the listing: a batch whose object was written after the listing and
+    // whose row committed before the index read is in flight, not missing.
+    for (const row of indexed) if (!listed.has(row.r2_key) && Date.parse(row.received_at) <= young) add(scan.missing, row.id);
+    for (const object of objects) if (!keys.has(object.key) && object.uploaded.getTime() <= young) add(scan.orphans, object.key);
+    scan.listed += objects.length; scan.batches += indexed.length;
+    scan.bytes += objects.reduce((sum, object) => sum + object.size, 0);
+    scan.start_after = upper;
+    listedTick += objects.length; indexedTick += indexed.length; pages++;
+    done = !truncated;
   }
-  const listed = new Set(objects.map(object => object.key)), keys = new Set(indexed.map(row => row.r2_key));
-  for (const row of indexed) if (!listed.has(row.r2_key)) add(scan.missing, row.id);
-  // Ingest writes R2 before its D1 commit, so young unindexed objects are usually in flight.
-  for (const object of objects) if (!keys.has(object.key) && now.getTime() - object.uploaded.getTime() > limits.orphanGraceMs) add(scan.orphans, object.key);
-  scan.ticks++; scan.listed += objects.length; scan.batches += indexed.length;
-  scan.bytes += objects.reduce((sum, object) => sum + object.size, 0);
-  scan.start_after = upper;
-  const done = !truncated;
+  scan.ticks++;
   const pass: Pass | null = done ? { ...scan, start_after: null, completed_at: iso(now) } : null;
   const update = await env.DB.prepare('UPDATE health_state SET scan=?,last_pass=COALESCE(?,last_pass),revision=revision+1,updated_at=? WHERE id=1 AND revision=?')
     .bind(done ? null : JSON.stringify(scan), pass ? JSON.stringify(pass) : null, iso(now), state.revision).run();
   // Overlapping invocations: the loser's tick is discarded rather than double counted.
   if (!update.meta.changes) return { conflict: true };
-  return { listed: objects.length, indexed: indexed.length, pass_completed: done, missing: scan.missing.count, orphans: scan.orphans.count };
+  return { pages, listed: listedTick, indexed: indexedTick, pass_completed: done, missing: scan.missing.count, orphans: scan.orphans.count };
 }
 
 export function createHealthTask(overrides: Partial<HealthLimits> = {}): MaintenanceTask {
   const limits = { ...HEALTH_LIMITS, ...overrides };
-  return { name: 'health', schedule: 'hourly', allotment: HEALTH_ALLOTMENT, run: (env, ctx) => listDiff(env, ctx.now, limits) };
+  return { name: 'health', schedule: 'hourly', allotment: HEALTH_ALLOTMENT, run: (env, ctx) => listDiff(env, ctx, limits) };
 }
 export const healthTask = createHealthTask();
 

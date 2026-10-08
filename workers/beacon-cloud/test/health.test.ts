@@ -22,14 +22,14 @@ import { job, setPolicy as setProcessingPolicy, staged, workspace } from './proc
 const HOUR = 3600_000, DAY = 24 * HOUR;
 const codes = (health: Awaited<ReturnType<typeof dataHealth>>) => health.findings.map(finding => finding.code);
 const finding = (health: Awaited<ReturnType<typeof dataHealth>>, code: string) => health.findings.find(item => item.code === code);
-async function healthTick(env: Env, now: Date, listPage = 1000) {
-  const report = await runMaintenance({ ...env, MAINTENANCE_TASKS: 'health' } as Env, { now, tasks: [createHealthTask({ listPage })] });
+async function healthTick(env: Env, now: Date, listPage = 1000, maxPages = 1) {
+  const report = await runMaintenance({ ...env, MAINTENANCE_TASKS: 'health' } as Env, { now, tasks: [createHealthTask({ listPage, maxPages })] });
   for (const kind of ['d1', 'r2', 'fetch'] as const) assert.ok(report.health.usage[kind] <= HEALTH_ALLOTMENT[kind]);
   return report.health;
 }
-async function pass(env: Env, now: Date, listPage = 1000) {
+async function pass(env: Env, now: Date, listPage = 1000, maxPages = 1) {
   for (let ticks = 1; ticks <= 50; ticks++) {
-    const tick = await healthTick(env, now, listPage);
+    const tick = await healthTick(env, now, listPage, maxPages);
     assert.equal(tick.ok, true, JSON.stringify(tick));
     if ((tick.result as any).pass_completed) return { ticks, state: JSON.parse((await env.DB.prepare('SELECT last_pass FROM health_state WHERE id=1').first<any>()).last_pass) };
   }
@@ -66,11 +66,10 @@ test('the list-diff finds missing raw objects and orphans across bounded ticks',
     const strays = ['batches/aaa/runtime/' + '0'.repeat(64) + '.ndjson', 'batches/zzz/runtime/' + 'f'.repeat(64) + '.ndjson'];
     for (const key of strays) await env.RAW.put(key, 'synthetic stray');
     await env.RAW.put('elsewhere/not-a-batch', 'synthetic');
-    await t.test('young unindexed objects are in flight, not orphans', async () => {
+    await t.test('young unindexed objects and young index rows are in flight, not orphans or missing', async () => {
       const { ticks, state } = await pass(env, new Date(), 2);
       assert.ok(ticks >= 3);
-      assert.deepEqual([state.listed, state.batches, state.missing.count, state.orphans.count], [6, 5, 1, 0]);
-      assert.deepEqual(state.missing.sample, [batches[2].id]);
+      assert.deepEqual([state.listed, state.batches, state.missing.count, state.orphans.count], [6, 5, 0, 0]);
     });
     await t.test('after the grace window both directions are reported with identifiers only', async () => {
       const now = later(120);
@@ -84,12 +83,41 @@ test('the list-diff finds missing raw objects and orphans across bounded ticks',
       assert.equal(health.capacity.raw_bytes, state.bytes);
       assert.ok(!codes(health).includes('raw_scan_stale'));
     });
-    await t.test('when R2 is empty the index side stays bounded per tick', async () => {
+    await t.test('one tick diffs as many pages as its allotment allows', async () => {
+      const { ticks, state } = await pass(env, later(120), 2, 50);
+      assert.equal(ticks, 1);
+      assert.deepEqual([state.listed, state.batches, state.missing.count, state.orphans.count], [6, 5, 1, 2]);
+      assert.ok(state.ticks === 1);
+    });
+    await t.test('when R2 is empty the index side stays bounded per page', async () => {
       for (const batch of batches) await env.RAW.delete(batch.r2_key);
-      const { ticks, state } = await pass(env, new Date(), 2);
+      const { ticks, state } = await pass(env, later(120), 2);
       assert.equal(state.missing.count, 5);
       assert.ok(ticks >= 3, 'two index rows per tick');
     });
+  } finally { await fixture.close(); }
+});
+
+test('a batch uploaded between the R2 listing and the index read is in flight, not missing', async () => {
+  const fixture = await createEnvFixture();
+  try {
+    const env = fixture.env;
+    await fixture.ingest([syntheticEvent('settled-1')]);
+    let uploaded = false;
+    // A device's ingest writes R2 and commits D1 after the listing snapshot but before the range read.
+    const racing = { ...env, RAW: new Proxy(env.RAW, { get(target, property) {
+      const value = Reflect.get(target, property, target);
+      if (property !== 'list') return typeof value === 'function' ? value.bind(target) : value;
+      return async (...args: unknown[]) => {
+        const listing = await (value as (...values: unknown[]) => Promise<unknown>).apply(target, args);
+        if (!uploaded) { uploaded = true; await fixture.ingest([syntheticEvent('racing-1', { session: 'racing' })]); }
+        return listing;
+      };
+    } }) } as Env;
+    const tick = await healthTick(racing, new Date());
+    assert.ok(uploaded);
+    assert.deepEqual([(tick.result as any).pass_completed, (tick.result as any).indexed, (tick.result as any).missing], [true, 2, 0]);
+    assert.equal(finding(await dataHealth(env), 'raw_missing'), undefined);
   } finally { await fixture.close(); }
 });
 
