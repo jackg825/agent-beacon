@@ -1,8 +1,8 @@
 # 專案關聯、交接筆記與 memory 審閱
 
-這一階段讓兩台 Mac 的活動可以被人工串成任務，並保存有來源的交接摘要與 memory。審閱流程一律由人決定：候選可以是手動撰寫，也可以是可選背景整理產生的「自動整理・待審」摘要（見 [BACKGROUND-PROCESSING.md](BACKGROUND-PROCESSING.md)，預設關閉）。沒有模型生成、檔案發布或跨 Mac memory 同步；可選的 Jev 只留下未校準訊號，不能審閱。
+這一階段讓兩台 Mac 的活動可以被人工串成任務，並保存有來源的交接摘要與 memory。審閱流程一律由人決定：候選可以是手動撰寫，也可以是可選背景整理產生的「自動整理・待審」摘要（見 [BACKGROUND-PROCESSING.md](BACKGROUND-PROCESSING.md)，預設關閉）。沒有模型生成，也沒有自動發布；已核准筆記只會在審閱者替某台裝置新增同步訂閱、使用者在那台 Mac 上預覽並套用後，寫成同步資料夾內由 Beacon 管理的 `.beacon.md` 副本（見 [MAC-SYNC.md](MAC-SYNC.md)）。可選的 Jev 只留下未校準訊號與待確認標記，不能審閱。
 
-新增功能的本機合成驗證與整體檢查結果見 [VALIDATION.md](VALIDATION.md)（0.2 手動流程與 0.3 背景整理都只在本機驗證）。先前 [TEST-DEPLOYMENT.md](TEST-DEPLOYMENT.md) 記錄的是基礎 ingest／dashboard／MCP 的雲端驗收，不能當成這一階段已部署或真實兩台 Mac 已接上的證據。
+新增功能的本機合成驗證與整體檢查結果見 [VALIDATION.md](VALIDATION.md)（0.2 手動流程、0.3 背景整理與 0.4 的修訂、標記、共享、Mac 同步與資料維護都只在本機驗證）。先前 [TEST-DEPLOYMENT.md](TEST-DEPLOYMENT.md) 記錄的是基礎 ingest／dashboard／MCP 的雲端驗收，不能當成這一階段已部署或真實兩台 Mac 已接上的證據。
 
 ## 日常使用方式
 
@@ -27,7 +27,7 @@
 
 ## 一份筆記的範圍與生命週期
 
-`summary` 是交接摘要；`memory` 是供後續查詢採用的知識筆記。兩者都儲存在中央 D1，原始事件仍在 R2。核准 memory **不會**自動寫入任何 Mac 的 `AGENTS.md`、skills 或其他記憶檔案。
+`summary` 是交接摘要；`memory` 是供後續查詢採用的知識筆記。兩者都儲存在中央 D1，原始事件仍在 R2。核准 memory **不會**自動寫入任何 Mac 的 `AGENTS.md`、skills 或其他記憶檔案；明確的 Mac 同步只寫 `sync_root` 底下的 `.beacon.md` 副本，要不要讓 agent 讀它由使用者決定。
 
 一份候選只屬於一個專案，可以另外指定 task。所有來源都必須屬於該專案；若指定 task，來源事件所在的 session 也必須已連結到該 task。Task 可以跨專案，但跨專案交接應各寫一份專案筆記，再用同一 task 串起來。
 
@@ -260,7 +260,7 @@ npx wrangler d1 execute agent-beacon-restore-check-local --local --persist-to .l
 
 核對還原後的 tables、constraints、trigger、資料計數及既有索引查詢；若 trigger／schema 不完整，先修復備份流程，不能繼續升級。這個本機 drill 不證明 R2 已還原，也不代表雲端 Time Travel 已演練成功。
 
-確認備份可用後，在隔離 TEST 套用 migration `0002_project_workflows.sql`、`0003_context_reviews.sql` 和 `0004_processing.sql`，再部署新程式並透過互動提示設定獨立審閱 secret。Migration 一定要先於程式：0.3 的筆記查詢會讀 `context_generation`，程式先上會讓筆記查詢回傳 `503`（ingest 不受影響）：
+確認備份可用後，在隔離 TEST 依序套用尚未套用的 migration：`0002_project_workflows.sql`、`0003_context_reviews.sql`、`0004_processing.sql`，以及 0.4 的 `0005_device_sync.sql`–`0010_context_supersedes_partial_index.sql`（`wrangler d1 migrations apply` 會依檔名順序執行），再部署新程式並透過互動提示設定獨立審閱 secret。Migration 一定要先於程式：0.3 的筆記查詢會讀 `context_generation`，0.4 的筆記查詢會讀 `context_flags`，程式先上會讓筆記查詢回傳 `503`（ingest 不受影響）：
 
 ```sh
 npx wrangler d1 migrations apply agent-beacon-cloud-test-db --remote --config .local/wrangler.test.jsonc
@@ -272,13 +272,15 @@ Secrets 不寫到命令參數或 `vars`。沒有 REVIEW_TOKEN 時新增／審閱
 
 部署 0.3 後背景整理仍然關閉：沒有 `MAINTENANCE_TASKS=processing` 時排程不做任何查詢，沒有工作區政策時不規劃任何工作。要開啟時依 [DEPLOYMENT.md](DEPLOYMENT.md#background-processing-opt-in-03) 逐步進行：Workers Paid 是前提；先用合成資料設定工作區與專案政策並審閱第一份自動整理；Jev 只用於受控的合成測試，`EXTERNAL_PROCESSING_PROJECTS` 只列測試專案，`JEV_API_KEY` 只用 `wrangler secret put` 設定這個服務專屬的值，不借用其他 Cloudflare 專案或應用程式的 secret，並設定很小的每日預算。
 
+部署 0.4 後同樣不會多做任何事：沒有訂閱時裝置讀不到任何筆記，沒有在 `MAINTENANCE_TASKS` 加入 `backup`／`health` 時每小時的排程不做任何查詢，沒有綁定 `BACKUP` 時不會備份，沒有設定保存天數時不刪除任何資料。要開啟時依 [DEPLOYMENT.md](DEPLOYMENT.md#mac-sync-and-data-operations-opt-in-04) 逐步進行：Workers Paid 是排程任務的前提；另建私人 BACKUP bucket，只在私人 config 綁定；第一個 checkpoint 完成並通過完整性檢查後，用存放在 0600 檔案裡的審閱金鑰執行 `backup:restore-check`，演練通過才由審閱者記錄 `verified`；保存期限只能在這之後套用。上面以 D1 匯出檔做的本機還原檢查仍是第一次升級的前提，因為那時還沒有 BACKUP 可以演練。
+
 若只是程式退版，回復上一個已核准 Worker 版本，保留所有新增 D1 tables 和 R2：
 
 ```sh
 npx wrangler rollback REPLACE_WITH_PREVIOUS_WORKER_VERSION_ID --config .local/wrangler.test.jsonc
 ```
 
-三份 migration 都是 additive，沒有 down migration；不要 drop tables、刪除候選（包括自動整理候選）、移除 audit 或清掉 R2 來退版。舊程式可繼續使用原有 tables，新增資料保留供修復後讀取；舊程式不讀 `context_generation`，會把自動整理顯示成一般待審候選，建立者稽核仍是 `pipeline:beacon.extractive@1`。只想停止背景整理時不必退版：把工作區政策改成 `enabled:false`，或從 `MAINTENANCE_TASKS` 移除 `processing` 後重新部署。
+這些 migration 都是 additive，沒有 down migration；不要 drop tables、刪除候選（包括自動整理候選）、移除 audit、訂閱、共享或標記紀錄，也不要清掉 R2 或 BACKUP 來退版。舊程式可繼續使用原有 tables，新增資料保留供修復後讀取；舊程式不讀 `context_generation`，會把自動整理顯示成一般待審候選，建立者稽核仍是 `pipeline:beacon.extractive@1`。只想停止背景整理時不必退版：把工作區政策改成 `enabled:false`，或從 `MAINTENANCE_TASKS` 移除 `processing` 後重新部署。0.3 的程式不使用 0.4 的 tables，會把 `MAINTENANCE_TASKS` 裡的 `backup`／`health` 回報成 `unknown_task`；已同步到 Mac 的檔案不受退版影響。只想停止同步或備份時也不必退版：撤銷訂閱，或從 `MAINTENANCE_TASKS` 移除 `backup`／`health` 後重新部署。
 
 若確實需要 D1 回到較早時間，這是另一項會丟棄新索引、審閱或裝置輪替的回復操作。停止本專案寫入、另存目前資料並確認還原時間後，才使用明確 TEST config 的 Time Travel restore；不要對共用 account 其他資料庫操作：
 
@@ -286,4 +288,4 @@ npx wrangler rollback REPLACE_WITH_PREVIOUS_WORKER_VERSION_ID --config .local/wr
 npx wrangler d1 time-travel restore agent-beacon-cloud-test-db --bookmark REPLACE_WITH_CONFIRMED_BOOKMARK --config .local/wrangler.test.jsonc
 ```
 
-還原時點若早於 `0002`／`0003`／`0004`，先使用對應的舊 Worker，再規劃重新升級。D1 Time Travel 不回復 R2 原文或本機 outbox；對齊裝置 token 狀態、D1 index、保留的 R2 batches 與 checkpoint 後才恢復轉送。自動 reindex、scheduled backup 和真正雲端 restore 演練仍未完成。
+還原時點若早於 `0002`–`0010` 中任何一份，先使用對應的舊 Worker，再規劃重新升級。D1 Time Travel 不回復 R2 原文或本機 outbox；對齊裝置 token 狀態、D1 index、保留的 R2 batches 與 checkpoint 後才恢復轉送。已套用的保存期限刪除只能從 BACKUP 的 `raw/` 複本（寬限期內）放回 R2 原文。自動 reindex 仍未提供；0.4 的排程備份與 `restore-check` 演練只在本機以合成資料執行過，尚未在雲端執行。

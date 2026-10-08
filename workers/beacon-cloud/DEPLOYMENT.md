@@ -75,10 +75,13 @@ npx wrangler secret put REVIEW_TOKEN --config .local/wrangler.production.jsonc
 
 Deployment before read secrets produces a protected but unusable dashboard/MCP,
 not an open read endpoint. No devices can upload until their digests are inserted.
-The 0.2 and 0.3 changes also require migrations `0002`, `0003` and `0004`. They
-add central workflow and background-processing tables/triggers without changing
-raw history; 0.3 stays inert after deployment until the opt-in steps in
-[Background processing opt-in](#background-processing-opt-in-03) are taken. Back up the
+The 0.2, 0.3 and 0.4 changes also require migrations `0002` through `0010`. They
+add central workflow, background-processing, sync, revision and data-operations
+tables/triggers/indexes without changing raw history; 0.3 and 0.4 stay inert after
+deployment until the opt-in steps in
+[Background processing opt-in](#background-processing-opt-in-03) and
+[Mac sync and data operations opt-in](#mac-sync-and-data-operations-opt-in-04)
+are taken. Back up the
 selected D1 database first; use the existing isolated TEST config for a future
 TEST upgrade, never a shared database or production example by accident.
 Omitting `REVIEW_TOKEN` leaves all workflow writes denied. Never reuse read,
@@ -217,6 +220,110 @@ Stopping and rollback:
   handler, and how rollback interacts with registered crons was not tested here:
   check the Worker's schedules afterwards and remove them if they remain.
 
+## Mac sync and data operations opt-in (0.4)
+
+This runbook has **not** been executed in any Cloudflare environment either; it
+describes a later, separately approved TEST upgrade. Deploying 0.4 changes nothing
+on its own: no device can read a note until a reviewer grants it, the hourly cron
+runs nothing until `MAINTENANCE_TASKS` names `backup` or `health`, `backup` does
+nothing without a `BACKUP` binding, and nothing is deleted until a reviewer applies
+a retention plan. The features are specified in [MAC-SYNC.md](MAC-SYNC.md),
+[DATA-OPERATIONS.md](DATA-OPERATIONS.md) and
+[CONTEXT-WORKFLOWS.md](CONTEXT-WORKFLOWS.md).
+
+Prerequisites:
+
+- **Workers Paid** for `backup` and `health`, for the same reason as processing:
+  the Free cron limits (10 ms CPU, 50 subrequests, 50 D1 queries) cannot hold a
+  backup round or a list-diff page. Sync, flags, shares and retention plans are
+  request-driven and do not need the cron.
+- A `REVIEW_TOKEN` already set as a secret. Grants, flags, shares, retention and
+  every backup route, **including reads**, need it.
+- A separate, private R2 bucket for backups, created only after approval. Never
+  reuse `RAW` or any other project's bucket, and never enable public access.
+- Node.js 22+ and this package checked out on the operator machine for the drill.
+
+Steps, shown for the isolated TEST config; keep the explicit `--config` on every
+remote command and never edit the public `wrangler.jsonc` for a deployment:
+
+1. **Back up first.** Pause this project's forwarders and review writes, export D1
+   privately, record a Time Travel bookmark and run the local restore check in
+   [CONTEXT-WORKFLOWS.md](CONTEXT-WORKFLOWS.md). Stop if the restore check is incomplete.
+2. **Migrate before deploying code.** `npx wrangler d1 migrations apply agent-beacon-cloud-test-db --remote --config .local/wrangler.test.jsonc`
+   applies every pending migration in order: `0002`–`0004` if absent, then `0005`
+   (sync subscriptions), `0006` (retention, backups, health state), `0007` (flags,
+   shares, `include_shared`; reads the `0004` tables), `0008` (backup rounds),
+   `0009` (indexes; needs `0004` and `0007`) and `0010` (rebuilds one index). All are
+   additive. Code deployed before `0007` makes note queries return `503`, because
+   recall counts open flags; ingest is unaffected.
+3. **Deploy and confirm it is inert.** `npx wrangler deploy --config .local/wrangler.test.jsonc`,
+   then: `GET /api/sync/subscriptions` is empty, a synthetic device's
+   `GET /v1/sync/subscriptions` lists nothing and its `/v1/sync/snapshot` answers `403`,
+   `GET /api/retention/policies` keeps every class permanent, and
+   `GET /api/health/data` reports `backup_not_configured`.
+4. **Bind the backup bucket privately.** After approval,
+   `npx wrangler r2 bucket create agent-beacon-cloud-test-backup --config .local/wrangler.test.jsonc`
+   (stop if the name exists), then add `{"binding":"BACKUP","bucket_name":"agent-beacon-cloud-test-backup"}`
+   to `r2_buckets` in `.local/wrangler.test.jsonc` only.
+5. **Schedule the tasks.** The private config needs both crons, with the hourly one
+   exactly `17 * * * *` (see [the 0.3 steps](#background-processing-opt-in-03)). Add
+   `health` to the comma-separated `MAINTENANCE_TASKS` var (for example `"health"`, or
+   `"processing,health"` when processing is enabled) and deploy; once its report looks
+   right, add `backup` (`"backup,health"` or `"processing,backup,health"`) and deploy
+   again. Adjust `BACKUP_INTERVAL_HOURS`, `BACKUP_MAX_AGE_DAYS`,
+   `BACKUP_RETENTION_GRACE_DAYS` and `MAINTENANCE_BUDGET_MS` only within the ranges
+   in [DATA-OPERATIONS.md](DATA-OPERATIONS.md); they are vars, not secrets.
+6. **First checkpoint.** Wait for the hourly tick, or `POST /api/backups/run` and then
+   wait. `GET /api/backups` with the reviewer key shows it `completed` with
+   `integrity_verified_at` set; the scheduled log line carries only task names,
+   durations, usage counts and codes. Record those counts.
+7. **Restore drill.** On the operator machine, put the reviewer key in a private file
+   without placing it on a command line, for example
+   `umask 077 && pbpaste > /ABS/PRIVATE/PATH/review-token` from a password manager
+   copy, then clear the clipboard. The file must be an absolute-path, 0600 regular
+   file, not a symlink. Then:
+
+   ```sh
+   cd workers/beacon-cloud
+   npm run backup:restore-check -- --url https://agent-beacon-cloud-test.REPLACE_WITH_SUBDOMAIN.workers.dev --review-token-file /ABS/PRIVATE/PATH/review-token --checkpoint REPLACE_WITH_CHECKPOINT_UUID
+   ```
+
+   It replays the checkpoint only into its own temporary local Miniflare D1 and
+   prints a report, its hash and a `verify_request`. Add `--out` with a new private
+   directory only if you need an offline rerun (`--dir`); that directory then holds
+   raw history and device token digests, so delete it after use, along with the token
+   file. When `result` is `passed`, submit `verify_request` to
+   `POST /api/backups/:id/verify` or the 資料維護 tab. `verified` records the
+   reviewer's attestation; the server can only compare counts with the manifest.
+8. **Retention, only after step 7.** Apply nothing until the newest checkpoint within
+   `BACKUP_MAX_AGE_DAYS` is both drill-verified and integrity-verified. Then
+   `POST /api/retention/policies` a `raw` `keep_days`, read `GET /api/retention/plan`,
+   check its batches and blocked reasons, and apply it within an hour. Start with
+   synthetic batches. Deletion is not reversible from the Worker: the R2 objects come
+   back only from BACKUP's `raw/` copies during the grace period, and D1 rows only
+   through Time Travel or an export.
+9. **Sync grant (synthetic first).** With the reviewer key, grant one synthetic
+   device one project in the Mac 同步 tab or `POST /api/sync/subscriptions`, then on
+   that Mac follow [MAC-SYNC.md](MAC-SYNC.md): `preview`, read the diff, `apply`,
+   `rollback`. A pilot with real notes needs its own explicit approval and record.
+
+Stopping and rollback:
+
+- **Stop backups or health checks** by removing the names from `MAINTENANCE_TASKS`
+  and redeploying, or by removing the `BACKUP` binding (the task then reports
+  `backup_not_configured`). A running checkpoint stays `running`; nothing is deleted.
+  Expire unneeded checkpoints with `POST /api/backups/:id/expire`; never empty the
+  bucket by hand.
+- **Stop sync** by revoking subscriptions. Files already on a Mac stay until its user
+  runs `rollback` or deletes them; revocation never reaches the Mac.
+- **Stop retention** by setting `keep_days` back to `null`. Runs already applied stay
+  recorded in `retention_runs`; pending BACKUP-copy removals after the grace period
+  continue only while `backup` is scheduled.
+- **Code rollback.** `npx wrangler rollback` keeps the `0005`–`0010` tables, audits,
+  grants, flags, shares and checkpoints. A 0.3 Worker ignores them and reports
+  `backup`/`health` in `MAINTENANCE_TASKS` as `unknown_task`; remove those names.
+  Never drop tables, delete audits or clear BACKUP as a rollback step.
+
 ## Remote acceptance before using real logs
 
 Use synthetic logs and temporary devices first. Repeat local acceptance against
@@ -268,7 +375,10 @@ any later database change, export this database privately and record a D1 Time
 Travel bookmark (where supported). D1 recovery is an independent explicit action
 and can discard newer indexes/device rotations; reconcile against retained R2
 batches and outboxes before resuming. Code rollback, backup restoration and R2
-reindex/garbage collection are not automated or tested in the cloud here.
+reindex/garbage collection are not automated or tested in the cloud here. The 0.4
+restore drill rebuilds a checkpoint only in a local temporary database to prove it
+is restorable; putting raw objects back from BACKUP's `raw/` copies or restoring D1
+is a separate, planned recovery with writes stopped.
 
 If retiring the service, disable forwarding and access first, preserve approved
 backups, and remove only this project's Worker/bindings/resources after explicit
