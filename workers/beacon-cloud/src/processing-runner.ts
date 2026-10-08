@@ -4,7 +4,7 @@ import { extractiveGenerator, Generator, GeneratorEvent, validateGenerated } fro
 import { stableJSON } from './identity';
 import { defaultStage } from './jev';
 import type { Allotment, MaintenanceContext } from './maintenance';
-import { cleanLine, projectEvents, workerSecrets } from './privacy';
+import { cleanLine, FieldClass, projectEvents, workerSecrets } from './privacy';
 import { EffectivePolicy, effectivePolicy } from './processing-policy';
 import { JobScope, SelectionStage, StageSignal } from './processing-stage';
 import { versionScope } from './queries';
@@ -14,7 +14,8 @@ import { Env, HttpError } from './types';
 export const LEASE_MIN_MS = 10 * 60_000;
 /** Largest external call timeout a job may make (the budget's timeout_ms cap), added to every lease. */
 export const EXTERNAL_TIMEOUT_MS = MAX_CALL_TIMEOUT_MS;
-export const BACKOFF_MINUTES = [1, 5, 30, 120];
+/** Wait before attempts 2, 3 and 4; the fourth failure (MAX_ATTEMPTS) leaves the job failed. */
+export const BACKOFF_MINUTES = [1, 5, 30];
 export const MAX_JOBS_PER_TICK = 2;
 /**
  * Platform calls a single job may need: claim, checks, versions, ≤20 verifications and
@@ -24,7 +25,9 @@ export const MAX_JOBS_PER_TICK = 2;
 export const JOB_RESERVE: Allotment = { d1: 110, r2: 260, fetch: 1 };
 export const MAX_JOB_RAW_READS = 240;
 export const MAX_JOB_RAW_BYTES = 48 * 1024 * 1024;
-const MAX_VERSIONS = 1000;
+export const MAX_JOB_VERSIONS = 1000;
+/** Per-job raw limits: R2 objects read, characters read and event versions considered. */
+export interface RawLimits { reads: number; bytes: number; versions: number }
 
 export interface JobRow {
   id: string; scope_type: 'task' | 'project'; scope_id: string; project_id: string; task_id: string | null; scope_key: string;
@@ -124,12 +127,12 @@ async function currentSources(env: Env, job: JobRow) {
  * are read grouped by batch, one object in memory at a time. Missing or corrupt raw
  * data is a failure, never a reason to substitute a version.
  */
-async function exactVersions(env: Env, rows: SourceRow[]) {
+async function exactVersions(env: Env, rows: SourceRow[], limits: RawLimits) {
   const versions = (await env.DB.prepare(`SELECT v.event_id,v.payload_hash,v.line_number,b.r2_key FROM event_versions v
     JOIN batches b ON b.id=v.batch_id WHERE v.event_id IN (SELECT value FROM json_each(?)) ORDER BY b.r2_key,v.line_number LIMIT ?`)
-    .bind(JSON.stringify(rows.map((row) => row.event_id)), MAX_VERSIONS + 1)
+    .bind(JSON.stringify(rows.map((row) => row.event_id)), limits.versions + 1)
     .all<{ event_id: string; payload_hash: string; line_number: number; r2_key: string }>()).results;
-  if (versions.length > MAX_VERSIONS) throw new JobError('too_many_versions');
+  if (versions.length > limits.versions) throw new JobError('too_many_versions');
   const index = new Map(rows.map((row) => [row.event_id, row]));
   const chosen = new Map<string, { payload: unknown; payload_hash: string }>();
   let reads = 0, bytes = 0;
@@ -138,11 +141,11 @@ async function exactVersions(env: Env, rows: SourceRow[]) {
     for (const key of keys) {
       const wanted = list.filter((version) => version.r2_key === key && !chosen.has(version.event_id));
       if (!wanted.length) continue;
-      if (++reads > MAX_JOB_RAW_READS) throw new JobError('raw_read_limit');
+      if (++reads > limits.reads) throw new JobError('raw_read_limit');
       const object = await env.RAW.get(key);
       if (!object) throw new HttpError(503, 'Raw batch unavailable');
       const text = await object.text();
-      if ((bytes += text.length) > MAX_JOB_RAW_BYTES) throw new JobError('raw_byte_limit');
+      if ((bytes += text.length) > limits.bytes) throw new JobError('raw_byte_limit');
       const lines = text.split('\n');
       for (const version of wanted) {
         const row = index.get(version.event_id)!;
@@ -163,7 +166,9 @@ async function exactVersions(env: Env, rows: SourceRow[]) {
   return chosen;
 }
 
-export interface RunOptions { stage?: SelectionStage; generator?: Generator }
+export interface RunOptions { stage?: SelectionStage; generator?: Generator;
+  /** Lower per-job raw limits; the defaults are the MAX_JOB_* constants (tests use small ones). */
+  limits?: Partial<RawLimits> }
 
 /** Run one claimed job to a fenced end state. */
 async function runClaimed(env: Env, ctx: MaintenanceContext, lease: Lease, options: RunOptions): Promise<JobOutcome> {
@@ -181,11 +186,14 @@ async function runClaimed(env: Env, ctx: MaintenanceContext, lease: Lease, optio
   const current = await currentSources(env, job);
   if (!current.valid) return await skip(env, lease, 'scope_changed', []) ? 'skipped' : 'lease_lost';
   const covered = current.rows.map((row) => row.event_id);
-  const versions = await exactVersions(env, current.rows);
+  const versions = await exactVersions(env, current.rows,
+    { reads: MAX_JOB_RAW_READS, bytes: MAX_JOB_RAW_BYTES, versions: MAX_JOB_VERSIONS, ...options.limits });
   const used = current.rows.filter((row) => versions.has(row.event_id));
   const secrets = workerSecrets(env);
-  const projection = projectEvents(used.map((row) => ({ payload: versions.get(row.event_id)!.payload, timestamp: row.timestamp })),
-    policy.summary_fields, { secrets });
+  const sources = used.map((row) => ({ payload: versions.get(row.event_id)!.payload, timestamp: row.timestamp }));
+  const projection = projectEvents(sources, policy.summary_fields, { secrets });
+  const reproject = (fields: readonly FieldClass[], assigned: Iterable<string>) => projectEvents(sources,
+    fields.filter((field) => policy.summary_fields.includes(field)), { secrets, assigned: [...projection.assigned, ...assigned] });
   const events: GeneratorEvent[] = projection.events.map((event, index) => ({ ...event, event_id: used[index].event_id,
     payload_hash: versions.get(used[index].event_id)!.payload_hash, device_id: used[index].device_id, session_id: used[index].session_id }));
   const counts = { event_count: events.length, excluded_count: current.rows.length - events.length,
@@ -198,7 +206,7 @@ async function runClaimed(env: Env, ctx: MaintenanceContext, lease: Lease, optio
   const scope: JobScope = { scope_type: job.scope_type, scope_id: job.scope_id, project_id: job.project_id, task_id: job.task_id,
     scope_key: job.scope_key };
   const decision = await (options.stage ?? defaultStage)({ env, ctx, job_id: job.id, attempt: job.attempts, lease_owner: lease.owner,
-    scope, policy, projection: projection.events, labels: { task_title: current.task_title, project_name: current.project_name } });
+    scope, policy, projection: projection.events, reproject, labels: { task_title: current.task_title, project_name: current.project_name } });
   if (decision.decision === 'skip')
     return await skip(env, lease, decision.skip_reason ?? 'stage_skip', covered, decision.signals, decision.note ?? null) ? 'skipped' : 'lease_lost';
   const titles = policy.summary_fields.includes('titles');
@@ -238,8 +246,10 @@ async function runClaimed(env: Env, ctx: MaintenanceContext, lease: Lease, optio
 
 async function fail(env: Env, lease: Lease, code: string, now: Date): Promise<JobOutcome> {
   const { job } = lease, last = job.attempts >= job.max_attempts;
-  const next = new Date(now.getTime() + BACKOFF_MINUTES[Math.min(job.attempts, BACKOFF_MINUTES.length) - 1] * 60_000).toISOString();
-  const result = await env.DB.prepare(`UPDATE processing_jobs SET status=?,next_attempt_at=?,last_error=?,lease_owner=NULL,lease_until=NULL,
+  // A failed job waits for a reviewer, so it keeps the time it was last due instead of a retry time.
+  const next = last ? null
+    : new Date(now.getTime() + BACKOFF_MINUTES[Math.min(job.attempts, BACKOFF_MINUTES.length) - 1] * 60_000).toISOString();
+  const result = await env.DB.prepare(`UPDATE processing_jobs SET status=?,next_attempt_at=COALESCE(?,next_attempt_at),last_error=?,lease_owner=NULL,lease_until=NULL,
     updated_at=? ${fenced}`).bind(last ? 'failed' : 'queued', next, code, now.toISOString(), job.id, lease.owner, job.attempts).run();
   return !result.meta.changes ? 'lease_lost' : last ? 'failed' : 'retry';
 }

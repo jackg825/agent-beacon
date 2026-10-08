@@ -8,7 +8,7 @@
 import { digest } from './auth';
 import { invalidSourceScope } from './context';
 import { externalFetch } from './external-fetch';
-import { assignedValues, cleanLine, cleanText, FieldClass, ProjectedEvent, redact, workerSecrets } from './privacy';
+import { assignedValues, cleanLine, cleanText, FieldClass, ProjectedEvent, workerSecrets } from './privacy';
 import { CallOutcome, finishCallStatement, readBudget, reserveCall, utcDay } from './processing-budget';
 import { externalGate, jevConfig } from './processing-policy';
 import { isHighSignal, ruleFilter, SelectionStage, StageInput, StageResult, StageSignal } from './processing-stage';
@@ -63,26 +63,6 @@ export function externalEvent(event: ProjectedEvent, fields: ReadonlySet<FieldCl
   } else if (event.file_ext) out.file_ext = event.file_ext;
   for (const key of contentKeys) if (fields.has(key) && event[key] !== undefined) out[key] = event[key];
   return out;
-}
-
-const identifierKeys = new Set(['id', 'content_sha256']);
-/**
- * Collect values assigned to secret-like keys across every string of the request,
- * then redact every string with them and the Worker's own secrets. Identifiers
- * (note ids and content hashes) are left exact so questions keep pointing at them.
- */
-function redactAll<T>(value: T, secrets: readonly string[]): T {
-  const assigned = new Set<string>();
-  const visit = (item: unknown, key = ''): void => {
-    if (typeof item === 'string') { if (!identifierKeys.has(key)) for (const found of assignedValues(item)) assigned.add(found); }
-    else if (Array.isArray(item)) item.forEach((entry) => visit(entry));
-    else if (item && typeof item === 'object') for (const [name, entry] of Object.entries(item)) visit(entry, name);
-  };
-  visit(value);
-  const map = (item: unknown, key = ''): unknown => typeof item === 'string' ? (identifierKeys.has(key) ? item : redact(item, { secrets, assigned }))
-    : Array.isArray(item) ? item.map((entry) => map(entry))
-    : item && typeof item === 'object' ? Object.fromEntries(Object.entries(item).map(([name, entry]) => [name, map(entry, name)])) : item;
-  return map(value) as T;
 }
 
 /**
@@ -207,21 +187,29 @@ export const jevStage: SelectionStage = async (input) => {
   if (prior.length) return proceed(prior.some((call) => call.status === 'failed') ? 'jev_previous_failed' : 'jev_previous_outcome_unknown');
   const budget = await readBudget(env);
   if (!budget || !budget.daily_call_limit || !budget.daily_token_limit) return proceed('jev_budget:budget_disabled');
-  const timeoutMs = Math.min(budget.timeout_ms, ctx.remaining() - 2_000);
-  if (timeoutMs < 1_000) return proceed('jev_no_time');
+  // The whole configured timeout, plus 2 s to record the outcome, must fit in what is
+  // left of this invocation. It is never shortened to fit: a cut-short call would use
+  // the job's only evaluation and its budget on an answer that cannot arrive in time.
+  if (ctx.remaining() - 2_000 < budget.timeout_ms) return proceed('jev_no_time');
 
-  const secrets = workerSecrets(env);
   const rows = notesAllowed ? await currentNotes(env, input) : [];
+  // Values assigned to secret keys anywhere in the request, collected from the stored
+  // (un-redacted) notes and titles here and from the events inside reproject; every
+  // part is then redacted with all of them before any string is cut.
+  const found = new Set<string>();
+  for (const text of [...rows.flatMap((row) => [row.title, row.content]), input.labels.task_title ?? '', input.labels.project_name ?? ''])
+    for (const value of assignedValues(text)) found.add(value);
+  const projected = input.reproject(policy.external_fields, found);
+  const redaction = { secrets: workerSecrets(env), assigned: projected.assigned };
   const notes: JevNote[] | null = notesAllowed ? await Promise.all(rows.map(async (row) => ({ id: row.id, kind: row.kind,
-    ...(titles ? { title: cleanLine(row.title, { secrets }, 160) } : {}), content: cleanText(row.content, { secrets }, MAX_JEV_NOTE_CHARS),
+    ...(titles ? { title: cleanLine(row.title, redaction, 160) } : {}), content: cleanText(row.content, redaction, MAX_JEV_NOTE_CHARS),
     content_sha256: await digest(row.content) }))) : null;
   const base = { rubric_version: JEV_RUBRIC_VERSION, scope: { type: scope.scope_type,
-    ...(taskTitle ? { task_title: cleanLine(taskTitle, { secrets }, 160) } : {}),
-    ...(titles && input.labels.project_name ? { project_name: cleanLine(input.labels.project_name, { secrets }, 160) } : {}) } };
-  const events = input.projection.map((event, index) => externalEvent(event, fields, index + 1));
-  // Redact the whole request before fitting; the fit removes whole events and notes only.
-  const clean = redactAll({ base, events, notes }, secrets);
-  const fit = fitJevRequest(config.model, clean.base, clean.events, clean.notes, !!taskTitle, budget.max_input_chars);
+    ...(taskTitle ? { task_title: cleanLine(taskTitle, redaction, 160) } : {}),
+    ...(titles && input.labels.project_name ? { project_name: cleanLine(input.labels.project_name, redaction, 160) } : {}) } };
+  const events = projected.events.map((event, index) => externalEvent(event, fields, index + 1));
+  // The fit removes whole events and notes only, never part of a string.
+  const fit = fitJevRequest(config.model, base, events, notes, !!taskTitle, budget.max_input_chars);
   if (!fit) return proceed(Object.keys(jevQuestions(notes ?? [], !!taskTitle)).length ? 'jev_input_too_large' : undefined);
 
   const reservation = await reserveCall(env, { job_id: input.job_id, provider: 'jev', model: config.model, attempt: input.attempt,
@@ -230,7 +218,7 @@ export const jevStage: SelectionStage = async (input) => {
   const asked = Object.keys(fit.request.questions);
   const result = await externalFetch(ctx.fetch, config.endpoint, { method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'application/json', Authorization: 'Bearer ' + env.JEV_API_KEY }, body: fit.body },
-    { timeoutMs, maxBytes: MAX_JEV_RESPONSE_BYTES });
+    { timeoutMs: budget.timeout_ms, maxBytes: MAX_JEV_RESPONSE_BYTES });
   const finished = ctx.now.toISOString();
   let outcome: CallOutcome, signals: StageSignal[] = [], note: string | undefined;
   if (!result.ok) {
