@@ -13,12 +13,13 @@ export function workflowEvent(id:string,repo='alpha',session='same-native-sessio
     event:{id,action:'command.executed',kind:'agent_runtime',fidelity:'observed'},harness:{name:'codex_cli',collection_method:'hook'},
     session:{id:session,working_directory:'/synthetic/'+repo},repository:'https://github.com/Example/'+repo+'.git',message};
 }
-export async function workflowFixture() {
+/** `bindings` adds vars to the synthetic Worker, e.g. MAINTENANCE_TASKS for a scheduled-processing check. */
+export async function workflowFixture(bindings:Record<string,string>={}) {
   const directory=await mkdtemp(join(tmpdir(),'beacon-context-'));
   const options=convertV4MiniflareOptions({resourcePersistencePath:join(directory,'storage'),workers:[{
     name:'beacon-context',modules:true as const,scriptPath:resolve('dist/worker.mjs'),compatibilityDate:'2026-10-01',
     d1Databases:{DB:'workflow-test-index'},r2Buckets:{RAW:'workflow-test-raw'},bindings:{READ_TOKEN:workflowTokens.read,
-      REVIEW_TOKEN:workflowTokens.review,MCP_TOKEN:workflowTokens.mcp}}]});
+      REVIEW_TOKEN:workflowTokens.review,MCP_TOKEN:workflowTokens.mcp,...bindings}}]});
   let mf=new Miniflare(options);
   const request=(path:string,init:Parameters<typeof mf.dispatchFetch>[1]={})=>mf.dispatchFetch('http://localhost'+path,init);
   const read=(path:string)=>request(path,{headers:{Authorization:'Bearer '+workflowTokens.read}});
