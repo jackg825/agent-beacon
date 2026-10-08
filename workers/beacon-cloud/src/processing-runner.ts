@@ -25,7 +25,9 @@ export const MAX_JOBS_PER_TICK = 2;
 export const JOB_RESERVE: Allotment = { d1: 110, r2: 260, fetch: 1 };
 export const MAX_JOB_RAW_READS = 240;
 export const MAX_JOB_RAW_BYTES = 48 * 1024 * 1024;
-const MAX_VERSIONS = 1000;
+export const MAX_JOB_VERSIONS = 1000;
+/** Per-job raw limits: R2 objects read, characters read and event versions considered. */
+export interface RawLimits { reads: number; bytes: number; versions: number }
 
 export interface JobRow {
   id: string; scope_type: 'task' | 'project'; scope_id: string; project_id: string; task_id: string | null; scope_key: string;
@@ -125,12 +127,12 @@ async function currentSources(env: Env, job: JobRow) {
  * are read grouped by batch, one object in memory at a time. Missing or corrupt raw
  * data is a failure, never a reason to substitute a version.
  */
-async function exactVersions(env: Env, rows: SourceRow[]) {
+async function exactVersions(env: Env, rows: SourceRow[], limits: RawLimits) {
   const versions = (await env.DB.prepare(`SELECT v.event_id,v.payload_hash,v.line_number,b.r2_key FROM event_versions v
     JOIN batches b ON b.id=v.batch_id WHERE v.event_id IN (SELECT value FROM json_each(?)) ORDER BY b.r2_key,v.line_number LIMIT ?`)
-    .bind(JSON.stringify(rows.map((row) => row.event_id)), MAX_VERSIONS + 1)
+    .bind(JSON.stringify(rows.map((row) => row.event_id)), limits.versions + 1)
     .all<{ event_id: string; payload_hash: string; line_number: number; r2_key: string }>()).results;
-  if (versions.length > MAX_VERSIONS) throw new JobError('too_many_versions');
+  if (versions.length > limits.versions) throw new JobError('too_many_versions');
   const index = new Map(rows.map((row) => [row.event_id, row]));
   const chosen = new Map<string, { payload: unknown; payload_hash: string }>();
   let reads = 0, bytes = 0;
@@ -139,11 +141,11 @@ async function exactVersions(env: Env, rows: SourceRow[]) {
     for (const key of keys) {
       const wanted = list.filter((version) => version.r2_key === key && !chosen.has(version.event_id));
       if (!wanted.length) continue;
-      if (++reads > MAX_JOB_RAW_READS) throw new JobError('raw_read_limit');
+      if (++reads > limits.reads) throw new JobError('raw_read_limit');
       const object = await env.RAW.get(key);
       if (!object) throw new HttpError(503, 'Raw batch unavailable');
       const text = await object.text();
-      if ((bytes += text.length) > MAX_JOB_RAW_BYTES) throw new JobError('raw_byte_limit');
+      if ((bytes += text.length) > limits.bytes) throw new JobError('raw_byte_limit');
       const lines = text.split('\n');
       for (const version of wanted) {
         const row = index.get(version.event_id)!;
@@ -164,7 +166,9 @@ async function exactVersions(env: Env, rows: SourceRow[]) {
   return chosen;
 }
 
-export interface RunOptions { stage?: SelectionStage; generator?: Generator }
+export interface RunOptions { stage?: SelectionStage; generator?: Generator;
+  /** Lower per-job raw limits; the defaults are the MAX_JOB_* constants (tests use small ones). */
+  limits?: Partial<RawLimits> }
 
 /** Run one claimed job to a fenced end state. */
 async function runClaimed(env: Env, ctx: MaintenanceContext, lease: Lease, options: RunOptions): Promise<JobOutcome> {
@@ -182,7 +186,8 @@ async function runClaimed(env: Env, ctx: MaintenanceContext, lease: Lease, optio
   const current = await currentSources(env, job);
   if (!current.valid) return await skip(env, lease, 'scope_changed', []) ? 'skipped' : 'lease_lost';
   const covered = current.rows.map((row) => row.event_id);
-  const versions = await exactVersions(env, current.rows);
+  const versions = await exactVersions(env, current.rows,
+    { reads: MAX_JOB_RAW_READS, bytes: MAX_JOB_RAW_BYTES, versions: MAX_JOB_VERSIONS, ...options.limits });
   const used = current.rows.filter((row) => versions.has(row.event_id));
   const secrets = workerSecrets(env);
   const sources = used.map((row) => ({ payload: versions.get(row.event_id)!.payload, timestamp: row.timestamp }));

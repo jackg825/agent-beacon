@@ -4,6 +4,7 @@ import { getContext, insertCandidate, listContext } from '../src/context';
 import { validateGenerated } from '../src/generator';
 import { runMaintenance } from '../src/maintenance';
 import { PROCESSING_ALLOTMENT, processingMaintenance, processingRead, processingTick, processingWrite } from '../src/processing';
+import { JOB_RESERVE, MAX_JOB_RAW_BYTES, MAX_JOB_RAW_READS, MAX_JOB_VERSIONS, RawLimits } from '../src/processing-runner';
 import { getEventVersion } from '../src/queries';
 import { Env } from '../src/types';
 import { createEnvFixture, syntheticEvent } from './env-fixture';
@@ -193,6 +194,47 @@ test('a busy tick stays inside its allotment: five scopes planned, two whole job
     }
     assert.equal(queued, 0);
     assert.equal(await count(f.env, "processing_jobs WHERE status='succeeded'"), 7);
+  } finally { await f.close(); }
+});
+
+test('a job stops at its raw read, byte and version limits with a short code; a tick without time for a whole job claims none', async () => {
+  const f = await createEnvFixture();
+  try {
+    // Every R2 read of a job fits its reserve: at most 240 batches plus 20 source verifications.
+    assert.deepEqual([MAX_JOB_RAW_READS, MAX_JOB_RAW_BYTES, MAX_JOB_VERSIONS, JOB_RESERVE.r2], [240, 48 * 1024 * 1024, 1000, 240 + 20]);
+    await setPolicy(f.env, workspace, { summary_fields: ['command_text'], min_new_events: 1000 });
+    // Three events in three batches, and an alternate capture of the first in a fourth: four versions.
+    const batches: string[] = [];
+    for (const [id, text, exit, second] of [['cap-1', 'npm test', 1, 1], ['cap-2', 'npm test', 0, 2], ['cap-3', 'npm run lint', 0, 3]] as const)
+      batches.push((await f.ingest(command(id, text, exit, { session: 'cap-s', timestamp: at(second) }))).batch_id);
+    await f.ingest(command('cap-1', 'npm test', 1, { session: 'cap-forged', repo: 'cap-forged', timestamp: at(1) }));
+    let total = 0;
+    for (const id of batches) {
+      const key = (await f.env.DB.prepare('SELECT r2_key FROM batches WHERE id=?').bind(id).first<{ r2_key: string }>())!.r2_key;
+      total += (await (await f.env.RAW.get(key))!.text()).length;
+    }
+    const planned = (await run(f.env, { project_id: (await f.event('cap-1'))!.project_id })).scopes[0];
+    const base = later(60), minutes = (value: number) => new Date(base.getTime() + value * 60_000);
+    const tickWith = (now: Date, limits: Partial<RawLimits> = {}, budget: { budgetMs?: number; clock?: () => number } = {}) =>
+      runMaintenance({ ...f.env, MAINTENANCE_TASKS: 'processing' } as Env, { now, ...budget,
+        tasks: [{ ...processingMaintenance[0], run: (env, ctx) => processingTick(env, ctx, { limits }) }] });
+    // Attempts 1–3, each after the previous backoff: over the version, read and character limits.
+    for (const [at, limits, code, reads] of [[0, { versions: 3 }, 'too_many_versions', 0], [1, { reads: 2 }, 'raw_read_limit', 2],
+      [6, { bytes: total - 1 }, 'raw_byte_limit', 3]] as const) {
+      const report = await tickWith(minutes(at), limits);
+      assert.equal(report.processing.ok, true, code);
+      assert.deepEqual([report.processing.result!.run_outcomes, report.processing.usage.r2], [{ retry: 1 }, reads], code);
+      const row = await job(f.env, planned.job_id);
+      assert.deepEqual([row.status, row.last_error, row.event_count], ['queued', code, null], code);
+    }
+    assert.equal(await count(f.env, 'processing_coverage'), 0);
+    // Under 5 s left: the runner stops before claiming. Exactly 5 s: it claims and the job finishes.
+    const starved = await tickWith(minutes(36), {}, { budgetMs: 4_999, clock: () => 0 });
+    assert.deepEqual([starved.processing.result!.stopped, starved.processing.result!.claimed], ['time', 0]);
+    assert.equal((await job(f.env, planned.job_id)).attempts, 3);
+    const enough = await tickWith(minutes(36), {}, { budgetMs: 5_000, clock: () => 0 });
+    assert.deepEqual(enough.processing.result!.run_outcomes, { succeeded: 1 });
+    assert.deepEqual([(await job(f.env, planned.job_id)).attempts, (await job(f.env, planned.job_id)).event_count], [4, 3]);
   } finally { await f.close(); }
 });
 
