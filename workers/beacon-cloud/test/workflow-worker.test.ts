@@ -85,7 +85,7 @@ test('protected workflows upgrade existing data, link Macs, review immutable evi
           requestInit:{headers:{Authorization:'Bearer '+workflowTokens.mcp}},fetch:f.runtime().dispatchFetch.bind(f.runtime()) as unknown as typeof fetch});
         try {
           await client.connect(transport);
-          const tools=(await client.listTools()).tools;assert.equal(tools.length,13);
+          const tools=(await client.listTools()).tools;assert.equal(tools.length,15);
           assert.ok(tools.every(tool=>tool.annotations?.readOnlyHint&&tool.annotations?.destructiveHint===false));
           for(const call of [
             {name:'beacon_get_task',arguments:{task_id:task.id}},
