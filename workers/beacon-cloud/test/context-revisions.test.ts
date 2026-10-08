@@ -333,6 +333,22 @@ test('a fake Jev run through the processing runner flags only the contradicted e
       .first<{ probability: number }>())!.probability, 0.95);
     await assert.rejects(direct(foreign, stagedJobs[0]), /context_flag_target/);
 
+    // A reviewer supersedes the asked note while the stage runs: its >= 0.5 answer is stored, it
+    // raises no flag (the note is no longer approved), and the job's batch still commits.
+    const racing: SelectionStage = async () => {
+      await note(f.env, event, { title: 'CI runs npm test, revised', supersedes: consistent }, 'approve');
+      return { decision: 'continue', signals: [signal(consistent, 0.9)] };
+    };
+    await f.ingest(command('jev-later-3', 'npm run build', 0, { session: 'jev-s', timestamp: '2026-10-07T08:03:00Z' }));
+    const last = (await run(f.env, { project_id: event.project_id })).scopes[0];
+    const raced = await runMaintenance({ ...f.env, MAINTENANCE_TASKS: 'processing' } as Env,
+      { now: later(320), schedule: 'frequent', tasks: staged(racing) });
+    assert.equal(raced.processing.ok, true, JSON.stringify(raced.processing));
+    assert.equal((await job(f.env, last.job_id)).status, 'succeeded');
+    assert.equal((await getContext(f.env, consistent)).context.status, 'superseded');
+    assert.deepEqual((await f.env.DB.prepare('SELECT question_id,probability FROM processing_signals WHERE job_id=?').bind(last.job_id).all()).results,
+      [{ question_id: 'contradiction:' + consistent, probability: 0.9 }]);
+    assert.equal(await count(f.env, 'context_flags WHERE job_id=?', last.job_id), 0);
   } finally { await f.close(); }
 });
 
