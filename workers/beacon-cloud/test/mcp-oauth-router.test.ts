@@ -56,7 +56,7 @@ test('real Worker validates external JWKS before distinguishing invalid JWTs fro
   try {
     const permitted=await request(await signed());
     assert.equal(permitted.status,200);
-    assert.equal((await permitted.json() as {result:{tools:unknown[]}}).result.tools.length,16);
+    assert.equal((await permitted.json() as {result:{tools:unknown[]}}).result.tools.length,17);
     const denied=await request(await signed({scope:'beacon:write'}));
     assert.equal(denied.status,403);
     assert.equal(denied.headers.get('WWW-Authenticate'),
