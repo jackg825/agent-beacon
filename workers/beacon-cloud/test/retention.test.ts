@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -19,6 +20,7 @@ import { backupTick, completeCheckpoint, createContext, drill, get, later, lates
 import { job, setPolicy as setProcessingPolicy, staged, workspace } from './processing-helpers';
 
 const DAY = 86400_000;
+const sha = (value: Uint8Array) => createHash('sha256').update(value).digest('hex');
 const status = (code: number) => (error: unknown) => error instanceof HttpError && error.status === code;
 async function body(response: Response | null) { assert.ok(response); return response.json() as Promise<any>; }
 const setPolicy = (env: Env, data_class: string, keep_days: number | null) => retentionWrite(post('/api/retention/policies', { data_class, keep_days }), env, reviewer);
@@ -129,12 +131,19 @@ test('raw retention deletes whole closed batch sets only behind a verified, inte
       assert.equal((await retentionPlan(env, { now })).backup_running, true);
       await assert.rejects(applyRetention(env, applyBody(withoutD), reviewer, now), (error: any) => error.status === 409 && /running/.test(error.message));
       await env.DB.prepare("UPDATE backup_checkpoints SET status='failed' WHERE status='running'").run();
-      // A BACKUP copy that changed since the copy was recorded refuses the whole plan.
-      await env.BACKUP!.put('raw/' + a.r2_key, 'synthetic replaced copy');
-      const changed = await applyRetention(env, applyBody(withoutD), reviewer, now);
-      assert.equal(changed.status, 409);
-      assert.equal((await changed.json() as any).batch_id, a.id);
-      await env.BACKUP!.put('raw/' + a.r2_key, await (await env.RAW.get(a.r2_key))!.arrayBuffer(),
+      // A BACKUP copy that changed since the copy was recorded refuses the whole plan: a different
+      // size, the same size with different bytes and no stored checksum (a plain overwrite), and the
+      // same size with different bytes that carry their own checksum.
+      const original = new Uint8Array(await (await env.RAW.get(a.r2_key))!.arrayBuffer());
+      const sameSize = original.map((byte, index) => index === 0 ? byte ^ 0x20 : byte);
+      for (const [body, options] of [['synthetic replaced copy', {}], [sameSize, {}], [sameSize, { sha256: sha(sameSize) }]] as const) {
+        await env.BACKUP!.put('raw/' + a.r2_key, body, options);
+        const changed = await applyRetention(env, applyBody(withoutD), reviewer, now);
+        assert.equal(changed.status, 409);
+        assert.equal((await changed.json() as any).batch_id, a.id);
+        assert.ok(await env.RAW.head(a.r2_key), 'the primary copy stays');
+      }
+      await env.BACKUP!.put('raw/' + a.r2_key, original,
         { sha256: (await env.DB.prepare('SELECT sha256 FROM backup_raw_objects WHERE batch_id=?').bind(a.id).first<any>()).sha256 });
       assert.equal(await count(env, 'SELECT COUNT(*) AS n FROM batches'), 4);
       assert.throws(() => parseApply({ ...input, extra: 1 }), status(400));

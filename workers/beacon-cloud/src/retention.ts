@@ -208,10 +208,11 @@ export async function applyRetention(env: Env, input: ApplyInput, actor: string,
   if (blocked.size) return json({ error: 'Retention plan is no longer eligible; generate a new plan',
     blocked: [...blocked].map(id => ({ batch_id: id, reasons: reasonsFor(id, set, blocked, assessment) })) }, 409);
   // The primary copy goes only while the BACKUP copy still exists with the recorded size and checksum.
+  // Every copy this Worker writes carries R2's stored SHA-256, so a copy without one (an overwrite
+  // through the console or another tool) counts as changed, even when its size still matches.
   for (const batch of batches) {
     const head = await env.BACKUP.head(rawCopyKey(batch.r2_key)), expected = assessment.backup.get(batch.id)!;
-    const stored = head ? hex(head.checksums.sha256) : null;
-    if (!head || head.size !== expected.size || (stored !== null && stored !== expected.sha256))
+    if (!head || head.size !== expected.size || hex(head.checksums.sha256) !== expected.sha256)
       return json({ error: 'Backup copy missing or changed; retention refused', batch_id: batch.id }, 409);
   }
   const runId = crypto.randomUUID(), at = iso(now), keys = batches.map(batch => batch.r2_key).sort();
