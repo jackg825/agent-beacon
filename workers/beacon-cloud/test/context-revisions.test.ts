@@ -393,6 +393,57 @@ test('shares need an approved authoritative memory and another project; recall s
   } finally { await f.close(); }
 });
 
+test('include_shared recall reads one page of the project\'s entries, not all of them, and still pages the union exactly once', async () => {
+  const f = await createEnvFixture();
+  try {
+    await f.ingest(syntheticEvent('cost-a', { repo: 'alpha', session: 'alpha-s' }));
+    await f.ingest(syntheticEvent('cost-b', { repo: 'beta', session: 'beta-s' }));
+    const a = await source(f, 'cost-a'), b = await source(f, 'cost-b');
+    const shared = await note(f.env, a, { title: 'Shared into beta' }, 'approve');
+    assert.equal((await write(f.env, `/api/context/${shared}/shares`, { target_type: 'project', target_id: b.project_id }))!.status, 201);
+    // 300 approved memories of beta through the real triggers, in four statements.
+    const ids = Array.from({ length: 300 }, (_, index) => ({ id: crypto.randomUUID(), at: new Date(Date.UTC(2026, 9, 1) + index * 1000).toISOString() }));
+    const json = JSON.stringify(ids), db = f.env.DB;
+    await db.batch([
+      db.prepare(`INSERT INTO context_entries(id,kind,project_id,title,content,created_at) SELECT json_extract(value,'$.id'),'memory',?,'Synthetic beta',
+        'Synthetic only.',json_extract(value,'$.at') FROM json_each(?)`).bind(b.project_id, json),
+      db.prepare(`INSERT INTO context_sources(context_id,event_id,payload_hash,ordinal) SELECT json_extract(value,'$.id'),?,?,0 FROM json_each(?)`)
+        .bind(b.id, b.payload_hash, json),
+      db.prepare(`UPDATE context_entries SET sealed=1 WHERE id IN (SELECT json_extract(value,'$.id') FROM json_each(?))`).bind(json),
+      db.prepare(`UPDATE context_entries SET status='approved',review_id=id||':review',reviewed_at=created_at,reviewed_by=?
+        WHERE id IN (SELECT json_extract(value,'$.id') FROM json_each(?))`).bind(reviewer, json),
+    ]);
+    let read = 0;
+    const metered = { ...f.env, DB: new Proxy(db, { get(target, property) {
+      if (property === 'prepare') return (sql: string) => {
+        const wrap = (statement: any): any => new Proxy(statement, { get(object, key) {
+          if (key === 'bind') return (...args: unknown[]) => wrap(object.bind(...args));
+          if (key === 'all') return async () => { const result = await object.all(); read += result.meta.rows_read; return result; };
+          const value = object[key]; return typeof value === 'function' ? value.bind(object) : value;
+        } });
+        return wrap(target.prepare(sql));
+      };
+      const value = Reflect.get(target, property, target); return typeof value === 'function' ? value.bind(target) : value;
+    } }) } as Env;
+    const rowsRead = async (query: Record<string, string>) => { read = 0; const page = await listContext(metered, new URLSearchParams(query)); return { read, page }; };
+    const plain = await rowsRead({ project_id: b.project_id, limit: '5' });
+    const withShared = await rowsRead({ project_id: b.project_id, include_shared: '1', limit: '5' });
+    assert.equal(withShared.page.context.length, 5);
+    // One page of each arm plus the project's active shares, not every approved entry (3,610 rows before).
+    assert.ok(withShared.read <= plain.read + 50, `include_shared read ${withShared.read} rows, default recall ${plain.read}`);
+    // Pages still walk the whole union once, newest first.
+    const seen: string[] = [];
+    for (let before: string | null = null, pages = 0; pages < 20; pages++) {
+      const page: any = await listContext(f.env, new URLSearchParams({ project_id: b.project_id, include_shared: '1', limit: '40', ...before ? { before } : {} }));
+      seen.push(...page.context.map((entry: any) => entry.id));
+      if (!(before = page.next_cursor)) break;
+    }
+    assert.equal(seen.length, 301);
+    assert.deepEqual(new Set(seen), new Set([shared, ...ids.map((item) => item.id)]));
+    assert.deepEqual(seen.slice(0, 2), [shared, ids.at(-1)!.id], 'the shared note (approved now) is newest');
+  } finally { await f.close(); }
+});
+
 test('a device snapshot carries shared memories only when its subscription includes them, and include_shared is immutable', async () => {
   const f = await createEnvFixture();
   try {

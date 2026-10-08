@@ -152,11 +152,17 @@ export async function listContext(env:Env,params:URLSearchParams) {
     // entry is still approved with valid sources. Default recall never includes shares.
     const sharedWhere=[`sh.target_type='project' AND sh.target_id=? AND sh.revoked_at IS NULL AND c.sealed=1 AND c.status='approved'
       AND c.kind='memory' AND NOT ${invalidSourceScope}`,...kind?['c.kind=?']:[],...flagged?[openFlag]:[],...page];
+    // Each arm keeps its own order and limit, so the project's entries are read in index order
+    // and stop after one page instead of being computed in full for every page. The shared arm
+    // starts from the project's active shares (CROSS JOIN fixes that order) rather than walking
+    // every approved entry to look for a share.
     result=await env.DB.prepare(`SELECT * FROM (
-      SELECT ${contextColumns},NULL AS share_id,NULL AS shared_from_project_id ${contextFrom} WHERE ${[...where,...page].join(' AND ')}
-      UNION ALL SELECT ${contextColumns},sh.id AS share_id,c.project_id AS shared_from_project_id ${contextFrom}
-        JOIN context_shares sh ON sh.context_id=c.id WHERE ${sharedWhere.join(' AND ')}
-    ) ORDER BY created_at DESC,id DESC LIMIT ?`).bind(...args,...pageArgs,params.get('project_id'),...kind?[kind]:[],...pageArgs,limit+1)
+      SELECT * FROM (SELECT ${contextColumns},NULL AS share_id,NULL AS shared_from_project_id ${contextFrom}
+        WHERE ${[...where,...page].join(' AND ')} ORDER BY c.created_at DESC,c.id DESC LIMIT ?)
+      UNION ALL SELECT * FROM (SELECT ${contextColumns},sh.id AS share_id,c.project_id AS shared_from_project_id
+        FROM context_shares sh CROSS JOIN context_entries c ON c.id=sh.context_id LEFT JOIN context_generation g ON g.context_id=c.id
+        WHERE ${sharedWhere.join(' AND ')} ORDER BY c.created_at DESC,c.id DESC LIMIT ?)
+    ) ORDER BY created_at DESC,id DESC LIMIT ?`).bind(...args,...pageArgs,limit+1,params.get('project_id'),...kind?[kind]:[],...pageArgs,limit+1,limit+1)
       .all<ContextRow>();
   }
   const rows=result.results.slice(0,limit),last=rows.at(-1);
