@@ -26,12 +26,13 @@ const invalidSourceScope = `EXISTS(SELECT 1 FROM context_sources s JOIN events e
     WHERE s.context_id=c.id AND (e.project_id!=c.project_id OR (c.task_id IS NOT NULL AND NOT EXISTS(
       SELECT 1 FROM task_sessions ts WHERE ts.task_id=c.task_id AND ts.session_id=e.session_id
     ))))`;
-const subscriptionSelect=`SELECT s.id,s.device_id,s.project_id,s.kinds,s.created_at,s.created_by,s.revoked_at,s.revoked_by,
+const subscriptionSelect=`SELECT s.id,s.device_id,s.project_id,s.kinds,s.include_shared,s.created_at,s.created_by,s.revoked_at,s.revoked_by,
   d.name AS device_name,d.revoked AS device_revoked,p.name AS project_name
   FROM device_sync_subscriptions s JOIN devices d ON d.id=s.device_id JOIN projects p ON p.id=s.project_id`;
-type SubscriptionRow={id:string;device_id:string;project_id:string;kinds:string;created_at:string;created_by:string;
+type SubscriptionRow={id:string;device_id:string;project_id:string;kinds:string;include_shared:number;created_at:string;created_by:string;
   revoked_at:string|null;revoked_by:string|null;device_name:string;device_revoked:number;project_name:string};
-type EntryRow={id:string;kind:SyncKind;title:string;content:string;task_id:string|null;supersedes_id:string|null;reviewed_at:string};
+type EntryRow={id:string;kind:SyncKind;title:string;content:string;task_id:string|null;supersedes_id:string|null;reviewed_at:string;
+  share_id:string|null;shared_from_project_id:string|null};
 
 function canonicalKinds(kinds:readonly string[]):SyncKind[] {
   if (!Array.isArray(kinds) || !kinds.length || kinds.length>SYNC_KINDS.length || new Set(kinds).size!==kinds.length
@@ -49,7 +50,8 @@ function strict(params:URLSearchParams,allowed:string[]):URLSearchParams {
 }
 function view(row:SubscriptionRow) {
   const {device_revoked,...rest}=row;
-  return {...rest,kinds:JSON.parse(row.kinds) as SyncKind[],status:row.revoked_at?'revoked':'active',device_revoked:!!device_revoked};
+  return {...rest,kinds:JSON.parse(row.kinds) as SyncKind[],include_shared:!!row.include_shared,status:row.revoked_at?'revoked':'active',
+    device_revoked:!!device_revoked};
 }
 function dbError(error:unknown):never {
   if (/sync_subscription_(?:immutable|invalid_state)|sync_audit_immutable/.test(error instanceof Error?error.message:''))
@@ -61,30 +63,39 @@ function dbError(error:unknown):never {
  * Every authoritative approved entry of one project and the selected kinds, in
  * (kind, created_at, id) order, with a hash over the canonical list. Over 500
  * entries or 2 MiB of title+content bytes fails with 413 before any content is
- * read; the response is never silently truncated.
+ * read; the response is never silently truncated. With includeShared, memories other
+ * projects shared with this one join the list, each marked shared_from_project_id and
+ * share_id, and only while the share is active and the entry is still approved with
+ * valid sources (the same read-time check as context recall with include_shared).
  */
-export async function approvedSnapshot(env:Env,projectId:string,options:{kinds:readonly string[]}) {
-  const kinds=canonicalKinds(options.kinds);
-  const scope=`c.project_id=? AND c.status='approved' AND c.sealed=1 AND c.kind IN (${kinds.map(()=>'?').join(',')})
-    AND NOT ${invalidSourceScope}`;
+export async function approvedSnapshot(env:Env,projectId:string,options:{kinds:readonly string[];includeShared?:boolean}) {
+  const kinds=canonicalKinds(options.kinds),includeShared=!!options.includeShared;
+  const own=`SELECT c.*,NULL AS share_id,NULL AS shared_from_project_id FROM context_entries c WHERE c.project_id=?`;
+  const shared=`SELECT c.*,sh.id AS share_id,c.project_id AS shared_from_project_id FROM context_shares sh
+    JOIN context_entries c ON c.id=sh.context_id WHERE sh.target_type='project' AND sh.target_id=? AND sh.revoked_at IS NULL AND c.kind='memory'`;
+  const scope=`FROM (${own}${includeShared?` UNION ALL ${shared}`:''}) c WHERE c.status='approved' AND c.sealed=1
+    AND c.kind IN (${kinds.map(()=>'?').join(',')}) AND NOT ${invalidSourceScope}`;
+  const args=[...includeShared?[projectId,projectId]:[projectId],...kinds];
   const size=await env.DB.prepare(`SELECT COUNT(*) AS entries,
     COALESCE(SUM(length(CAST(c.title AS BLOB))+length(CAST(c.content AS BLOB))),0) AS bytes
-    FROM context_entries c WHERE ${scope}`).bind(projectId,...kinds).first<{entries:number;bytes:number}>();
+    ${scope}`).bind(...args).first<{entries:number;bytes:number}>();
   const tooLarge=()=>new HttpError(413,'Approved snapshot exceeds 500 entries or 2 MiB; narrow the subscription kinds');
   if (!size || size.entries>SNAPSHOT_MAX_ENTRIES || size.bytes>SNAPSHOT_MAX_BYTES) throw tooLarge();
-  const rows=await env.DB.prepare(`SELECT c.id,c.kind,c.title,c.content,c.task_id,c.supersedes_id,c.reviewed_at
-    FROM context_entries c WHERE ${scope} ORDER BY c.kind,c.created_at,c.id LIMIT ?`)
-    .bind(projectId,...kinds,SNAPSHOT_MAX_ENTRIES+1).all<EntryRow>();
+  const rows=await env.DB.prepare(`SELECT c.id,c.kind,c.title,c.content,c.task_id,c.supersedes_id,c.reviewed_at,c.share_id,c.shared_from_project_id
+    ${scope} ORDER BY c.kind,c.created_at,c.id LIMIT ?`)
+    .bind(...args,SNAPSHOT_MAX_ENTRIES+1).all<EntryRow>();
   // An approval between the two reads can grow the set; re-check what was loaded.
   const encoder=new TextEncoder();
   const bytes=rows.results.reduce((total,row)=>total+encoder.encode(row.title).length+encoder.encode(row.content).length,0);
   if (rows.results.length>SNAPSHOT_MAX_ENTRIES || bytes>SNAPSHOT_MAX_BYTES) throw tooLarge();
+  // Own entries keep exactly their earlier shape, so a snapshot without shares hashes as before.
   const entries=await Promise.all(rows.results.map(async row=>({id:row.id,kind:row.kind,title:row.title,content:row.content,
     content_sha256:await digest(row.content),task_id:row.task_id,supersedes_id:row.supersedes_id,
-    reviewed_at:row.reviewed_at,valid_from:row.reviewed_at})));
+    reviewed_at:row.reviewed_at,valid_from:row.reviewed_at,
+    ...(row.share_id?{shared_from_project_id:row.shared_from_project_id,share_id:row.share_id}:{})})));
   const reviewed=entries.map(entry=>entry.reviewed_at).sort().at(-1)??null;
-  return {schema:SNAPSHOT_SCHEMA,project_id:projectId,kinds,entry_count:entries.length,content_bytes:bytes,reviewed_through:reviewed,
-    snapshot_sha256:await digest(stableJSON({schema:SNAPSHOT_SCHEMA,project_id:projectId,kinds,entries})),entries};
+  return {schema:SNAPSHOT_SCHEMA,project_id:projectId,kinds,include_shared:includeShared,entry_count:entries.length,content_bytes:bytes,
+    reviewed_through:reviewed,snapshot_sha256:await digest(stableJSON({schema:SNAPSHOT_SCHEMA,project_id:projectId,kinds,entries})),entries};
 }
 
 function cursor(value:string):[string,string] {
@@ -127,17 +138,18 @@ export async function getSubscription(env:Env,id:string) {
   return {subscription:{...view(row),audit:audit.results}};
 }
 
-async function body(request:Request,keys:string[]):Promise<Record<string,unknown>> {
+async function body(request:Request,keys:string[],optional:string[]=[]):Promise<Record<string,unknown>> {
   const value=await readJson(request);
   if (!value || typeof value!=='object' || Array.isArray(value) ||
-      Object.keys(value).some(key=>!keys.includes(key)) || keys.some(key=>!Object.hasOwn(value,key)))
+      Object.keys(value).some(key=>!keys.includes(key) && !optional.includes(key)) || keys.some(key=>!Object.hasOwn(value,key)))
     throw new HttpError(400,'Body must contain only the required fields');
   return value as Record<string,unknown>;
 }
 async function createSubscription(request:Request,env:Env,actor:string) {
-  const value=await body(request,['device_id','project_id','kinds']);
+  const value=await body(request,['device_id','project_id','kinds'],['include_shared']);
   if (typeof value.device_id!=='string' || !devicePattern.test(value.device_id)) throw new HttpError(400,'Invalid device identifier');
-  const deviceId=value.device_id,projectId=hashId(value.project_id);
+  if (value.include_shared!==undefined && typeof value.include_shared!=='boolean') throw new HttpError(400,'include_shared must be true or false');
+  const deviceId=value.device_id,projectId=hashId(value.project_id),includeShared=value.include_shared?1:0;
   const kinds=JSON.stringify(canonicalKinds(Array.isArray(value.kinds)?value.kinds:[]));
   const device=await env.DB.prepare('SELECT revoked FROM devices WHERE id=?').bind(deviceId).first<{revoked:number}>();
   if (!device) throw new HttpError(404,'Device not found');
@@ -148,16 +160,16 @@ async function createSubscription(request:Request,env:Env,actor:string) {
   // so concurrent grants cannot exceed the bound or create two active rows.
   let result;
   try {
-    result=await env.DB.prepare(`INSERT INTO device_sync_subscriptions(id,device_id,project_id,kinds,created_at,created_by)
-      SELECT ?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM devices WHERE id=? AND revoked=0)
+    result=await env.DB.prepare(`INSERT INTO device_sync_subscriptions(id,device_id,project_id,kinds,include_shared,created_at,created_by)
+      SELECT ?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM devices WHERE id=? AND revoked=0)
         AND (SELECT COUNT(*) FROM device_sync_subscriptions WHERE device_id=? AND revoked_at IS NULL)<?
-      ON CONFLICT DO NOTHING`).bind(id,deviceId,projectId,kinds,now,actor,deviceId,deviceId,MAX_ACTIVE_SUBSCRIPTIONS).run();
+      ON CONFLICT DO NOTHING`).bind(id,deviceId,projectId,kinds,includeShared,now,actor,deviceId,deviceId,MAX_ACTIVE_SUBSCRIPTIONS).run();
   } catch (error) {dbError(error);}
   if (result!.meta.changes>0) return json({...await getSubscription(env,id),created:true},201);
-  const active=await env.DB.prepare('SELECT id,kinds FROM device_sync_subscriptions WHERE device_id=? AND project_id=? AND revoked_at IS NULL')
-    .bind(deviceId,projectId).first<{id:string;kinds:string}>();
-  if (active && active.kinds===kinds) return json({...await getSubscription(env,active.id),created:false});
-  if (active) throw new HttpError(409,'An active subscription with other kinds exists; revoke it first');
+  const active=await env.DB.prepare('SELECT id,kinds,include_shared FROM device_sync_subscriptions WHERE device_id=? AND project_id=? AND revoked_at IS NULL')
+    .bind(deviceId,projectId).first<{id:string;kinds:string;include_shared:number}>();
+  if (active && active.kinds===kinds && active.include_shared===includeShared) return json({...await getSubscription(env,active.id),created:false});
+  if (active) throw new HttpError(409,'An active subscription with other kinds or shared-entry setting exists; revoke it first');
   throw new HttpError(409,`Device credential is revoked or already has ${MAX_ACTIVE_SUBSCRIPTIONS} active subscriptions`);
 }
 async function revokeSubscription(request:Request,env:Env,id:string,actor:string) {
@@ -180,10 +192,12 @@ export async function syncRead(request:Request,env:Env):Promise<Response|null> {
   if (request.method!=='GET') return null;
   const url=new URL(request.url),path=url.pathname;
   if (path==='/api/context/snapshot') {
-    const params=strict(url.searchParams,['project_id','kind']),projectId=hashId(params.get('project_id'));
+    const params=strict(url.searchParams,['project_id','kind','include_shared']),projectId=hashId(params.get('project_id'));
     const kinds=params.has('kind')?[params.get('kind')!]:[...SYNC_KINDS];
+    const shared=params.get('include_shared');
+    if (shared!==null && shared!=='0' && shared!=='1') throw new HttpError(400,'include_shared must be 0 or 1');
     if (!await env.DB.prepare('SELECT id FROM projects WHERE id=?').bind(projectId).first()) throw new HttpError(404,'Project not found');
-    return json({snapshot:await approvedSnapshot(env,projectId,{kinds})});
+    return json({snapshot:await approvedSnapshot(env,projectId,{kinds,includeShared:shared==='1'})});
   }
   if (path==='/api/sync/subscriptions') return json(await listSubscriptions(env,url.searchParams));
   const match=/^\/api\/sync\/subscriptions\/([^/]+)$/.exec(path);
@@ -212,18 +226,20 @@ export async function syncDeviceRead(request:Request,env:Env,device:Device):Prom
   const url=new URL(request.url);
   if (url.pathname==='/v1/sync/subscriptions') {
     if (url.search) throw new HttpError(400,'Invalid sync query');
-    const rows=await env.DB.prepare(`SELECT id,project_id,kinds,created_at FROM device_sync_subscriptions
+    const rows=await env.DB.prepare(`SELECT id,project_id,kinds,include_shared,created_at FROM device_sync_subscriptions
       WHERE device_id=? AND revoked_at IS NULL ORDER BY created_at,id LIMIT ?`).bind(device.id,MAX_ACTIVE_SUBSCRIPTIONS)
-      .all<{id:string;project_id:string;kinds:string;created_at:string}>();
-    return json({device_id:device.id,subscriptions:rows.results.map(row=>({...row,kinds:JSON.parse(row.kinds) as SyncKind[]}))});
+      .all<{id:string;project_id:string;kinds:string;include_shared:number;created_at:string}>();
+    return json({device_id:device.id,subscriptions:rows.results.map(row=>({...row,kinds:JSON.parse(row.kinds) as SyncKind[],
+      include_shared:!!row.include_shared}))});
   }
   if (url.pathname!=='/v1/sync/snapshot') return null;
   // The subscription decides the kinds; a query parameter can never widen them.
   if (url.searchParams.has('kind')) throw new HttpError(400,'The subscription decides the kinds; remove kind');
   const projectId=hashId(strict(url.searchParams,['project_id']).get('project_id'));
-  const subscription=await env.DB.prepare(`SELECT id,kinds FROM device_sync_subscriptions
-    WHERE device_id=? AND project_id=? AND revoked_at IS NULL`).bind(device.id,projectId).first<{id:string;kinds:string}>();
+  const subscription=await env.DB.prepare(`SELECT id,kinds,include_shared FROM device_sync_subscriptions
+    WHERE device_id=? AND project_id=? AND revoked_at IS NULL`).bind(device.id,projectId).first<{id:string;kinds:string;include_shared:number}>();
   if (!subscription) throw new HttpError(403,'No active sync subscription for this device and project');
-  const snapshot=await approvedSnapshot(env,projectId,{kinds:JSON.parse(subscription.kinds)});
+  // Shared entries only when the reviewer granted them on this subscription.
+  const snapshot=await approvedSnapshot(env,projectId,{kinds:JSON.parse(subscription.kinds),includeShared:!!subscription.include_shared});
   return json({snapshot:{...snapshot,subscription_id:subscription.id}});
 }

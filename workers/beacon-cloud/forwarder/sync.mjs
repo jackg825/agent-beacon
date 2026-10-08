@@ -269,6 +269,10 @@ export function verifySnapshot(snapshot, target) {
       typeof entry.content !== 'string' || !entry.content || codePoints(entry.content) > 12000 ||
       ![entry.task_id, entry.supersedes_id].every((id) => id === null || (typeof id === 'string' && uuidPattern.test(id))) ||
       typeof entry.reviewed_at !== 'string' || !timePattern.test(entry.reviewed_at) || entry.valid_from !== entry.reviewed_at) throw fail('INVALID_SNAPSHOT');
+    // A memory another project shared names that project and the share, both or neither.
+    const shared = 'shared_from_project_id' in entry || 'share_id' in entry;
+    if (shared && (entry.kind !== 'memory' || typeof entry.shared_from_project_id !== 'string' || !hashPattern.test(entry.shared_from_project_id) ||
+      entry.shared_from_project_id === snapshot.project_id || typeof entry.share_id !== 'string' || !uuidPattern.test(entry.share_id))) throw fail('INVALID_SNAPSHOT');
     if (entry.content_sha256 !== hash(entry.content)) throw fail('SNAPSHOT_INTEGRITY_FAILED');
     ids.add(entry.id);
   }
@@ -309,11 +313,15 @@ export function renderSnapshot(snapshot) {
     '> 控制字元以 \\u{…} 顯示；content_sha256 是中央服務原文的雜湊。',
     '',
   ];
+  // Only snapshots that carry shared memories gain this line, so other files render as before.
+  if (snapshot.entries.some((entry) => entry.shared_from_project_id))
+    lines.splice(lines.length - 1, 0, '> 標有 shared_from_project_id 的長期記憶屬於其他專案，由審閱者明確共享到這個專案。');
   snapshot.entries.forEach((entry, index) => {
     lines.push(`## ${index + 1}. ${escapeTitle(entry.title)}`, '', `- id: ${entry.id}`, `- kind: ${entry.kind}`,
       `- reviewed_at: ${entry.reviewed_at}`, `- content_sha256: ${entry.content_sha256}`);
     if (entry.task_id) lines.push(`- task_id: ${entry.task_id}`);
     if (entry.supersedes_id) lines.push(`- supersedes_id: ${entry.supersedes_id}`);
+    if (entry.shared_from_project_id) lines.push(`- shared_from_project_id: ${entry.shared_from_project_id}`, `- share_id: ${entry.share_id}`);
     const content = visible(entry.content.replace(/\r\n/g, '\n'));
     // A fence longer than any backtick run inside cannot be closed by the content.
     const fence = '`'.repeat(Math.max(3, longestBacktickRun(content) + 1));

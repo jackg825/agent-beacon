@@ -291,7 +291,7 @@ test('a device reads only the subscribed kinds of its own active subscriptions',
       `project_id=${alpha.project_id}&project_id=${alpha.project_id}`,`project_id=${alpha.project_id}&limit=1`,'project_id=x',''])
       await rejects(read('/v1/sync/snapshot?'+query),400);
     const own=await json(await read('/v1/sync/subscriptions'));
-    assert.deepEqual(own,{device_id:'mbp',subscriptions:[{id:grant.id,project_id:alpha.project_id,kinds:['memory'],created_at:grant.created_at}]});
+    assert.deepEqual(own,{device_id:'mbp',subscriptions:[{id:grant.id,project_id:alpha.project_id,kinds:['memory'],include_shared:false,created_at:grant.created_at}]});
     assert.deepEqual((await json(await read('/v1/sync/subscriptions','mini'))).subscriptions,[]);
     await rejects(read('/v1/sync/subscriptions?device_id=mini'),400);
     for (const path of ['/v1/sync/other','/v1/sync/snapshot/x','/v1/sync']) assert.equal(await read(path),null);
