@@ -4,7 +4,7 @@ import { insertCandidate } from '../src/context';
 import { runMaintenance } from '../src/maintenance';
 import { PROCESSING_ALLOTMENT, processingMaintenance, processingWrite } from '../src/processing';
 import { MAX_ATTEMPTS, planTick } from '../src/processing-planner';
-import { BACKOFF_MINUTES } from '../src/processing-runner';
+import { BACKOFF_MINUTES, EXTERNAL_TIMEOUT_MS, LEASE_MIN_MS } from '../src/processing-runner';
 import { SelectionStage } from '../src/processing-stage';
 import { projectWrite } from '../src/project-workflows';
 import { Env } from '../src/types';
@@ -249,6 +249,32 @@ test('expired leases are reclaimed, and a completion from a lost lease commits n
     assert.equal(await count(f.env, 'processing_job_fence'), 0);
     await assert.rejects(f.env.DB.prepare('INSERT INTO processing_job_fence(job_id,lease_owner,attempts) VALUES(?,?,?)')
       .bind(stolen.id, 'crashed', 1).run(), /processing_lease_lost/);
+  } finally { await f.close(); }
+});
+
+test('a claim holds its lease for the invocation plus the longest call and a minute, and an overlapping tick leaves it alone', async () => {
+  const f = await createEnvFixture();
+  try {
+    await setPolicy(f.env, workspace, { min_new_events: 1000 });
+    const base = later(60), held: { lease_until: string; overlap: any }[] = [];
+    // While the job runs, another invocation starts five minutes later and must find nothing to claim.
+    const stage: SelectionStage = async ({ env, job_id }) => {
+      const row = await env.DB.prepare('SELECT lease_until FROM processing_jobs WHERE id=?').bind(job_id).first<{ lease_until: string }>();
+      held.push({ lease_until: row!.lease_until, overlap: await tick(f.env, new Date(base.getTime() + 5 * 60_000)) });
+      return { decision: 'continue', signals: [] };
+    };
+    for (const [index, budgetMs] of [25_000, 600_000].entries()) {
+      await f.ingest(command(`hold-${index}`, 'npm test', 0, { repo: `hold-${index}`, session: `hold-${index}` }));
+      await run(f.env, { project_id: (await f.event(`hold-${index}`))!.project_id });
+      // A fixed clock: remaining() is exactly the invocation budget when the job is claimed.
+      const report = await runMaintenance({ ...f.env, MAINTENANCE_TASKS: 'processing' } as Env,
+        { now: base, tasks: staged(stage), budgetMs, clock: () => 0 });
+      assert.deepEqual(report.processing.result!.run_outcomes, { succeeded: 1 });
+    }
+    // At least ten minutes; otherwise remaining time + the 30 s longest call + 60 s.
+    assert.deepEqual(held.map((item) => Date.parse(item.lease_until) - base.getTime()), [LEASE_MIN_MS, 600_000 + EXTERNAL_TIMEOUT_MS + 60_000]);
+    assert.deepEqual([LEASE_MIN_MS, EXTERNAL_TIMEOUT_MS], [10 * 60_000, 30_000]);
+    for (const { overlap } of held) assert.deepEqual([overlap.ok, overlap.result.expired, overlap.result.claimed], [true, 0, 0]);
   } finally { await f.close(); }
 });
 
