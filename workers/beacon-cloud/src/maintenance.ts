@@ -1,11 +1,9 @@
 import { Env, HttpError } from './types';
 import { processingMaintenance } from './processing';
 import { operationsMaintenance } from './operations';
+import { MaintenanceError } from './maintenance-error';
 
-/** Error codes are the only failure detail a scheduled report carries. */
-export class MaintenanceError extends Error {
-  constructor(public code: string) { super(code); }
-}
+export { MaintenanceError };
 export type Schedule = 'frequent' | 'hourly';
 // Workers Paid gives crons firing at least hourly 15 min of CPU instead of 30 s,
 // so heavy maintenance (backup, health) runs on the hourly schedule.
