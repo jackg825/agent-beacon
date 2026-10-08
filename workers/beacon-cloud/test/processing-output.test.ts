@@ -218,9 +218,9 @@ test('job reads list identifiers, codes and counts only, with filters and keyset
     // A task without linked sessions has no scope to plan.
     assert.deepEqual(await run(f.env, { task_id: await newTask(f.env, 'Synthetic empty task') }), { scopes: [] });
     await rejects(processingWrite(post('/api/processing/run', { project_id: 'e'.repeat(64) }), f.env, reviewer), 404);
-    // Budget and usage routes belong to part B; until then they are not served.
-    assert.equal(await processingWrite(post('/api/processing/budget', {}), f.env, reviewer), null);
-    assert.equal(await processingRead(new Request('http://localhost/api/processing/usage'), f.env), null);
+    // Unknown processing paths are left to the router's 404.
+    assert.equal(await processingWrite(post('/api/processing/unknown', {}), f.env, reviewer), null);
+    assert.equal(await processingRead(new Request('http://localhost/api/processing/unknown'), f.env), null);
     assert.equal(await processingWrite(post('/api/context', {}), f.env, reviewer), null);
   } finally { await f.close(); }
 });

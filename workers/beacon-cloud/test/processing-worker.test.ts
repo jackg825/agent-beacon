@@ -11,6 +11,7 @@ import { openPolicy } from './processing-helpers';
 import { workflowEvent, workflowTokens as tokens } from './workflow-fixture';
 
 const hash = (text: string) => createHash('sha256').update(text).digest('hex');
+const budget = { daily_call_limit: 3, daily_token_limit: 30_000, daily_usd_ceiling: null, max_input_chars: 8000, max_output_tokens: 256, timeout_ms: 5000 };
 
 test('bundled Worker: processing routes keep roles separate and a scheduled tick produces a pending candidate', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'beacon-processing-'));
@@ -37,18 +38,25 @@ test('bundled Worker: processing routes keep roles separate and a scheduled tick
     const frequent = (minutes: number) => worker.scheduled({ cron: '*/15 * * * *', scheduledTime: new Date(Date.now() + minutes * 60_000) });
 
     await t.test('every read route needs read authority; device, MCP and review credentials are refused', async () => {
-      for (const path of ['/api/processing/policy', '/api/processing/policy?project_id=' + project, '/api/processing/jobs', '/api/processing/jobs/' + '0'.repeat(64)]) {
+      for (const path of ['/api/processing/policy', '/api/processing/policy?project_id=' + project, '/api/processing/jobs', '/api/processing/jobs/' + '0'.repeat(64),
+        '/api/processing/usage', '/api/processing/usage?day=2026-10-08']) {
         for (const token of [undefined, tokens.mcp, tokens.mbp, tokens.review]) assert.equal((await get(path, token)).status, 401, `${path} ${token}`);
         assert.notEqual((await get(path, tokens.read)).status, 401);
       }
       assert.equal((await get('/api/processing/jobs/' + '0'.repeat(64), tokens.read)).status, 404);
       assert.equal((await get('/api/processing/jobs?status=bad', tokens.read)).status, 400);
+      for (const query of ['?day=2026-13-01', '?day=yesterday', '?other=1', '?day=2026-10-08&day=2026-10-09'])
+        assert.equal((await get('/api/processing/usage' + query, tokens.read)).status, 400, query);
+      const usage = (await (await get('/api/processing/usage?day=2026-10-08', tokens.read)).json()) as any;
+      // No budget row: every limit is zero and nothing can be reserved.
+      assert.equal(usage.budget.configured, false); assert.equal(usage.budget.external_enabled, false);
+      assert.deepEqual([usage.usage.calls, usage.remaining.calls, usage.cost_basis], [0, 0, 'provider_reported']);
     });
 
     await t.test('every write route needs the independent review credential and a same-origin request', async () => {
       const writes: [string, unknown][] = [['/api/processing/policies', { ...openPolicy, scope_type: 'workspace', scope_id: '*' }],
         ['/api/processing/run', { project_id: project }], ['/api/processing/jobs/' + '0'.repeat(64) + '/retry', {}],
-        ['/api/processing/jobs/' + '0'.repeat(64) + '/dismiss', {}]];
+        ['/api/processing/jobs/' + '0'.repeat(64) + '/dismiss', {}], ['/api/processing/budget', budget]];
       for (const [path, body] of writes) {
         for (const token of [undefined, tokens.read, tokens.mcp, tokens.mbp]) assert.equal((await post(path, body, token)).status, 403, `${path} ${token}`);
         assert.equal((await post(path, body, tokens.review, { Origin: 'https://hostile.invalid' })).status, 403);
@@ -56,7 +64,13 @@ test('bundled Worker: processing routes keep roles separate and a scheduled tick
       // Disabled by default: running a scope is refused, never forced.
       assert.equal((await post('/api/processing/run', { project_id: project }, tokens.review)).status, 409);
       assert.equal((await post('/api/processing/jobs/' + '0'.repeat(64) + '/retry', {}, tokens.review)).status, 404);
-      assert.equal((await post('/api/processing/budget', {}, tokens.review)).status, 404);
+      for (const invalid of [{}, { ...budget, daily_call_limit: -1 }, { ...budget, timeout_ms: 30_001 }, { ...budget, daily_usd_ceiling: '1' }, { ...budget, extra: 1 }])
+        assert.equal((await post('/api/processing/budget', invalid, tokens.review)).status, 400, JSON.stringify(invalid));
+      const limited = await post('/api/processing/budget', budget, tokens.review);
+      assert.equal(limited.status, 200);
+      const view = (await limited.json()) as any;
+      assert.deepEqual([view.budget.version, view.budget.daily_call_limit, view.budget.updated_by, view.audit.length],
+        [1, 3, 'reviewer:' + hash(tokens.review).slice(0, 16), 1]);
       assert.equal((await post('/api/processing/policies', { ...openPolicy, scope_type: 'workspace', scope_id: '*', extra: 1 }, tokens.review)).status, 400);
       const saved = await post('/api/processing/policies', { ...openPolicy, scope_type: 'workspace', scope_id: '*', summary_fields: ['command_text'] }, tokens.review);
       assert.equal(saved.status, 200);
