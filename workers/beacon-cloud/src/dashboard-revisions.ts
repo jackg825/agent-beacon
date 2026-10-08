@@ -37,7 +37,7 @@ export const revisionsScript = String.raw`
           if (item.relation !== 'self') row.append(button('查看這個版本', () => selectContext(item.id)));
           list.append(row);
         }
-        if (data.truncated) list.append(text('li', '修訂鏈很長，只列出最早的 ' + data.entries.length + ' 份。'));
+        if (data.truncated) list.append(text('li', '修訂鏈很長，只列出最接近這份筆記的 ' + data.entries.length + ' 份（依修訂距離），更早或更晚的版本未列出。'));
       } catch (error) { loaded = false; failure(error); }
     });
     return chain;

@@ -159,7 +159,7 @@ Context 清單的狀態預設為已核准且 D1 來源範圍有效；明確指�
 - `valid_from` 是核准時間（等於 `reviewed_at`）；待審與已拒絕的候選為 `null`。
 - `valid_until` 是取代它的新版本被核准的時間；目前版本為 `null`。一份筆記最多只會有一個核准的新版本，所以期間不重疊，有效期間是 `[valid_from, valid_until)`。
 - 有效期間和權威性分開：來源範圍後來改變時，筆記仍在它的期間內，但 `authoritative=false`。
-- `GET /api/context/:id/history` 回傳這份筆記往前的所有舊版，以及往後的所有修訂（包含待審與已拒絕的修訂），依建立時間排序。每筆附 `relation`（`ancestor`／`self`／`descendant`）、有效期間、權威性、`open_flags` 與審閱紀錄；不含內容，內容請讀詳情。最多 100 筆，超過時 `truncated=true`。從最新版本往回看，不會列出舊版底下另一條被拒絕的修訂分支。
+- `GET /api/context/:id/history` 回傳這份筆記往前的所有舊版，以及往後的所有修訂（包含待審與已拒絕的修訂），依建立時間排序。每筆附 `relation`（`ancestor`／`self`／`descendant`）、有效期間、權威性、`open_flags` 與審閱紀錄；不含內容，內容請讀詳情。最多 100 筆：鏈更長時保留離這份筆記最近的版本（依修訂距離，同距離較舊的優先），這份筆記本身一定在內，並回傳 `truncated=true`。從最新版本往回看，不會列出舊版底下另一條被拒絕的修訂分支。
 - `GET /api/context?as_of=<UTC ISO 時間>` 回傳那一刻已核准、尚未被取代的筆記（現在可能已是 `superseded`）。這是歷史查詢：不套用目前的來源範圍，`authoritative` 仍代表現在的狀態；不能和 `status` 一起使用。時間必須是 `Z` 結尾的 UTC，可省略毫秒。
 
 ### 待確認標記

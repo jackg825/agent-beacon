@@ -4,7 +4,7 @@
 // new revision through the existing supersede flow, and a share is re-checked on
 // every read. See CONTEXT-WORKFLOWS.md.
 import { z } from 'zod';
-import { contextColumns, contextFrom, contextView, ContextRow, flagSelect, FlagRow, flagView, invalidSourceScope, shareSelect, ShareRow,
+import { contextColumns, contextView, ContextRow, flagSelect, FlagRow, flagView, invalidSourceScope, shareSelect, ShareRow,
   shareView } from './context';
 import type { ProjectedEvent } from './privacy';
 import { CONTRADICTION_SIGNAL, isHighSignal, StageSignal } from './processing-stage';
@@ -42,7 +42,9 @@ function dbError(error: unknown): never {
  * The revision chain around one entry: every ancestor through supersedes_id and every
  * descendant (approved, superseded, pending or rejected revisions), oldest first, each
  * with its validity window, authority, open flag count and review audit. Content is left
- * to the entry detail, so a long chain stays small.
+ * to the entry detail, so a long chain stays small. A chain longer than MAX_HISTORY keeps
+ * the entries nearest the requested one (by revision distance, then age), so the entry
+ * itself and its neighbours are always there; `truncated` says that farther ones exist.
  */
 export async function contextHistory(env: Env, id: string) {
   if (!uuid.safeParse(id).success) throw new HttpError(400, 'Invalid context id');
@@ -50,11 +52,14 @@ export async function contextHistory(env: Env, id: string) {
   const rows = (await env.DB.prepare(`WITH RECURSIVE
       up(id,depth) AS (SELECT ?,0 UNION SELECT c.supersedes_id,up.depth+1 FROM context_entries c JOIN up ON c.id=up.id
         WHERE c.supersedes_id IS NOT NULL AND up.depth<?),
-      down(id,depth) AS (SELECT ?,0 UNION SELECT c.id,down.depth+1 FROM context_entries c JOIN down ON c.supersedes_id=down.id WHERE down.depth<?)
+      down(id,depth) AS (SELECT ?,0 UNION SELECT c.id,down.depth+1 FROM context_entries c JOIN down ON c.supersedes_id=down.id WHERE down.depth<?),
+      near(id,distance) AS (SELECT id,MIN(depth) FROM (SELECT id,depth FROM up UNION ALL SELECT id,depth FROM down) GROUP BY id)
     SELECT ${contextColumns},CASE WHEN c.id=? THEN 'self' WHEN c.id IN (SELECT id FROM up) THEN 'ancestor' ELSE 'descendant' END AS relation
-    ${contextFrom} WHERE c.sealed=1 AND c.id IN (SELECT id FROM up UNION SELECT id FROM down) ORDER BY c.created_at,c.id LIMIT ?`)
+    FROM near JOIN context_entries c ON c.id=near.id LEFT JOIN context_generation g ON g.context_id=c.id
+    WHERE c.sealed=1 ORDER BY near.distance,c.created_at,c.id LIMIT ?`)
     .bind(id, MAX_HISTORY, id, MAX_HISTORY, id, MAX_HISTORY + 1).all<ContextRow & { relation: string }>()).results;
-  const kept = rows.slice(0, MAX_HISTORY);
+  // Nearest first decides what is kept; the response is oldest first.
+  const kept = rows.slice(0, MAX_HISTORY).sort((a, b) => a.created_at < b.created_at ? -1 : a.created_at > b.created_at ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
   const audit = (await env.DB.prepare(`SELECT context_id,id,actor,action,reason,created_at FROM context_audit
     WHERE context_id IN (SELECT value FROM json_each(?)) ORDER BY created_at,id`).bind(JSON.stringify(kept.map((row) => row.id)))
     .all<{ context_id: string; id: string; actor: string; action: string; reason: string | null; created_at: string }>()).results;

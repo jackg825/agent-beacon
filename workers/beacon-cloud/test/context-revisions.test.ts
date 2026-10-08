@@ -126,6 +126,39 @@ test('revision lookups stay on the revision index once statistics exist (EXPLAIN
   } finally { await f.close(); }
 });
 
+test('a history longer than its limit keeps the requested entry and the revisions nearest to it', async () => {
+  const f = await createEnvFixture();
+  try {
+    await f.ingest(syntheticEvent('long-1'));
+    const from = await source(f, 'long-1');
+    const chain = [await note(f.env, from, { title: 'long v0' }, 'approve')];
+    // 104 more approved revisions through the real triggers, each superseding the previous, in one D1 batch.
+    const db = f.env.DB, statements: D1PreparedStatement[] = [], start = Date.now() + 1000;
+    for (let index = 1; index <= 104; index++) {
+      const id = crypto.randomUUID(), at = new Date(start + index * 1000).toISOString();
+      statements.push(
+        db.prepare(`INSERT INTO context_entries(id,kind,project_id,title,content,supersedes_id,created_at) VALUES(?,'memory',?,?,'Synthetic only.',?,?)`)
+          .bind(id, from.project_id, 'long v' + index, chain.at(-1), at),
+        db.prepare('INSERT INTO context_sources(context_id,event_id,payload_hash,ordinal) VALUES(?,?,?,0)').bind(id, from.id, from.payload_hash),
+        db.prepare('UPDATE context_entries SET sealed=1 WHERE id=?').bind(id),
+        db.prepare(`UPDATE context_entries SET status='approved',review_id=?,reviewed_at=?,reviewed_by=? WHERE id=?`).bind(crypto.randomUUID(), at, reviewer, id));
+      chain.push(id);
+    }
+    await db.batch(statements);
+    const newest = await contextHistory(f.env, chain[104]);
+    assert.equal(newest.truncated, true);
+    assert.deepEqual(newest.entries.map((entry: any) => entry.id), chain.slice(5), 'the entry itself and its 99 nearest ancestors, oldest first');
+    assert.deepEqual([newest.entries.at(-1)!.relation, newest.entries.filter((entry: any) => entry.relation === 'self').length], ['self', 1]);
+    // From the middle: the nearest on both sides, the older one first at equal distance.
+    const middle = await contextHistory(f.env, chain[50]);
+    assert.equal(middle.truncated, true);
+    assert.deepEqual(middle.entries.map((entry: any) => entry.id), chain.slice(0, 100));
+    assert.equal(middle.entries.find((entry: any) => entry.id === chain[50])!.relation, 'self');
+    assert.equal((await contextHistory(f.env, chain[3])).truncated, true);
+    assert.equal((await contextHistory(f.env, chain[3])).entries.length, 100);
+  } finally { await f.close(); }
+});
+
 test('reviewer flags need an approved entry and existing evidence, close once with a reason, and never touch the note', async () => {
   const f = await createEnvFixture();
   try {
