@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BACKUP_BOOKKEEPING } from '../src/operations-shared';
 import { Manifest, backupTask, backupsReviewerRead, backupsWrite, createBackupTask, expireCheckpoint } from '../src/backup';
+import { revisionsWrite } from '../src/context-revisions';
 import { runMaintenance } from '../src/maintenance';
 import { Env } from '../src/types';
 import { RestoreError, bucketSource, dirSource, httpSource, parseArgs, readReviewToken, reportSha256, restoreCheck, runCli, verifyRequest, workerUrl }
@@ -38,8 +39,22 @@ async function seed(fixture: Awaited<ReturnType<typeof createEnvFixture>>) {
   const base = { kind: 'memory', project_id: event.project_id, title: 'Synthetic note', content: 'Synthetic content only.',
     sources: [{ event_id: event.id, payload_hash: event.payload_hash }] };
   const parent = await createContext(fixture.env, base, 'approve');
-  await createContext(fixture.env, { ...base, title: 'Synthetic revision', supersedes_id: parent }, 'approve');
+  const revision = await createContext(fixture.env, { ...base, title: 'Synthetic revision', supersedes_id: parent }, 'approve');
   await createContext(fixture.env, { ...base, kind: 'summary', title: 'Synthetic rejected' }, 'reject');
+  // Track R rows, which the drill reloads with their triggers deferred: an open and a dismissed
+  // flag with exact evidence, and a revoked then re-created share to another project.
+  const revise = async (path: string, body: unknown) => {
+    const response = await revisionsWrite(post(path, body), fixture.env, reviewer);
+    assert.ok(response && response.status < 300, await response?.clone().text());
+    return response!.json() as Promise<any>;
+  };
+  const evidence = [{ event_id: event.id, payload_hash: event.payload_hash }];
+  await revise(`/api/context/${revision}/flags`, { kind: 'needs_review', note: 'Synthetic open flag', evidence });
+  const dismissed = (await revise(`/api/context/${revision}/flags`, { kind: 'contradiction', evidence })).flag.id;
+  await revise(`/api/context/flags/${dismissed}/resolve`, { resolution: 'dismissed', reason: 'Synthetic dismissal' });
+  const target = { target_type: 'project', target_id: (await fixture.event('backup-4'))!.project_id };
+  await revise(`/api/context/shares/${(await revise(`/api/context/${revision}/shares`, target)).share.id}/revoke`, {});
+  await revise(`/api/context/${revision}/shares`, target);
   // A table (and trigger) added by a later track appears in the snapshot and the drill automatically.
   const migrations = await addTrackMigration(fixture.env);
   await fixture.env.DB.prepare('INSERT INTO zz_track_notes VALUES(?,?,?)').bind('synthetic-track-row', event.project_id, 'synthetic').run();
@@ -110,7 +125,9 @@ test('a checkpoint chunks rows, snapshots every other table, copies raw batches,
       assert.equal(report.counts.raw_objects, manifest.raw.objects);
       assert.ok(report.triggers.expected >= 20 && report.triggers.matched === report.triggers.expected);
       for (const check of ['manifest_sha256', 'chunk_sha256', 'raw_sha256', 'foreign_key_check', 'triggers_recreated', 'context_review_invariants',
-        'payload_rehash', 'device_identity', 'row_counts', 'project_drift']) assert.ok(report.checks.includes(check), check);
+        'context_revision_invariants', 'payload_rehash', 'device_identity', 'row_counts', 'project_drift']) assert.ok(report.checks.includes(check), check);
+      for (const table of ['context_flags', 'context_flag_audit', 'context_shares', 'context_share_audit'])
+        assert.ok(manifest.table_counts[table] >= 2, `${table} rows are part of the drill`);
       assert.deepEqual(report.findings, []);
       assert.equal(reportSha256(report), reportSha256(JSON.parse(JSON.stringify(report))));
       assert.ok(!JSON.stringify(report).includes(event.id) && !JSON.stringify(report).includes('Synthetic'));

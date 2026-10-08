@@ -275,6 +275,22 @@ export async function restoreCheck(options: { checkpointId: string; source: Back
       ] as const) { const n = await count(sql); if (n) fail(code, n); }
       checks.push('context_review_invariants');
     }
+    if (['context_flags', 'context_flag_audit', 'context_shares', 'context_share_audit', 'event_versions'].every(table => columns.has(table))) {
+      // The flag and share triggers were deferred while loading: check what they normally guarantee.
+      for (const [code, sql] of [
+        ['context_flag_audit_missing', `SELECT COUNT(*) AS n FROM context_flags f WHERE NOT EXISTS(SELECT 1 FROM context_flag_audit a
+          WHERE a.id=f.id||':create' AND a.flag_id=f.id) OR (f.status!='open' AND NOT EXISTS(SELECT 1 FROM context_flag_audit a
+          WHERE a.id=f.id||':'||CASE f.status WHEN 'resolved' THEN 'resolve' ELSE 'dismiss' END AND a.flag_id=f.id))`],
+        // Retention never deletes a version an open flag cites, so open evidence must still resolve.
+        ['context_flag_evidence_unresolved', `SELECT COUNT(*) AS n FROM context_flags f, json_each(f.evidence) j WHERE f.status='open'
+          AND NOT EXISTS(SELECT 1 FROM event_versions v WHERE v.event_id=json_extract(j.value,'$.event_id')
+            AND v.payload_hash=json_extract(j.value,'$.payload_hash'))`],
+        ['context_share_audit_missing', `SELECT COUNT(*) AS n FROM context_shares s WHERE NOT EXISTS(SELECT 1 FROM context_share_audit a
+          WHERE a.id=s.id||':create' AND a.share_id=s.id) OR (s.revoked_at IS NOT NULL AND NOT EXISTS(SELECT 1 FROM context_share_audit a
+          WHERE a.id=s.id||':revoke' AND a.share_id=s.id))`],
+      ] as const) { const n = await count(sql); if (n) fail(code, n); }
+      checks.push('context_revision_invariants');
+    }
     if (columns.has('devices')) {
       const devices = await db.prepare('SELECT COUNT(*) AS n,COUNT(DISTINCT token_hash) AS digests FROM devices').first<{ n: number; digests: number }>();
       if (devices!.n !== manifest.table_counts.devices || devices!.digests !== devices!.n) fail('device_token_digest_mismatch');
