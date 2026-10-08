@@ -32,12 +32,20 @@ export async function createEnvFixture(options: { backup?: boolean; bindings?: P
     compatibilityDate: '2026-10-01', d1Databases: { DB: 'fixture-index' },
     r2Buckets: options.backup ? { RAW: 'fixture-raw', BACKUP: 'fixture-backup' } : { RAW: 'fixture-raw' },
   }] }));
-  const env = { DB: await mf.getD1Database('DB'), RAW: await mf.getR2Bucket('RAW'),
-    ...(options.backup ? { BACKUP: await mf.getR2Bucket('BACKUP') } : {}), ...options.bindings } as unknown as Env;
-  await applyMigrations(env.DB);
-  for (const device of Object.values(fixtureDevices)) {
-    await env.DB.prepare('INSERT INTO devices(id,name,token_hash,created_at) VALUES(?,?,?,?)')
-      .bind(device.id, device.name, device.token_hash, '2026-10-08T00:00:00Z').run();
+  let env: Env;
+  try {
+    env = { DB: await mf.getD1Database('DB'), RAW: await mf.getR2Bucket('RAW'),
+      ...(options.backup ? { BACKUP: await mf.getR2Bucket('BACKUP') } : {}), ...options.bindings } as unknown as Env;
+    await applyMigrations(env.DB);
+    for (const device of Object.values(fixtureDevices)) {
+      await env.DB.prepare('INSERT INTO devices(id,name,token_hash,created_at) VALUES(?,?,?,?)')
+        .bind(device.id, device.name, device.token_hash, '2026-10-08T00:00:00Z').run();
+    }
+  } catch (error) {
+    // A failed setup must not leave workerd running: the test file could never exit.
+    await mf.dispose().catch(() => {});
+    await rm(directory, { recursive: true, force: true });
+    throw error;
   }
   return {
     env, mf, directory,
