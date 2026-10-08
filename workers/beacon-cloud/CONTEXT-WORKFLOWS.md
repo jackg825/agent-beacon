@@ -1,8 +1,8 @@
 # 專案關聯、交接筆記與 memory 審閱
 
-這一階段讓兩台 Mac 的活動可以被人工串成任務，並保存有來源的交接摘要與 memory。它目前是**手動整理與審閱流程**，沒有 Jev、自動 AI compact、檔案發布或跨 Mac memory 同步。
+這一階段讓兩台 Mac 的活動可以被人工串成任務，並保存有來源的交接摘要與 memory。審閱流程一律由人決定：候選可以是手動撰寫，也可以是可選背景整理產生的「自動整理・待審」摘要（見 [BACKGROUND-PROCESSING.md](BACKGROUND-PROCESSING.md)，預設關閉）。沒有模型生成、檔案發布或跨 Mac memory 同步；可選的 Jev 只留下未校準訊號，不能審閱。
 
-新增功能的本機合成驗證與整體檢查結果見 [VALIDATION.md](VALIDATION.md)。先前 [TEST-DEPLOYMENT.md](TEST-DEPLOYMENT.md) 記錄的是基礎 ingest／dashboard／MCP 的雲端驗收，不能當成這一階段已部署或真實兩台 Mac 已接上的證據。
+新增功能的本機合成驗證與整體檢查結果見 [VALIDATION.md](VALIDATION.md)（0.2 手動流程與 0.3 背景整理都只在本機驗證）。先前 [TEST-DEPLOYMENT.md](TEST-DEPLOYMENT.md) 記錄的是基礎 ingest／dashboard／MCP 的雲端驗收，不能當成這一階段已部署或真實兩台 Mac 已接上的證據。
 
 ## 日常使用方式
 
@@ -43,6 +43,16 @@
 每次來源都指定「中央事件 ID＋`payload_hash`」，不猜版本，也不偷偷換成第一份 payload。建立候選及核准時，服務讀取指定的 R2 原文、核對雜湊，並確認原文的專案／session／harness 範圍與中央索引一致。相同事件 ID 的另一份 capture 若聲稱不同 repo 或 session，不能用來取得錯誤的來源背書。
 
 `sources_valid` 只表示目前 D1 中的專案／task 範圍仍符合，不表示 R2 永遠可讀，也不表示摘要每一句都是真的。來源範圍之後變動，已核准筆記會變成 `authoritative=false`；預設查詢不再回傳它。明確指定 `status=approved` 仍可查看這些紀錄供稽核。原文缺失或損壞時，建立／核准回傳 `503`，不把它當成成功；仍可以拒絕待審候選。
+
+## 自動整理候選
+
+背景整理開啟後，排程會為任務或專案範圍產生「自動整理・待審」候選。它和手動候選存在同一個 table，審閱方式完全相同：
+
+- 一律是 `pending` 的 `summary`，`supersedes_id` 為空，建立者（`audit` 第一筆的 actor）是 `pipeline:beacon.extractive@1`。來源是規劃時選定、執行時核對過範圍的精確事件版本，內容每一點都以 `[n]` 指向第 n 個來源。
+- Context 的清單與詳情多了兩個欄位：`origin` 是 `manual` 或 `pipeline`；`generation` 對手動候選是 `null`，對自動整理是 `{job_id, processor, previous_context_id}`。`job_id` 可以用 `GET /api/processing/jobs/REPLACE_WITH_JOB_SHA256` 查來源、涵蓋與訊號；`previous_context_id` 是同一範圍上一份自動整理，只用來串起歷史，不是取代關係。
+- 核准、拒絕與理由都和手動候選一樣，需要 `REVIEW_TOKEN` 呼叫 `POST /api/context/REPLACE_WITH_CONTEXT_UUID/review`。0004 的 trigger 讓任何 `pipeline:` actor 都不能核准或拒絕；預設查詢只回傳已核准、來源範圍有效的內容，所以待審的自動整理不會被當成知識。
+- 內容需要修正時：核准後用一般修訂流程建立新版本（新候選＋`supersedes_id` 指向已核准版本），或拒絕它再另外撰寫手動候選。背景整理不會修改或取代任何筆記。
+- 一個範圍有一份尚未審閱的自動整理時，排程先不規劃該範圍的下一份；審閱後，下一份會涵蓋這段期間累積的新事件。
 
 ## 金鑰與審閱紀錄
 
@@ -181,7 +191,7 @@ npx wrangler d1 execute agent-beacon-restore-check-local --local --persist-to .l
 
 核對還原後的 tables、constraints、trigger、資料計數及既有索引查詢；若 trigger／schema 不完整，先修復備份流程，不能繼續升級。這個本機 drill 不證明 R2 已還原，也不代表雲端 Time Travel 已演練成功。
 
-確認備份可用後，在隔離 TEST 套用 migration `0002_project_workflows.sql` 和 `0003_context_reviews.sql`，再部署新程式並透過互動提示設定獨立審閱 secret：
+確認備份可用後，在隔離 TEST 套用 migration `0002_project_workflows.sql`、`0003_context_reviews.sql` 和 `0004_processing.sql`，再部署新程式並透過互動提示設定獨立審閱 secret。Migration 一定要先於程式：0.3 的筆記查詢會讀 `context_generation`，程式先上會讓筆記查詢回傳 `503`（ingest 不受影響）：
 
 ```sh
 npx wrangler d1 migrations apply agent-beacon-cloud-test-db --remote --config .local/wrangler.test.jsonc
@@ -191,13 +201,15 @@ npx wrangler secret put REVIEW_TOKEN --config .local/wrangler.test.jsonc
 
 Secrets 不寫到命令參數或 `vars`。沒有 REVIEW_TOKEN 時新增／審閱保持拒絕，查閱使用原本讀取權限。用合成事件重做關聯、task、候選、來源錯配拒絕、核准／修訂競爭、dashboard／唯讀 MCP，以及重新部署後的同一筆資料查詢；驗收前不接真實 transcript。
 
+部署 0.3 後背景整理仍然關閉：沒有 `MAINTENANCE_TASKS=processing` 時排程不做任何查詢，沒有工作區政策時不規劃任何工作。要開啟時依 [DEPLOYMENT.md](DEPLOYMENT.md#background-processing-opt-in-03) 逐步進行：Workers Paid 是前提；先用合成資料設定工作區與專案政策並審閱第一份自動整理；Jev 只用於受控的合成測試，`EXTERNAL_PROCESSING_PROJECTS` 只列測試專案，`JEV_API_KEY` 只用 `wrangler secret put` 設定這個服務專屬的值，不借用其他 Cloudflare 專案或應用程式的 secret，並設定很小的每日預算。
+
 若只是程式退版，回復上一個已核准 Worker 版本，保留所有新增 D1 tables 和 R2：
 
 ```sh
 npx wrangler rollback REPLACE_WITH_PREVIOUS_WORKER_VERSION_ID --config .local/wrangler.test.jsonc
 ```
 
-兩份 migration 是 additive，沒有 down migration；不要 drop tables、刪除候選、移除 audit 或清掉 R2 來退版。舊程式可繼續使用原有 tables，新增資料保留供修復後讀取。
+三份 migration 都是 additive，沒有 down migration；不要 drop tables、刪除候選（包括自動整理候選）、移除 audit 或清掉 R2 來退版。舊程式可繼續使用原有 tables，新增資料保留供修復後讀取；舊程式不讀 `context_generation`，會把自動整理顯示成一般待審候選，建立者稽核仍是 `pipeline:beacon.extractive@1`。只想停止背景整理時不必退版：把工作區政策改成 `enabled:false`，或從 `MAINTENANCE_TASKS` 移除 `processing` 後重新部署。
 
 若確實需要 D1 回到較早時間，這是另一項會丟棄新索引、審閱或裝置輪替的回復操作。停止本專案寫入、另存目前資料並確認還原時間後，才使用明確 TEST config 的 Time Travel restore；不要對共用 account 其他資料庫操作：
 
@@ -205,4 +217,4 @@ npx wrangler rollback REPLACE_WITH_PREVIOUS_WORKER_VERSION_ID --config .local/wr
 npx wrangler d1 time-travel restore agent-beacon-cloud-test-db --bookmark REPLACE_WITH_CONFIRMED_BOOKMARK --config .local/wrangler.test.jsonc
 ```
 
-還原時點若早於 `0002`／`0003`，先使用舊 Worker，再規劃重新升級。D1 Time Travel 不回復 R2 原文或本機 outbox；對齊裝置 token 狀態、D1 index、保留的 R2 batches 與 checkpoint 後才恢復轉送。自動 reindex、scheduled backup 和真正雲端 restore 演練仍未完成。
+還原時點若早於 `0002`／`0003`／`0004`，先使用對應的舊 Worker，再規劃重新升級。D1 Time Travel 不回復 R2 原文或本機 outbox；對齊裝置 token 狀態、D1 index、保留的 R2 batches 與 checkpoint 後才恢復轉送。自動 reindex、scheduled backup 和真正雲端 restore 演練仍未完成。
