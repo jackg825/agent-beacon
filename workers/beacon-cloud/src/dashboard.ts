@@ -65,6 +65,8 @@ const SCRIPT = String.raw`'use strict';
   const status = (message) => { byId('status').textContent = message; };
   const failure = (error) => status(error.message || '讀取失敗，請稍後重試。');
   const stateLabels = { pending: '待審・尚未採用', approved: '已核准', rejected: '已拒絕', superseded: '已由新版取代' };
+  // Background pipeline output is labelled wherever a candidate is listed or shown.
+  const originBadge = (entry) => text('span', entry.status === 'pending' ? '自動整理・待審' : '自動整理', 'badge pending');
   const relationLabels = { depends_on: '依賴', shares_service: '共用服務', fork_of: '分支自' };
   const tabs = ['activity', 'projects', 'context', ...${JSON.stringify(panels.map((panel) => panel.tab))}];
   const panelLoaders = {};
@@ -351,6 +353,7 @@ const SCRIPT = String.raw`'use strict';
     for (const entry of state.context) {
       const node = button('', () => selectContext(entry.id), 'card-button');
       node.append(text('span', entry.title), text('span', stateLabels[entry.status] || entry.status, 'badge ' + entry.status), text('span', (entry.kind === 'memory' ? '長期記憶' : '交接摘要') + ' · ' + entry.source_count + ' 個來源 · ' + date(entry.created_at), 'session-meta'));
+      if (entry.origin === 'pipeline') node.append(originBadge(entry));
       byId('context-list').append(node);
     }
     byId('more-context').hidden = !state.contextCursor;
@@ -365,7 +368,13 @@ const SCRIPT = String.raw`'use strict';
     const container = byId('context-detail'); container.replaceChildren();
     const heading = text('div', '', 'detail-heading');
     heading.append(text('h3', entry.title), text('span', stateLabels[entry.status] || entry.status, 'badge ' + entry.status));
+    if (entry.origin === 'pipeline') heading.append(originBadge(entry));
     container.append(heading);
+    if (entry.origin === 'pipeline') {
+      container.append(text('p', '這份候選由背景整理自動產生（' + entry.generation.processor + '），只依指定來源的中繼資料與政策允許的欄位整理；系統不能核准，仍需人工審閱。', 'notice'));
+      container.append(text('div', '整理工作 ' + entry.generation.job_id, 'identity'));
+      if (entry.generation.previous_context_id) container.append(text('div', '同範圍上一份自動整理：' + entry.generation.previous_context_id, 'identity'));
+    }
     if (entry.status !== 'approved') container.append(text('p', '這份內容目前不作為已核准的工作依據。原始紀錄仍保留。', 'notice warning'));
     else if (entry.authoritative === false) container.append(text('p', '這份筆記曾被核准，但目前來源範圍不符合採用條件。請先查閱原始來源與審閱紀錄。', 'notice warning'));
     container.append(text('p', entry.content, 'content'));
