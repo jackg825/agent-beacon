@@ -2,20 +2,26 @@ import { digest } from './auth';
 import { insertCandidate } from './context';
 import { extractiveGenerator, Generator, GeneratorEvent, validateGenerated } from './generator';
 import { stableJSON } from './identity';
+import { defaultStage } from './jev';
 import type { Allotment, MaintenanceContext } from './maintenance';
 import { cleanLine, projectEvents, workerSecrets } from './privacy';
 import { EffectivePolicy, effectivePolicy } from './processing-policy';
-import { JobScope, ruleFilter, SelectionStage, StageSignal } from './processing-stage';
+import { JobScope, SelectionStage, StageSignal } from './processing-stage';
 import { versionScope } from './queries';
+import { MAX_CALL_TIMEOUT_MS } from './processing-budget';
 import { Env, HttpError } from './types';
 
 export const LEASE_MIN_MS = 10 * 60_000;
-/** Largest external call timeout a job may make (part B), added to every lease. */
-export const EXTERNAL_TIMEOUT_MS = 30_000;
+/** Largest external call timeout a job may make (the budget's timeout_ms cap), added to every lease. */
+export const EXTERNAL_TIMEOUT_MS = MAX_CALL_TIMEOUT_MS;
 export const BACKOFF_MINUTES = [1, 5, 30, 120];
 export const MAX_JOBS_PER_TICK = 2;
-/** Platform calls a single job may need: claim, checks, versions, ≤20 verifications and one batch. */
-export const JOB_RESERVE: Allotment = { d1: 90, r2: 260, fetch: 0 };
+/**
+ * Platform calls a single job may need: claim, checks, versions, ≤20 verifications and
+ * one batch, plus the optional evaluator (prior-call and budget reads, notes,
+ * reservation, one outbound fetch and a fenced batch of up to twelve answers).
+ */
+export const JOB_RESERVE: Allotment = { d1: 110, r2: 260, fetch: 1 };
 export const MAX_JOB_RAW_READS = 240;
 export const MAX_JOB_RAW_BYTES = 48 * 1024 * 1024;
 const MAX_VERSIONS = 1000;
@@ -191,8 +197,8 @@ async function runClaimed(env: Env, ctx: MaintenanceContext, lease: Lease, optio
   if (!events.length) return await skip(env, lease, 'no_matching_versions', covered) ? 'skipped' : 'lease_lost';
   const scope: JobScope = { scope_type: job.scope_type, scope_id: job.scope_id, project_id: job.project_id, task_id: job.task_id,
     scope_key: job.scope_key };
-  const decision = await (options.stage ?? ruleFilter)({ env, ctx, job_id: job.id, attempt: job.attempts, scope, policy,
-    projection: projection.events });
+  const decision = await (options.stage ?? defaultStage)({ env, ctx, job_id: job.id, attempt: job.attempts, lease_owner: lease.owner,
+    scope, policy, projection: projection.events, labels: { task_title: current.task_title, project_name: current.project_name } });
   if (decision.decision === 'skip')
     return await skip(env, lease, decision.skip_reason ?? 'stage_skip', covered, decision.signals, decision.note ?? null) ? 'skipped' : 'lease_lost';
   const titles = policy.summary_fields.includes('titles');

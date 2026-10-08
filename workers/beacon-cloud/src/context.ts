@@ -20,7 +20,8 @@ type ContextRow = {
   generation_job_id:string|null;generation_processor:string|null;generation_previous_context_id:string|null;
 };
 
-const invalidSourceScope = `EXISTS(SELECT 1 FROM context_sources s JOIN events e ON e.id=s.event_id
+// Shared with the Jev stage, which reads only authoritative notes.
+export const invalidSourceScope = `EXISTS(SELECT 1 FROM context_sources s JOIN events e ON e.id=s.event_id
     WHERE s.context_id=c.id AND (e.project_id!=c.project_id OR (c.task_id IS NOT NULL AND NOT EXISTS(
       SELECT 1 FROM task_sessions ts WHERE ts.task_id=c.task_id AND ts.session_id=e.session_id
     ))))`;

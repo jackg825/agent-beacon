@@ -13,8 +13,12 @@ export interface StageSignal {
 }
 export interface StageInput {
   env: Env; ctx: MaintenanceContext; job_id: string; attempt: number; scope: JobScope; policy: EffectivePolicy;
+  /** The claim's lease owner; anything a stage commits is fenced on (job_id, lease_owner, attempt). */
+  lease_owner: string;
   /** Redacted projection under the policy's summary_fields; an external stage must narrow it to external_fields. */
   projection: ProjectedEvent[];
+  /** Raw task title and project name as stored; a stage may use them only under the `titles` class, redacted. */
+  labels: { task_title: string | null; project_name: string | null };
 }
 export interface StageResult {
   decision: 'continue' | 'skip';
@@ -22,12 +26,13 @@ export interface StageResult {
   skip_reason?: string;
   /** Short code recorded on the job, e.g. jev_skip_overridden. */
   note?: string;
+  /** Stored by the runner with the job's end state (a stage that already stored them returns none). */
   signals: StageSignal[];
 }
 /**
- * The seam between source selection and generation. Part A runs only the
- * deterministic rule filter. Part B's optional Jev stage receives the same input,
- * must pass the deploy gate, policy and budget reservation itself, and may only add
+ * The seam between source selection and generation. The default runs the
+ * deterministic rule filter, then the optional Jev stage (src/jev.ts), which must
+ * pass the deploy gate, policy and budget reservation itself, and may only add
  * signals or skip under the policy threshold; it can never approve, edit or delete.
  */
 export type SelectionStage = (input: StageInput) => Promise<StageResult>;
