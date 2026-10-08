@@ -127,13 +127,18 @@ export async function planTick(env: Env, now: Date, limit = SCOPES_PER_TICK): Pr
     .first<Parameters<typeof policyRow>[0]>();
   if (!workspace?.enabled) return result;
   result.workspace_enabled = true;
-  const cursor = (await env.DB.prepare('SELECT scan_key FROM processing_scan_cursor WHERE id=1').first<{ scan_key: string }>())?.scan_key ?? '';
+  const read = await env.DB.prepare('SELECT scan_key,updated_at FROM processing_scan_cursor WHERE id=1')
+    .first<{ scan_key: string; updated_at: string }>();
+  const cursor = read?.scan_key ?? '', stamp = read?.updated_at ?? '';
   let scopes = await enabledScopes(env, cursor, '\uffff', limit);
   if (scopes.length < limit && cursor) scopes = scopes.concat(await enabledScopes(env, '', cursor, limit - scopes.length));
   if (!scopes.length) return result;
-  // Claim this range first; an overlapping invocation that lost the swap plans nothing.
-  const swap = await env.DB.prepare('UPDATE processing_scan_cursor SET scan_key=?,updated_at=? WHERE id=1 AND scan_key=?')
-    .bind(scopes.at(-1)!.scan_key, now.toISOString(), cursor).run();
+  // Claim this range first; an overlapping invocation that lost the swap plans nothing. With
+  // no more scopes than one tick scans, the key wraps round to itself, so the swap also
+  // compares updated_at, which every swap moves strictly forward.
+  const next = new Date(Math.max(now.getTime(), (Date.parse(stamp) || 0) + 1)).toISOString();
+  const swap = await env.DB.prepare('UPDATE processing_scan_cursor SET scan_key=?,updated_at=? WHERE id=1 AND scan_key=? AND updated_at=?')
+    .bind(scopes.at(-1)!.scan_key, next, cursor, stamp).run();
   if (!swap.meta.changes) return { ...result, cursor_conflict: true };
   const projects = [...new Set(scopes.map((scope) => scope.project_id))];
   const rows = (await env.DB.prepare(`SELECT * FROM processing_policies WHERE scope_type='project'

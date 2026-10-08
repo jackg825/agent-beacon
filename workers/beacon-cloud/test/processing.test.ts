@@ -77,6 +77,43 @@ test('timing rules: minimum new events, quiet minutes plus settle lag, and idemp
   } finally { await f.close(); }
 });
 
+/** A database on which another invocation runs `overlap` to completion just before this one's cursor swap. */
+function overlapBeforeSwap(db: D1Database, overlap: () => Promise<unknown>): D1Database {
+  let fired = false;
+  return { prepare: (sql: string) => {
+    const statement = db.prepare(sql);
+    if (fired || !sql.startsWith('UPDATE processing_scan_cursor')) return statement;
+    fired = true;
+    return { bind: (...values: unknown[]) => {
+      const bound = statement.bind(...values);
+      return { run: async () => { await overlap(); return bound.run(); } };
+    } } as unknown as D1PreparedStatement;
+  }, batch: (statements: D1PreparedStatement[]) => db.batch(statements) } as unknown as D1Database;
+}
+
+test('overlapping planners: the one that loses the cursor swap plans nothing, also when the cursor would not move', async () => {
+  const f = await createEnvFixture();
+  try {
+    await setPolicy(f.env, workspace, { min_new_events: 1000 });
+    for (const repo of ['cas-a', 'cas-b', 'cas-c']) await f.ingest(syntheticEvent(`${repo}-1`, { repo, session: `${repo}-s` }));
+    const now = later(60);
+    const overlapped = async (limit: number) => {
+      let inner: Awaited<ReturnType<typeof planTick>> | undefined;
+      const outer = await planTick({ ...f.env, DB: overlapBeforeSwap(f.env.DB, async () => { inner = await planTick(f.env, now, limit); }) } as Env,
+        now, limit);
+      return [inner!.scanned, inner!.cursor_conflict ?? false, outer.scanned, outer.cursor_conflict ?? false];
+    };
+    // Three scopes, two per tick: the overlapping invocation moved the cursor first, so this one plans nothing.
+    assert.deepEqual(await overlapped(2), [2, false, 0, true]);
+    // Five per tick: both read the same cursor and would wrap round to the same key, so the key alone
+    // cannot tell them apart. The second must still lose.
+    assert.deepEqual(await overlapped(5), [3, false, 0, true]);
+    // Without an overlap, ticks keep planning.
+    assert.equal((await planTick(f.env, now, 5)).scanned, 3);
+    assert.equal((await planTick(f.env, now, 5)).scanned, 3);
+  } finally { await f.close(); }
+});
+
 test('coverage selection: 450 events become three jobs covering each event exactly once, oldest first', async () => {
   const f = await createEnvFixture();
   try {
