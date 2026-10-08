@@ -1,8 +1,8 @@
 import { applyMigrationStatements } from '../scripts/migration-sql';
 
-type Database = {prepare(sql:string):{run():Promise<unknown>}};
+type Database<Statement> = {prepare(sql:string):Statement;batch(statements:Statement[]):Promise<unknown>};
 
 /** Keep trigger bodies intact while executing the committed SQLite migrations. */
-export async function applyMigrations(db:Database, files?:string[]) {
+export async function applyMigrations<Statement>(db:Database<Statement>, files?:string[]) {
   await applyMigrationStatements(db,{files});
 }

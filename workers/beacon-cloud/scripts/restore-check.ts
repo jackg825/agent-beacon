@@ -103,13 +103,14 @@ const lines = (bytes: Uint8Array) => new TextDecoder('utf-8', { fatal: true, ign
 /** Tables in foreign-key dependency order (parents first), from PRAGMA foreign_key_list. */
 async function loadOrder(db: D1Database, tables: string[]): Promise<{ order: string[]; selfRefs: Map<string, { from: string; to: string }> }> {
   const parents = new Map<string, Set<string>>(), selfRefs = new Map<string, { from: string; to: string }>();
-  for (const table of tables) {
-    const keys = await db.prepare('SELECT "table" AS parent,"from" AS from_column,"to" AS to_column,id FROM pragma_foreign_key_list(?)').bind(table)
-      .all<{ parent: string; from_column: string; to_column: string; id: number }>();
+  const lists = await db.batch<{ parent: string; from_column: string; to_column: string; id: number }>(tables.map(table =>
+    db.prepare('SELECT "table" AS parent,"from" AS from_column,"to" AS to_column,id FROM pragma_foreign_key_list(?)').bind(table)));
+  tables.forEach((table, index) => {
+    const keys = lists[index];
     parents.set(table, new Set(keys.results.filter(key => key.parent !== table && tables.includes(key.parent)).map(key => key.parent)));
     const self = keys.results.filter(key => key.parent === table);
     if (self.length === 1) selfRefs.set(table, { from: self[0].from_column, to: self[0].to_column });
-  }
+  });
   const order: string[] = [], done = new Set<string>();
   while (order.length < tables.length) {
     const ready = tables.filter(table => !done.has(table) && [...parents.get(table)!].every(parent => done.has(parent))).sort();
@@ -214,11 +215,12 @@ export async function restoreCheck(options: { checkpointId: string; source: Back
     const deferred = await applyMigrationStatements(db, { deferTriggers: true, directory: options.migrationsDirectory });
     const tables = Object.keys(manifest.table_counts).sort();
     const columns = new Map<string, Set<string>>();
-    for (const table of tables) {
-      const info = await db.prepare('SELECT name FROM pragma_table_info(?)').bind(table).all<{ name: string }>();
-      if (!info.results.length) { fail('unknown_table'); continue; }
-      columns.set(table, new Set(info.results.map(row => row.name)));
-    }
+    // Read-only lookups go in D1 batches: one local round trip each instead of one per table.
+    const infos = tables.length ? await db.batch<{ name: string }>(tables.map(table => db.prepare('SELECT name FROM pragma_table_info(?)').bind(table))) : [];
+    tables.forEach((table, index) => {
+      if (!infos[index].results.length) { fail('unknown_table'); return; }
+      columns.set(table, new Set(infos[index].results.map(row => row.name)));
+    });
     if (failures.size) return report({ tables: {}, raw_objects: raw.length });
     const { order, selfRefs } = await loadOrder(db, tables);
     // Migrations may seed rows (single-row state tables); the checkpoint's rows replace them.
@@ -239,10 +241,11 @@ export async function restoreCheck(options: { checkpointId: string; source: Back
     }
     // Recreate triggers from the same migration text and compare what SQLite stored.
     let matched = 0;
-    for (const statement of deferred) await db.prepare(statement.sql).run();
-    for (const statement of deferred) {
-      const stored = await db.prepare("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?").bind(statement.trigger).first<{ sql: string }>();
-      if (stored?.sql === normalizedStatement(statement.sql)) matched++;
+    if (deferred.length) {
+      await db.batch(deferred.map(statement => db.prepare(statement.sql)));
+      const stored = await db.batch<{ sql: string }>(deferred.map(statement =>
+        db.prepare("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?").bind(statement.trigger)));
+      deferred.forEach((statement, index) => { if (stored[index].results[0]?.sql === normalizedStatement(statement.sql)) matched++; });
     }
     if (matched !== deferred.length) fail('trigger_mismatch', deferred.length - matched);
     checks.push('triggers_recreated');
@@ -250,10 +253,11 @@ export async function restoreCheck(options: { checkpointId: string; source: Back
     if (fk.results.length) fail('foreign_key_violation', fk.results.length);
     checks.push('foreign_key_check');
     const counts: Record<string, number> = {};
-    for (const table of tables) {
-      counts[table] = (await db.prepare(`SELECT COUNT(*) AS n FROM "${table}"`).first<{ n: number }>())!.n;
+    const totals = tables.length ? await db.batch<{ n: number }>(tables.map(table => db.prepare(`SELECT COUNT(*) AS n FROM "${table}"`))) : [];
+    tables.forEach((table, index) => {
+      counts[table] = totals[index].results[0].n;
       if (counts[table] !== manifest.table_counts[table]) fail('row_count_mismatch');
-    }
+    });
     checks.push('row_counts');
     const count = async (sql: string) => (await db.prepare(sql).first<{ n: number }>())!.n;
     if (columns.has('context_entries') && columns.has('context_audit') && columns.has('context_sources')) {

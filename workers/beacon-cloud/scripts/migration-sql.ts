@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 
 export const migrationsDirectory = fileURLToPath(new URL('../migrations/', import.meta.url));
 export type MigrationStatement = { file: string; sql: string; trigger: string | null };
-type Database = { prepare(sql: string): { run(): Promise<unknown> } };
+type Database<Statement> = { prepare(sql: string): Statement; batch(statements: Statement[]): Promise<unknown> };
 
 /** Split one migration file, keeping trigger bodies (which contain `;`) intact. */
 export function splitMigration(file: string, sql: string): MigrationStatement[] {
@@ -40,13 +40,20 @@ export async function migrationStatements(files?: string[], directory = migratio
  * are skipped and returned so a restore-only scratch database can load historical rows
  * first and create the same triggers afterwards. Only scripts/restore-check.ts uses it,
  * and only on a local database it created.
+ *
+ * Everything goes in one D1 batch: one transaction, and one round trip to a local
+ * Miniflare instead of one per statement. Miniflare opens a fresh loopback connection
+ * for every binding call, so per-statement application left ~160 TIME_WAIT sockets
+ * per fixture and exhausted macOS's ephemeral ports when test files ran in parallel.
  */
-export async function applyMigrationStatements(db: Database, options: { files?: string[]; deferTriggers?: boolean; directory?: string } = {}) {
-  const deferred: MigrationStatement[] = [];
+export async function applyMigrationStatements<Statement>(db: Database<Statement>,
+  options: { files?: string[]; deferTriggers?: boolean; directory?: string } = {}) {
+  const deferred: MigrationStatement[] = [], apply: MigrationStatement[] = [];
   for (const statement of await migrationStatements(options.files, options.directory)) {
-    if (options.deferTriggers && statement.trigger) { deferred.push(statement); continue; }
-    await db.prepare(statement.sql).run();
+    if (options.deferTriggers && statement.trigger) deferred.push(statement);
+    else apply.push(statement);
   }
+  if (apply.length) await db.batch(apply.map(statement => db.prepare(statement.sql)));
   return deferred;
 }
 
