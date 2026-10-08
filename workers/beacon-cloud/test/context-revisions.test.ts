@@ -515,6 +515,21 @@ test('a device snapshot carries shared memories only when its subscription inclu
     assert.equal((await preview('&kind=memory')).snapshot_sha256, mini.snapshot_sha256);
     await rejects(syncRead(get(`/api/context/snapshot?project_id=${b.project_id}&include_shared=yes`), f.env), 400);
 
+    // Revoking a share stops serving it at once, while the memory itself stays approved and authoritative.
+    const second = await note(f.env, a, { title: 'Shared then revoked' }, 'approve');
+    const secondShare = (await json(await write(f.env, `/api/context/${second}/shares`, { target_type: 'project', target_id: b.project_id }))).share;
+    const recalled = async () => (await list(f.env, { project_id: b.project_id, include_shared: '1' })).map((entry) => entry.id).sort();
+    const withSecond = await snapshot('mbp');
+    assert.deepEqual(withSecond.entries.map((entry: any) => entry.id).sort(), [memory, own, second].sort());
+    assert.deepEqual(await recalled(), [memory, own, second].sort());
+    assert.equal((await write(f.env, `/api/context/shares/${secondShare.id}/revoke`, {}))!.status, 200);
+    assert.equal((await getContext(f.env, second)).context.authoritative, true);
+    const afterRevoke = await snapshot('mbp');
+    assert.deepEqual(afterRevoke.entries.map((entry: any) => entry.id), [memory, own]);
+    assert.equal(afterRevoke.snapshot_sha256, mbp.snapshot_sha256, 'the hash returns to the snapshot before the share');
+    assert.notEqual(afterRevoke.snapshot_sha256, withSecond.snapshot_sha256);
+    assert.deepEqual(await recalled(), [memory, own].sort());
+    assert.equal((await preview('&kind=memory&include_shared=1')).snapshot_sha256, mbp.snapshot_sha256);
     // Read time: once the shared memory is superseded, the device no longer receives it.
     await note(f.env, a, { title: 'Shared from alpha v2', supersedes: memory }, 'approve');
     assert.deepEqual((await snapshot('mbp')).entries.map((entry: any) => entry.id), [own]);
