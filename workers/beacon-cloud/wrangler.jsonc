@@ -6,6 +6,10 @@
   "workers_dev": false,
   "preview_urls": false,
   "observability": {"enabled": false},
+  // Background maintenance runs only the tasks named in MAINTENANCE_TASKS (none by
+  // default): processing on the frequent cron; the hourly cron is reserved and has
+  // no task yet. Names that match no task are reported as unknown_task.
+  "triggers": {"crons": ["*/15 * * * *", "17 * * * *"]},
   "d1_databases": [{
     "binding": "DB",
     "database_name": "agent-beacon-cloud-db",

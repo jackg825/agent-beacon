@@ -17,22 +17,29 @@ type ContextRow = {
   id:string;kind:string;project_id:string;task_id:string|null;title:string;content:string;
   status:string;supersedes_id:string|null;created_at:string;reviewed_at:string|null;
   source_count:number;sources_valid:number;
+  generation_job_id:string|null;generation_processor:string|null;generation_previous_context_id:string|null;
 };
 
-const invalidSourceScope = `EXISTS(SELECT 1 FROM context_sources s JOIN events e ON e.id=s.event_id
+// Shared with the Jev stage, which reads only authoritative notes.
+export const invalidSourceScope = `EXISTS(SELECT 1 FROM context_sources s JOIN events e ON e.id=s.event_id
     WHERE s.context_id=c.id AND (e.project_id!=c.project_id OR (c.task_id IS NOT NULL AND NOT EXISTS(
       SELECT 1 FROM task_sessions ts WHERE ts.task_id=c.task_id AND ts.session_id=e.session_id
     ))))`;
 const contextSelect = `SELECT c.id,c.kind,c.project_id,c.task_id,c.title,c.content,c.status,
   c.supersedes_id,c.created_at,c.reviewed_at,
   (SELECT COUNT(*) FROM context_sources s WHERE s.context_id=c.id) AS source_count,
-  NOT ${invalidSourceScope} AS sources_valid FROM context_entries c`;
+  NOT ${invalidSourceScope} AS sources_valid,g.job_id AS generation_job_id,g.processor AS generation_processor,
+  g.previous_context_id AS generation_previous_context_id
+  FROM context_entries c LEFT JOIN context_generation g ON g.context_id=c.id`;
 
 function view(row:ContextRow) {
-  const {sources_valid,...result}=row;
+  const {sources_valid,generation_job_id,generation_processor,generation_previous_context_id,...result}=row;
   // Approval records human review, not a guarantee that the prose is true.
   // If session/project evidence changes, the old derivative is no longer authoritative.
-  return {...result,sources_valid:!!sources_valid,authoritative:row.status==='approved' && !!sources_valid};
+  // Pipeline output is marked as such; it always needed the same explicit review.
+  return {...result,sources_valid:!!sources_valid,authoritative:row.status==='approved' && !!sources_valid,
+    origin:generation_job_id?'pipeline' as const:'manual' as const,
+    generation:generation_job_id?{job_id:generation_job_id,processor:generation_processor,previous_context_id:generation_previous_context_id}:null};
 }
 function parse<T>(schema:z.ZodType<T>,value:unknown):T {
   const result=schema.safeParse(value);
@@ -110,8 +117,22 @@ export async function getContext(env:Env,id:string) {
   return {context:{...view(row),sources:sources.results,audit:audit.results}};
 }
 
-async function createContext(request:Request,env:Env,actor:string) {
-  const input=parse(createSchema,await readJson(request));
+export type CandidateInput = z.infer<typeof createSchema>;
+export interface CandidateExtras {
+  /** Statements committed first in the same D1 batch (e.g. a job lease fence). */
+  before?: D1PreparedStatement[];
+  /** Statements committed after the candidate, given its new id and creation time. */
+  after?: (contextId:string,createdAt:string)=>D1PreparedStatement[];
+  now?: string;
+}
+
+/**
+ * The one way a candidate enters context_entries, used by the manual route and the
+ * background pipeline alike: same validation, same exact raw-version verification,
+ * same triggers, and one atomic D1 batch including any caller statements.
+ */
+export async function insertCandidate(env:Env,candidate:CandidateInput,actor:string,extras:CandidateExtras={}):Promise<string> {
+  const input=parse(createSchema,candidate);
   const pairs=input.sources.map(source=>`${source.event_id}:${source.payload_hash}`);
   if (new Set(pairs).size!==pairs.length) throw new HttpError(400,'Duplicate context sources');
   if (!await env.DB.prepare('SELECT id FROM projects WHERE id=?').bind(input.project_id).first())
@@ -126,15 +147,21 @@ async function createContext(request:Request,env:Env,actor:string) {
     if (parent.status!=='approved' || parent.kind!==input.kind || parent.project_id!==input.project_id
       || parent.task_id!==(input.task_id??null)) throw new HttpError(409,'Revision must replace a current approved entry in the same scope');
   }
-  const id=crypto.randomUUID(),now=new Date().toISOString();
-  const statements=[env.DB.prepare(`INSERT INTO context_entries(id,kind,project_id,task_id,title,content,supersedes_id,created_at)
+  const id=crypto.randomUUID(),now=extras.now??new Date().toISOString();
+  const statements=[...extras.before??[],env.DB.prepare(`INSERT INTO context_entries(id,kind,project_id,task_id,title,content,supersedes_id,created_at)
     VALUES(?,?,?,?,?,?,?,?)`).bind(id,input.kind,input.project_id,input.task_id??null,input.title,input.content,input.supersedes_id??null,now)];
   input.sources.forEach((source,ordinal)=>statements.push(env.DB.prepare(`INSERT INTO context_sources(context_id,event_id,payload_hash,ordinal)
     VALUES(?,?,?,?)`).bind(id,source.event_id,source.payload_hash,ordinal)));
   statements.push(env.DB.prepare('UPDATE context_entries SET sealed=1 WHERE id=?').bind(id));
   statements.push(env.DB.prepare(`INSERT INTO context_audit(id,context_id,actor,action,created_at) VALUES(?,?,?,'create',?)`)
     .bind(crypto.randomUUID(),id,actor,now));
+  statements.push(...extras.after?.(id,now)??[]);
   try {await env.DB.batch(statements);} catch(error) {dbError(error);}
+  return id;
+}
+
+async function createContext(request:Request,env:Env,actor:string) {
+  const id=await insertCandidate(env,parse(createSchema,await readJson(request)),actor);
   return json(await getContext(env,id),201);
 }
 

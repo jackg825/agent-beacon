@@ -90,6 +90,23 @@ export async function listDevices(env: Env) {
   return {devices:result.results};
 }
 
+export interface IndexScope { event_id:string; harness:string; session_id:string|null; project_id:string;
+  device_id:string; stream:string; identity_kind:string }
+/** Whether one raw version supports the central index row it is stored under. */
+export async function versionScope(payload: unknown, row: IndexScope) {
+  const sourceProject=await projectIdentity(payload as Record<string,unknown>,String(row.device_id));
+  const nativeSession=field(payload,'session','id');
+  const expectedSession=row.stream==='runtime' ? await digest(stableJSON([row.device_id,
+    field(payload,'harness','name')||'unknown',nativeSession?'native':'unscoped',nativeSession||`unscoped-event:${row.event_id}`])) : null;
+  // Weak path/unknown evidence may be upgraded by the same session, but an
+  // alternate capture claiming another remote/session cannot support a memory.
+  const strength=(kind:unknown)=>kind==='remote'?2:kind==='device_path'?1:0;
+  const matches=field(payload,'event','id')===row.event_id &&
+    (field(payload,'harness','name')||'unknown')===row.harness && expectedSession===row.session_id && (sourceProject.id===row.project_id ||
+    (!!nativeSession && strength(sourceProject.kind)<strength(row.identity_kind)));
+  return {matches,sourceProject,expectedSession};
+}
+
 /** Fetch a referenced immutable variant rather than substituting the first indexed payload. */
 export async function getEventVersion(env: Env, eventId: string, params: URLSearchParams) {
   const hash=params.get('payload_hash');
@@ -110,16 +127,7 @@ export async function getEventVersion(env: Env, eventId: string, params: URLSear
     payload=JSON.parse(line);
     if (await digest(stableJSON(payload))!==hash) throw new Error();
   } catch { throw new HttpError(503,'Raw event version unavailable'); }
-  const sourceProject=await projectIdentity(payload as Record<string,unknown>,String(row.device_id));
-  const nativeSession=field(payload,'session','id');
-  const expectedSession=row.stream==='runtime' ? await digest(stableJSON([row.device_id,
-    field(payload,'harness','name')||'unknown',nativeSession?'native':'unscoped',nativeSession||`unscoped-event:${row.event_id}`])) : null;
-  // Weak path/unknown evidence may be upgraded by the same session, but an
-  // alternate capture claiming another remote/session cannot support a memory.
-  const strength=(kind:unknown)=>kind==='remote'?2:kind==='device_path'?1:0;
-  const scopeMatches=field(payload,'event','id')===row.event_id &&
-    (field(payload,'harness','name')||'unknown')===row.harness && expectedSession===row.session_id && (sourceProject.id===row.project_id ||
-    (!!nativeSession && strength(sourceProject.kind)<strength(row.identity_kind)));
+  const {matches:scopeMatches,sourceProject,expectedSession}=await versionScope(payload,row as unknown as IndexScope);
   const {selected_hash,selected_batch_id,selected_line_number,r2_key,line_number,identity_kind,source_session_id,...index}=row;
   return {event:{...index,payload_hash:selected_hash,batch_id:selected_batch_id,
     action:field(payload,'event','action'),timestamp:field(payload,'timestamp'),

@@ -1,0 +1,401 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { getContext, insertCandidate, listContext } from '../src/context';
+import { validateGenerated } from '../src/generator';
+import { runMaintenance } from '../src/maintenance';
+import { PROCESSING_ALLOTMENT, processingMaintenance, processingRead, processingTick, processingWrite } from '../src/processing';
+import { JOB_RESERVE, MAX_JOB_RAW_BYTES, MAX_JOB_RAW_READS, MAX_JOB_VERSIONS, RawLimits } from '../src/processing-runner';
+import { getEventVersion } from '../src/queries';
+import { Env } from '../src/types';
+import { createEnvFixture, syntheticEvent } from './env-fixture';
+import { at, command, count, job, jobs, later, newTask, post, rejects, review, reviewer, run, setBudget, setPolicy, tick, workspace } from './processing-helpers';
+
+test('extractive citations resolve to persisted exact versions; non-matching captures are excluded and counted', async () => {
+  const f = await createEnvFixture();
+  try {
+    await setPolicy(f.env, workspace, { summary_fields: ['command_text', 'file_path'] });
+    await f.ingest([command('cite-1', 'npm test', 1, { timestamp: at(1) }),
+      syntheticEvent('cite-2', { action: 'file.modified', timestamp: at(2), extra: { file: { path: '/synthetic/alpha/src/login.ts' } } }),
+      command('cite-3', 'npm test', 0, { timestamp: at(3) }), syntheticEvent('cite-drop', { timestamp: at(4) })]);
+    // An alternate capture of cite-1 claims another repository; it must never be cited.
+    await f.ingest(command('cite-1', 'npm test', 1, { timestamp: at(1), repo: 'forged-repo', session: 'forged-session' }));
+    const indexed = (await f.event('cite-1'))!;
+    assert.equal(await count(f.env, 'event_versions WHERE event_id=?', indexed.id), 2);
+    // No stored version of cite-drop matches its index row any more.
+    await f.env.DB.prepare('UPDATE events SET harness=? WHERE event_id=?').bind('synthetic_other', 'cite-drop').run();
+    await tick(f.env);
+    const [done] = await jobs(f.env);
+    assert.equal(done.status, 'succeeded');
+    assert.equal(done.source_count, 4); assert.equal(done.event_count, 3); assert.equal(done.excluded_count, 1);
+    assert.equal(await count(f.env, 'processing_coverage WHERE job_id=?', done.id), 4);
+    assert.match(done.input_hash, /^[a-f0-9]{64}$/);
+    const context: any = (await getContext(f.env, done.result_context_id)).context;
+    assert.equal(validateGenerated({ title: context.title, content: context.content, sources: context.sources }), null);
+    const cited = new Set([...context.content.matchAll(/\[(\d+)\]/g)].map((match) => Number(match[1])));
+    assert.deepEqual([...cited].sort(), [1, 2, 3]);
+    assert.equal(context.source_count, 3);
+    for (const source of context.sources) {
+      const version = await getEventVersion(f.env, source.event_id, new URLSearchParams({ payload_hash: source.payload_hash }));
+      assert.equal(version.event.scope_matches_index, true);
+    }
+    assert.equal(context.sources.find((source: any) => source.event_id === indexed.id).payload_hash, indexed.payload_hash);
+    const dropped = (await f.event('cite-drop'))!.id;
+    assert.ok(!context.sources.some((source: any) => source.event_id === dropped));
+    assert.ok(context.content.includes('src/login.ts'));
+    assert.match(context.content, /先前失敗後已成功：「npm test」/);
+    // When the planned (first indexed) version stops matching its index row, another stored
+    // version that does match is cited instead of it.
+    const forged = (await f.env.DB.prepare("SELECT id,project_id FROM sessions WHERE source_session_id='forged-session'").first<any>())!;
+    await f.env.DB.prepare('UPDATE events SET session_id=?,project_id=? WHERE id=?').bind(forged.id, forged.project_id, indexed.id).run();
+    await tick(f.env, later(130));
+    const moved = (await jobs(f.env)).find((row: any) => row.project_id === forged.project_id);
+    assert.equal(moved.status, 'succeeded'); assert.equal(moved.excluded_count, 0);
+    const alternate: any = (await getContext(f.env, moved.result_context_id)).context;
+    assert.equal(alternate.sources.length, 1);
+    assert.notEqual(alternate.sources[0].payload_hash, indexed.payload_hash);
+    const version = await getEventVersion(f.env, indexed.id, new URLSearchParams({ payload_hash: alternate.sources[0].payload_hash }));
+    assert.equal(version.event.scope_matches_index, true);
+  } finally { await f.close(); }
+});
+
+test('a raw line altered in place keeps the job from projecting it: raw_unavailable, retried, nothing covered or sent', async () => {
+  const f = await createEnvFixture({ bindings: { EXTERNAL_PROCESSING_PROJECTS: '*', JEV_API_KEY: 'synthetic-jev-key-not-real-0000' } });
+  try {
+    // Every gate is open, so a projection of the altered line would be sent.
+    await setPolicy(f.env, workspace, { summary_fields: ['command_text', 'titles'], external_allowed: true, jev_enabled: true,
+      external_fields: ['command_text', 'titles'], min_new_events: 1000 });
+    await setBudget(f.env, { daily_call_limit: 5 });
+    await f.ingest([command('altered-1', 'npm test', 0, { session: 'altered-s', timestamp: at(1) }),
+      command('altered-2', 'npm run lint', 0, { session: 'altered-s', timestamp: at(2) })]);
+    const indexed = (await f.event('altered-2'))!;
+    const version = (await f.env.DB.prepare(`SELECT v.line_number,b.r2_key FROM event_versions v JOIN batches b ON b.id=v.batch_id
+      WHERE v.event_id=?`).bind(indexed.id).first<{ line_number: number; r2_key: string }>())!;
+    // A bad restore: the same event id, harness, session and repository, different content.
+    const lines = (await (await f.env.RAW.get(version.r2_key))!.text()).split('\n');
+    const record = JSON.parse(lines[version.line_number]);
+    record.command.command = 'echo ALTERED_CONTENT_MARKER';
+    lines[version.line_number] = JSON.stringify(record);
+    await f.env.RAW.put(version.r2_key, lines.join('\n'));
+    const taskId = await newTask(f.env, '合成：被改寫的原文', [indexed.session_id]);
+    const planned = (await run(f.env, { task_id: taskId })).scopes[0];
+    const calls: string[] = [];
+    const fetcher = (async (_input: RequestInfo | URL, init: RequestInit = {}) => { calls.push(String(init.body)); return Response.json({}); }) as typeof fetch;
+    const report = await tick(f.env, later(), { fetcher });
+    assert.equal(report.ok, true);
+    assert.deepEqual(report.result.run_outcomes, { retry: 1 });
+    const row = await job(f.env, planned.job_id);
+    assert.deepEqual([row.status, row.attempts, row.last_error, row.event_count], ['queued', 1, 'raw_unavailable', null]);
+    assert.deepEqual([calls, report.usage.fetch], [[], 0]);
+    assert.equal(await count(f.env, 'processing_calls'), 0);
+    assert.equal(await count(f.env, 'processing_coverage'), 0);
+    assert.equal(await count(f.env, 'context_entries'), 0);
+  } finally { await f.close(); }
+});
+
+test('pipeline candidates stay pending under a pipeline actor that cannot review; exclusions hold in the output', async () => {
+  const f = await createEnvFixture({ bindings: { REVIEW_TOKEN: 'synthetic-review-token-value-0000' } });
+  try {
+    // Metadata only: no paths, commands, tool names or titles in the candidate.
+    await setPolicy(f.env, workspace);
+    await f.ingest([command('meta-1', 'deploy --token=synthetic-review-token-value-0000', 2, { timestamp: at(1) }),
+      syntheticEvent('meta-2', { action: 'file.modified', timestamp: at(2), extra: { file: { path: '/Users/synthalice/private/plan-secret.md' } } }),
+      syntheticEvent('meta-3', { action: 'approval.denied', timestamp: at(3), extra: { approval: { decision: 'denied' }, tool: { name: 'SyntheticToolName' } } }),
+      syntheticEvent('meta-4', { action: 'session.started', timestamp: at(4) })]);
+    await tick(f.env);
+    const [done] = await jobs(f.env);
+    const context: any = (await getContext(f.env, done.result_context_id)).context;
+    assert.equal(context.status, 'pending'); assert.equal(context.authoritative, false);
+    assert.equal(context.kind, 'summary'); assert.equal(context.supersedes_id, null); assert.equal(context.task_id, null);
+    assert.equal(context.origin, 'pipeline');
+    assert.deepEqual(context.generation, { job_id: done.id, processor: 'beacon.extractive.v1', previous_context_id: null });
+    assert.deepEqual(context.audit.map((row: any) => [row.action, row.actor]), [['create', 'pipeline:beacon.extractive@1']]);
+    assert.match(context.title, /^自動整理：專案 [a-f0-9]{8}（2026-10-07）$/);
+    for (const hidden of ['plan-secret', 'synthalice', 'deploy', 'synthetic-review-token', 'SyntheticToolName', 'alpha'])
+      assert.ok(!(context.title + context.content).includes(hidden), hidden);
+    assert.match(context.content, /副檔名：\.md/);
+    assert.match(context.content, /approval\.denied：拒絕/);
+    assert.match(context.content, /失敗（結束碼 2）/);
+    // The database refuses review by any pipeline actor, whatever the code path.
+    for (const status of ['approved', 'rejected'])
+      await assert.rejects(f.env.DB.prepare(`UPDATE context_entries SET status=?,review_id=?,reviewed_at=?,reviewed_by=? WHERE id=?`)
+        .bind(status, crypto.randomUUID(), at(9), 'pipeline:beacon.extractive@1', context.id).run(), /context_review_forbidden/);
+    await assert.rejects(f.env.DB.prepare('DELETE FROM context_generation').run(), /context_immutable/);
+    await assert.rejects(f.env.DB.prepare('UPDATE context_generation SET processor=?').bind('forged').run(), /context_immutable/);
+    // A manual candidate cannot be relabelled as pipeline output.
+    const manual = await insertCandidate(f.env, { kind: 'summary', project_id: context.project_id, title: 'Manual synthetic',
+      content: 'Manual synthetic content.', sources: [{ event_id: context.sources[0].event_id, payload_hash: context.sources[0].payload_hash }] }, reviewer);
+    await assert.rejects(f.env.DB.prepare(`INSERT INTO context_generation(context_id,job_id,processor,scope_key,created_at) VALUES(?,?,?,?,?)`)
+      .bind(manual, '0'.repeat(64), 'beacon.extractive.v1', done.scope_key, at(9)).run(), /context_generation_invalid/);
+    assert.equal((await getContext(f.env, manual)).context.origin, 'manual');
+    assert.equal((await getContext(f.env, manual)).context.generation, null);
+    assert.equal((await listContext(f.env, new URLSearchParams('status=pending'))).context.find((row) => row.id === context.id)!.origin, 'pipeline');
+    await review(f.env, context.id, 'approve');
+    assert.equal((await getContext(f.env, context.id)).context.authoritative, true);
+    // The next summary of the scope is rebuilt from raw evidence and chained, not superseding.
+    await f.ingest(command('meta-5', 'npm test', 0, { timestamp: at(5) }));
+    await tick(f.env, later(130));
+    const chained: any = (await getContext(f.env, (await jobs(f.env)).at(-1).result_context_id)).context;
+    assert.equal(chained.generation.previous_context_id, context.id);
+    assert.equal(chained.supersedes_id, null);
+    assert.equal(chained.source_count, 1);
+    assert.equal((await getContext(f.env, context.id)).context.status, 'approved');
+  } finally { await f.close(); }
+});
+
+test('the rule filter skips low-signal-only sources and covers them; jobs without matching versions skip too', async () => {
+  const f = await createEnvFixture();
+  try {
+    await setPolicy(f.env, workspace);
+    await f.ingest([syntheticEvent('low-1', { action: 'session.started', timestamp: at(1) }),
+      syntheticEvent('low-2', { action: 'session.heartbeat', timestamp: at(2) }), syntheticEvent('low-3', { action: 'session.ended', timestamp: at(3) })]);
+    await tick(f.env);
+    const [low] = await jobs(f.env);
+    assert.equal(low.status, 'skipped'); assert.equal(low.skip_reason, 'low_signal_only');
+    assert.equal(await count(f.env, 'processing_coverage WHERE job_id=?', low.id), 3);
+    assert.equal(await count(f.env, 'context_entries'), 0);
+    await f.ingest(syntheticEvent('nomatch-1', { timestamp: at(5) }));
+    await f.env.DB.prepare('UPDATE events SET harness=? WHERE event_id=?').bind('synthetic_other', 'nomatch-1').run();
+    await tick(f.env, later(130));
+    const empty = (await jobs(f.env)).at(-1);
+    assert.equal(empty.skip_reason, 'no_matching_versions'); assert.equal(empty.excluded_count, 1);
+    assert.equal(await count(f.env, 'processing_coverage WHERE job_id=?', empty.id), 1);
+  } finally { await f.close(); }
+});
+
+test('a busy tick stays inside its allotment: five scopes planned, two whole jobs run, the rest wait', async () => {
+  const f = await createEnvFixture();
+  try {
+    await setPolicy(f.env, workspace, { summary_fields: ['command_text'] });
+    for (let repo = 0; repo < 7; repo++) {
+      await f.ingest(Array.from({ length: 30 }, (_, index) => command(`busy-${repo}-${index}`, index % 5 ? 'npm test' : 'npm run build',
+        index % 7 ? 0 : 1, { repo: `repo-${repo}`, session: `session-${repo}`, timestamp: at(index) })));
+    }
+    const first = await tick(f.env, later(60));
+    assert.equal(first.ok, true, JSON.stringify(first));
+    assert.equal(first.result.scanned, 5); assert.equal(first.result.planned, 5);
+    assert.deepEqual(first.result.run_outcomes, { succeeded: 2 });
+    for (const kind of ['d1', 'r2', 'fetch'] as const) assert.ok(first.usage[kind] <= PROCESSING_ALLOTMENT[kind], kind);
+    assert.equal(first.usage.fetch, 0);
+    const second = await tick(f.env, later(61));
+    // The cursor rotates on to the two scopes not yet seen, then wraps around.
+    assert.equal(second.result.scanned, 5);
+    assert.equal(second.result.planned, 2);
+    for (const kind of ['d1', 'r2', 'fetch'] as const) assert.ok(second.usage[kind] <= PROCESSING_ALLOTMENT[kind], kind);
+    // Without room for a whole job the runner stops before claiming instead of failing half way.
+    const tight = await runMaintenance({ ...f.env, MAINTENANCE_TASKS: 'processing' } as Env, { now: later(62), tasks: [{
+      ...processingMaintenance[0], run: (env, ctx) => processingTick(env, { ...ctx, usage: () => ({ ...ctx.usage(), r2: 590 }) }) }] });
+    assert.equal(tight.processing.ok, true);
+    assert.equal((tight.processing.result as any).stopped, 'allotment');
+    assert.equal((tight.processing.result as any).claimed, 0);
+    let queued = 99;
+    for (let round = 0; round < 6 && queued; round++) {
+      await tick(f.env, later(63 + round));
+      queued = await count(f.env, "processing_jobs WHERE status='queued'");
+    }
+    assert.equal(queued, 0);
+    assert.equal(await count(f.env, "processing_jobs WHERE status='succeeded'"), 7);
+  } finally { await f.close(); }
+});
+
+test('a job stops at its raw read, byte and version limits with a short code; a tick without time for a whole job claims none', async () => {
+  const f = await createEnvFixture();
+  try {
+    // Every R2 read of a job fits its reserve: at most 240 batches plus 20 source verifications.
+    assert.deepEqual([MAX_JOB_RAW_READS, MAX_JOB_RAW_BYTES, MAX_JOB_VERSIONS, JOB_RESERVE.r2], [240, 48 * 1024 * 1024, 1000, 240 + 20]);
+    await setPolicy(f.env, workspace, { summary_fields: ['command_text'], min_new_events: 1000 });
+    // Three events in three batches, and an alternate capture of the first in a fourth: four versions.
+    const batches: string[] = [];
+    for (const [id, text, exit, second] of [['cap-1', 'npm test', 1, 1], ['cap-2', 'npm test', 0, 2], ['cap-3', 'npm run lint', 0, 3]] as const)
+      batches.push((await f.ingest(command(id, text, exit, { session: 'cap-s', timestamp: at(second) }))).batch_id);
+    await f.ingest(command('cap-1', 'npm test', 1, { session: 'cap-forged', repo: 'cap-forged', timestamp: at(1) }));
+    let total = 0;
+    for (const id of batches) {
+      const key = (await f.env.DB.prepare('SELECT r2_key FROM batches WHERE id=?').bind(id).first<{ r2_key: string }>())!.r2_key;
+      total += (await (await f.env.RAW.get(key))!.text()).length;
+    }
+    const planned = (await run(f.env, { project_id: (await f.event('cap-1'))!.project_id })).scopes[0];
+    const base = later(60), minutes = (value: number) => new Date(base.getTime() + value * 60_000);
+    const tickWith = (now: Date, limits: Partial<RawLimits> = {}, budget: { budgetMs?: number; clock?: () => number } = {}) =>
+      runMaintenance({ ...f.env, MAINTENANCE_TASKS: 'processing' } as Env, { now, ...budget,
+        tasks: [{ ...processingMaintenance[0], run: (env, ctx) => processingTick(env, ctx, { limits }) }] });
+    // Attempts 1–3, each after the previous backoff: over the version, read and character limits.
+    for (const [at, limits, code, reads] of [[0, { versions: 3 }, 'too_many_versions', 0], [1, { reads: 2 }, 'raw_read_limit', 2],
+      [6, { bytes: total - 1 }, 'raw_byte_limit', 3]] as const) {
+      const report = await tickWith(minutes(at), limits);
+      assert.equal(report.processing.ok, true, code);
+      assert.deepEqual([report.processing.result!.run_outcomes, report.processing.usage.r2], [{ retry: 1 }, reads], code);
+      const row = await job(f.env, planned.job_id);
+      assert.deepEqual([row.status, row.last_error, row.event_count], ['queued', code, null], code);
+    }
+    assert.equal(await count(f.env, 'processing_coverage'), 0);
+    // Under 5 s left: the runner stops before claiming. Exactly 5 s: it claims and the job finishes.
+    const starved = await tickWith(minutes(36), {}, { budgetMs: 4_999, clock: () => 0 });
+    assert.deepEqual([starved.processing.result!.stopped, starved.processing.result!.claimed], ['time', 0]);
+    assert.equal((await job(f.env, planned.job_id)).attempts, 3);
+    const enough = await tickWith(minutes(36), {}, { budgetMs: 5_000, clock: () => 0 });
+    assert.deepEqual(enough.processing.result!.run_outcomes, { succeeded: 1 });
+    assert.deepEqual([(await job(f.env, planned.job_id)).attempts, (await job(f.env, planned.job_id)).event_count], [4, 3]);
+  } finally { await f.close(); }
+});
+
+test('ingest acknowledgements do not depend on processing tables, even when they are dropped', async () => {
+  const f = await createEnvFixture();
+  try {
+    await setPolicy(f.env, workspace);
+    await f.ingest(syntheticEvent('drop-1'));
+    await tick(f.env);
+    for (const table of ['processing_job_fence', 'processing_coverage', 'processing_job_sources', 'processing_signals', 'processing_calls',
+      'processing_job_audit', 'context_generation', 'processing_jobs', 'processing_policy_audit', 'processing_policies',
+      'processing_budget_audit', 'processing_budget', 'processing_scan_cursor'])
+      await f.env.DB.prepare(`DROP TABLE ${table}`).run();
+    const ack = await f.ingest([syntheticEvent('drop-2'), syntheticEvent('drop-3', { session: 'session-c' })], 'mini');
+    assert.equal(ack.accepted, 2); assert.equal(ack.inserted, 2);
+    const report = await tick(f.env);
+    assert.equal(report.ok, false); assert.equal(report.error, 'task_failed');
+    assert.equal((await f.ingest(syntheticEvent('drop-4'))).accepted, 1);
+    assert.equal(await count(f.env, 'events'), 4);
+  } finally { await f.close(); }
+});
+
+test('job reads list identifiers, codes and counts only, with filters and keyset pages', async () => {
+  const f = await createEnvFixture();
+  try {
+    await setPolicy(f.env, workspace, { summary_fields: ['command_text'] });
+    for (let repo = 0; repo < 3; repo++)
+      await f.ingest(command(`list-${repo}`, `echo MARKER_CONTENT_${repo}`, 0, { repo: `list-${repo}`, session: `s-${repo}` }));
+    await tick(f.env);
+    const read = async (path: string) => (await processingRead(new Request('http://localhost' + path), f.env))!.json() as Promise<any>;
+    const all = await read('/api/processing/jobs');
+    assert.equal(all.jobs.length, 3); assert.equal(all.next_cursor, null);
+    assert.ok(!JSON.stringify(all).includes('MARKER_CONTENT'));
+    const page = await read('/api/processing/jobs?limit=2');
+    assert.equal(page.jobs.length, 2);
+    const rest = await read('/api/processing/jobs?limit=2&before=' + encodeURIComponent(page.next_cursor));
+    assert.equal(rest.jobs.length, 1);
+    assert.equal(new Set([...page.jobs, ...rest.jobs].map((row: any) => row.id)).size, 3);
+    const succeeded = all.jobs.filter((row: any) => row.status === 'succeeded');
+    assert.equal(succeeded.length, 2);
+    assert.equal((await read('/api/processing/jobs?status=succeeded')).jobs.length, 2);
+    assert.equal((await read('/api/processing/jobs?status=queued')).jobs.length, 1);
+    assert.equal((await read('/api/processing/jobs?project_id=' + all.jobs[0].project_id)).jobs.length, 1);
+    const detail = (await read('/api/processing/jobs/' + succeeded[0].id)).job;
+    assert.equal(detail.covered_count, 1); assert.equal(detail.sources.length, 1); assert.equal(detail.sources[0].covered, true);
+    assert.equal(detail.result_status, 'pending');
+    assert.deepEqual([detail.signals, detail.calls, detail.audit], [[], [], []]);
+    assert.ok(!JSON.stringify(detail).includes('MARKER_CONTENT'));
+    for (const path of ['/api/processing/jobs?status=all', '/api/processing/jobs?limit=41', '/api/processing/jobs?before=bad',
+      '/api/processing/jobs?project_id=x', '/api/processing/jobs?task_id=x', '/api/processing/jobs?unknown=1',
+      '/api/processing/jobs?status=queued&status=failed', '/api/processing/jobs/not-a-job', `/api/processing/jobs/${succeeded[0].id}?x=1`])
+      await rejects(processingRead(new Request('http://localhost' + path), f.env), 400);
+    await rejects(processingRead(new Request('http://localhost/api/processing/jobs/' + '0'.repeat(64)), f.env), 404);
+    for (const body of [{}, { task_id: crypto.randomUUID(), project_id: all.jobs[0].project_id }, { task_id: 'x' }, { project_id: 'x' }, { other: 1 }])
+      await rejects(processingWrite(post('/api/processing/run', body), f.env, reviewer), 400);
+    await rejects(processingWrite(post('/api/processing/run', { task_id: crypto.randomUUID() }), f.env, reviewer), 404);
+    // A task without linked sessions has no scope to plan.
+    assert.deepEqual(await run(f.env, { task_id: await newTask(f.env, 'Synthetic empty task') }), { scopes: [] });
+    await rejects(processingWrite(post('/api/processing/run', { project_id: 'e'.repeat(64) }), f.env, reviewer), 404);
+    // Unknown processing paths are left to the router's 404.
+    assert.equal(await processingWrite(post('/api/processing/unknown', {}), f.env, reviewer), null);
+    assert.equal(await processingRead(new Request('http://localhost/api/processing/unknown'), f.env), null);
+    assert.equal(await processingWrite(post('/api/context', {}), f.env, reviewer), null);
+  } finally { await f.close(); }
+});
+
+test('acceptance: a labelled two-Mac task cites every failure, fix, verification, decision and open risk; Jev flags the right note', async () => {
+  const f = await createEnvFixture({ bindings: { EXTERNAL_PROCESSING_PROJECTS: '*', JEV_API_KEY: 'synthetic-acceptance-jev-key-000000' } });
+  try {
+    await setPolicy(f.env, workspace, { summary_fields: ['command_text', 'file_path', 'tool_name', 'titles', 'approved_note_text'],
+      external_allowed: true, jev_enabled: true, external_fields: ['command_text', 'titles', 'approved_note_text'] });
+    await setBudget(f.env, { daily_call_limit: 2 });
+    const labelled = {
+      failure: command('acc-mbp-fail', 'npm test -- login', 1, { session: 'mbp-login', timestamp: at(10) }),
+      fix: syntheticEvent('acc-mbp-fix', { action: 'file.modified', session: 'mbp-login', timestamp: at(20),
+        extra: { file: { path: '/synthetic/alpha/src/auth/callback.ts' } } }),
+      decision: syntheticEvent('acc-mbp-approval', { action: 'approval.allowed', session: 'mbp-login', timestamp: at(30),
+        extra: { approval: { decision: 'allowed' }, tool: { name: 'Bash' } } }),
+      verification: command('acc-mini-verify', 'npm test -- login', 0, { session: 'mini-verify', timestamp: at(40) }),
+      risk: command('acc-mini-lint', 'npm run lint', 2, { session: 'mini-verify', timestamp: at(50) }),
+    };
+    const noise = [syntheticEvent('acc-mbp-start', { action: 'session.started', session: 'mbp-login', timestamp: at(1) }),
+      syntheticEvent('acc-mbp-read', { action: 'file.read', session: 'mbp-login', timestamp: at(15),
+        extra: { file: { path: '/synthetic/alpha/README.md' } } })];
+    await f.ingest([...noise, labelled.failure, labelled.fix, labelled.decision]);
+    await f.ingest([labelled.verification, labelled.risk], 'mini');
+    const sessions = [(await f.event('acc-mbp-fail'))!.session_id, (await f.event('acc-mini-verify'))!.session_id];
+    const taskId = await newTask(f.env, '合成：修復登入並跨機驗證', sessions);
+    // Two approved notes the new activity is checked against: the task's note claims the
+    // callback needs no change (the fix contradicts it); the project's lint rule does not conflict.
+    const note = async (eventId: string, title: string, content: string, task?: string) => {
+      const event = (await f.event(eventId))!;
+      const id = await insertCandidate(f.env, { kind: 'memory', project_id: event.project_id, ...(task ? { task_id: task } : {}), title, content,
+        sources: [{ event_id: event.id, payload_hash: event.payload_hash }] }, reviewer);
+      await review(f.env, id, 'approve');
+      return id;
+    };
+    const stale = await note('acc-mbp-fail', '登入失敗原因', '登入失敗與 callback 無關，不需要修改 src/auth/callback.ts。', taskId);
+    const lint = await note('acc-mini-lint', 'Lint 規則', '合併前必須執行 npm run lint。');
+    // A synthetic evaluator: each contradiction question names one note id; it answers from that
+    // note's content in state and the activity, so the answer is only right if ids map to entries.
+    const asked: string[][] = [];
+    const fetcher = (async (_input: RequestInfo | URL, init: RequestInit = {}) => {
+      const body = JSON.parse(String(init.body));
+      asked.push(Object.keys(body.questions));
+      const commands = body.state.events.map((event: any) => event.command_text ?? '').join('\n');
+      const answers = Object.fromEntries(Object.keys(body.questions).map((id) => {
+        if (!id.startsWith('contradiction:')) return [id, { noul: id === 'new_information' ? 0.8 : 0.9, confidence: 0.7 }];
+        const target = body.state.approved_notes.find((entry: any) => entry.id === id.slice('contradiction:'.length));
+        const contradicted = /callback 無關/.test(target.content) && /npm test -- login/.test(commands);
+        return [id, { noul: contradicted ? 0.92 : 0.05, confidence: 0.6 }];
+      }));
+      return Response.json({ answers, usage: { input_tokens: 1500, output_tokens: 20 } });
+    }) as typeof fetch;
+    const planned = await run(f.env, { task_id: taskId });
+    assert.deepEqual(planned.scopes.map((scope: any) => scope.status), ['planned']);
+    await tick(f.env, later(), { fetcher });
+    const [done] = await jobs(f.env);
+    assert.equal(done.status, 'succeeded'); assert.equal(done.task_id, taskId);
+    const context: any = (await getContext(f.env, done.result_context_id)).context;
+    assert.equal(context.task_id, taskId);
+    assert.equal(context.title, '自動整理：合成：修復登入並跨機驗證（2026-10-07）');
+    const numberOf = async (id: string) => {
+      const central = (await f.event(id))!.id;
+      return context.sources.findIndex((source: any) => source.event_id === central) + 1;
+    };
+    const section = (heading: string) => context.content.split('\n\n').find((part: string) => part.startsWith(heading))!;
+    const expectations: [keyof typeof labelled, string][] = [['failure', '## 進度'], ['fix', '## 進度'], ['decision', '## 決策'],
+      ['verification', '## 已驗證結果'], ['risk', '## 待辦與風險']];
+    const found: Record<string, number> = {};
+    for (const [label, heading] of expectations) {
+      const n = await numberOf(labelled[label].event.id);
+      assert.ok(n > 0, `${label} is a persisted source`);
+      assert.ok(section(heading).includes(`[${n}]`), `${label} is cited under ${heading}`);
+      found[label] = n;
+    }
+    assert.match(section('## 進度'), /2 台裝置（mbp、mini）、2 個 session/);
+    assert.match(section('## 進度'), /src\/auth\/callback\.ts/);
+    assert.match(section('## 進度'), /先前失敗後已成功：「npm test -- login」/);
+    assert.match(section('## 已驗證結果'), /「npm test -- login」結束碼 0/);
+    assert.match(section('## 決策'), /approval\.allowed：允許（Bash）/);
+    assert.match(section('## 待辦與風險'), /「npm run lint」失敗（結束碼 2）/);
+    assert.match(section('## 待辦與風險'), /任務仍為進行中/);
+    assert.equal(validateGenerated({ title: context.title, content: context.content, sources: context.sources }), null);
+    // The contradiction answer lands on the task note it was about, and on no other entry.
+    assert.deepEqual(asked, [['new_information', 'task_related', `contradiction:${lint}`, `contradiction:${stale}`]]);
+    const detail = (await (await processingRead(new Request('http://localhost/api/processing/jobs/' + done.id), f.env))!.json() as any).job;
+    const signal = (id: string) => detail.signals.find((row: any) => row.question_id === 'contradiction:' + id);
+    assert.deepEqual([signal(stale).probability, signal(stale).context_id, signal(stale).label], [0.92, stale, 'uncalibrated']);
+    assert.deepEqual([signal(lint).probability, signal(lint).context_id], [0.05, lint]);
+    assert.equal(detail.note, null);
+    assert.deepEqual(detail.calls.map((call: any) => [call.provider, call.status]), [['jev', 'succeeded']]);
+    // Advisory only: both notes stay approved and the candidate still waits for review.
+    for (const id of [stale, lint]) assert.equal((await getContext(f.env, id)).context.status, 'approved');
+    assert.equal(context.status, 'pending');
+    // Counts recorded for VALIDATION.md.
+    const cited = new Set([...context.content.matchAll(/\[(\d+)\]/g)].map((match) => match[1]));
+    console.log(JSON.stringify({ acceptance: { events: done.event_count, sources: context.source_count, cited: cited.size,
+      labelled: Object.keys(labelled).length, labelled_cited: Object.keys(found).length, content_chars: context.content.length,
+      jev_questions: asked[0].length, jev_signals: detail.signals.length, contradiction_flagged: detail.signals
+        .filter((row: any) => row.question_id.startsWith('contradiction:') && row.probability >= 0.5).map((row: any) => row.context_id === stale ? 'task_note' : 'other') } }));
+    assert.equal(Object.keys(found).length, 5);
+  } finally { await f.close(); }
+});

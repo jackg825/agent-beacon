@@ -1,0 +1,68 @@
+import type { MaintenanceContext } from './maintenance';
+import type { FieldClass, Projection, ProjectedEvent } from './privacy';
+import type { EffectivePolicy } from './processing-policy';
+import type { Env } from './types';
+
+/** The scope a job summarizes, as re-validated at run time. */
+export interface JobScope {
+  scope_type: 'task' | 'project'; scope_id: string; project_id: string; task_id: string | null; scope_key: string;
+}
+/** One evaluator answer; stored in processing_signals and always shown as uncalibrated. */
+export interface StageSignal {
+  question_id: string; probability: number; confidence: number | null; evaluator: string; model: string | null;
+}
+export interface StageInput {
+  env: Env; ctx: MaintenanceContext; job_id: string; attempt: number; scope: JobScope; policy: EffectivePolicy;
+  /** The claim's lease owner; anything a stage commits is fenced on (job_id, lease_owner, attempt). */
+  lease_owner: string;
+  /** Redacted projection under the policy's summary_fields; an external stage must narrow it to external_fields. */
+  projection: ProjectedEvent[];
+  /**
+   * The same sources projected again under `fields` (never beyond summary_fields), also
+   * removing `assigned`: values a stage found assigned to secret keys in other parts of
+   * what it sends (notes, titles). Always redacted, before any cut; the result's
+   * `assigned` is everything removed, for redacting those other parts in turn.
+   */
+  reproject(fields: readonly FieldClass[], assigned: Iterable<string>): Projection;
+  /** Raw task title and project name as stored; a stage may use them only under the `titles` class, redacted. */
+  labels: { task_title: string | null; project_name: string | null };
+}
+export interface StageResult {
+  decision: 'continue' | 'skip';
+  /** Short code; required when skipping. */
+  skip_reason?: string;
+  /** Short code recorded on the job, e.g. jev_skip_overridden. */
+  note?: string;
+  /** Stored by the runner with the job's end state (a stage that already stored them returns none). */
+  signals: StageSignal[];
+}
+/**
+ * The seam between source selection and generation. The default runs the
+ * deterministic rule filter, then the optional Jev stage (src/jev.ts), which must
+ * pass the deploy gate, policy and budget reservation itself, and may only add
+ * signals or skip under the policy threshold; it can never approve, edit or delete.
+ */
+export type SelectionStage = (input: StageInput) => Promise<StageResult>;
+
+/** Actions that by themselves never justify a summary. */
+const lowSignal = new Set(['session.started', 'session.ended', 'session.created', 'session.deleted', 'session.idle',
+  'session.status', 'session.activity', 'session.heartbeat', 'session.compacting', 'session.compacted']);
+export function isLowSignal(action: string): boolean {
+  return lowSignal.has(action) || action.startsWith('inventory.') || action.includes('heartbeat');
+}
+/** Events a skip decision must never hide: failures, denials and policy enforcement. */
+export function isHighSignal(event: ProjectedEvent): boolean {
+  return (event.exit_code !== undefined && event.exit_code !== 0) || event.action === 'tool.failed' || event.action === 'session.error'
+    || ['deny', 'denied', 'reject', 'rejected', 'block', 'blocked'].includes(event.approval_decision ?? '')
+    || event.action === 'approval.denied' || event.policy_enforcement === 'enforce';
+}
+
+/**
+ * Deterministic default: skip only when every selected event is low-signal. Identical
+ * source sets cannot reach this stage, because coverage and job identity already
+ * exclude them.
+ */
+export const ruleFilter: SelectionStage = async ({ projection }) =>
+  projection.length && projection.every((event) => isLowSignal(event.action))
+    ? { decision: 'skip', skip_reason: 'low_signal_only', signals: [] }
+    : { decision: 'continue', signals: [] };

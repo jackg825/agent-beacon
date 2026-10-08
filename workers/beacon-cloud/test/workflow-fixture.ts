@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -13,12 +13,13 @@ export function workflowEvent(id:string,repo='alpha',session='same-native-sessio
     event:{id,action:'command.executed',kind:'agent_runtime',fidelity:'observed'},harness:{name:'codex_cli',collection_method:'hook'},
     session:{id:session,working_directory:'/synthetic/'+repo},repository:'https://github.com/Example/'+repo+'.git',message};
 }
-export async function workflowFixture() {
+/** `bindings` adds vars to the synthetic Worker, e.g. MAINTENANCE_TASKS for a scheduled-processing check. */
+export async function workflowFixture(bindings:Record<string,string>={}) {
   const directory=await mkdtemp(join(tmpdir(),'beacon-context-'));
   const options=convertV4MiniflareOptions({resourcePersistencePath:join(directory,'storage'),workers:[{
     name:'beacon-context',modules:true as const,scriptPath:resolve('dist/worker.mjs'),compatibilityDate:'2026-10-01',
     d1Databases:{DB:'workflow-test-index'},r2Buckets:{RAW:'workflow-test-raw'},bindings:{READ_TOKEN:workflowTokens.read,
-      REVIEW_TOKEN:workflowTokens.review,MCP_TOKEN:workflowTokens.mcp}}]});
+      REVIEW_TOKEN:workflowTokens.review,MCP_TOKEN:workflowTokens.mcp,...bindings}}]});
   let mf=new Miniflare(options);
   const request=(path:string,init:Parameters<typeof mf.dispatchFetch>[1]={})=>mf.dispatchFetch('http://localhost'+path,init);
   const read=(path:string)=>request(path,{headers:{Authorization:'Bearer '+workflowTokens.read}});
@@ -35,7 +36,8 @@ export async function workflowFixture() {
   }
   const initial=await upload([workflowEvent('initial-event')]);
   if (!initial.ok) throw new Error('Synthetic seed failed');
-  await applyMigrations(db,['0002_project_workflows.sql','0003_context_reviews.sql']);
+  // Then every later committed migration, as an operator would before deploying new code.
+  await applyMigrations(db,(await readdir('migrations')).filter(name=>/^\d+.*\.sql$/.test(name) && name!=='0001_initial.sql').sort());
   return {request,read,write,upload,db,
     runtime:()=>mf,
     async restart(){await mf.dispose();mf=new Miniflare(options);},
