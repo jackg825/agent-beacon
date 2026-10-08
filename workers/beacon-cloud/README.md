@@ -259,8 +259,8 @@ recorded; there is no `GENERATOR_*` configuration. See [ROADMAP.md](ROADMAP.md) 
 
 The 0.4 milestone adds the only path from the central service to a Mac, and it is
 explicit at both ends. A reviewer grants one device one project's approved notes;
-the device's own ingest key can then read that snapshot and nothing else (no
-timelines, no pending candidates, no other project unless a reviewer shared a
+the device's own ingest key can then read that snapshot and no other central data
+(no timelines, no pending candidates, no other project unless a reviewer shared a
 memory to this one and the grant sets `include_shared`). On that Mac, the user runs
 `forwarder/sync.mjs preview`, reads the diff and runs `apply <plan_id>`, which writes
 exactly the previewed bytes to a Beacon-owned `*.beacon.md` file under a configured
