@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -35,7 +35,8 @@ export async function workflowFixture() {
   }
   const initial=await upload([workflowEvent('initial-event')]);
   if (!initial.ok) throw new Error('Synthetic seed failed');
-  await applyMigrations(db,['0002_project_workflows.sql','0003_context_reviews.sql']);
+  // Then every later committed migration, as an operator would before deploying new code.
+  await applyMigrations(db,(await readdir('migrations')).filter(name=>/^\d+.*\.sql$/.test(name) && name!=='0001_initial.sql').sort());
   return {request,read,write,upload,db,
     runtime:()=>mf,
     async restart(){await mf.dispose();mf=new Miniflare(options);},
