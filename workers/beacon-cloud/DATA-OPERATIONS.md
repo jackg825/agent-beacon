@@ -137,7 +137,7 @@ npm run backup:restore-check -- --dir /ABS/PATH/new-directory --checkpoint REPLA
 ```text
 GET  /api/retention/policies
 POST /api/retention/policies   {"data_class":"raw","keep_days":180}
-GET  /api/retention/plan?max_batches=50
+GET  /api/retention/plan?max_batches=50&after=CURSOR
 POST /api/retention/apply      （plan 回傳的 data_class、generated_at、cutoff、batch_ids、plan_sha256）
 ```
 
@@ -145,7 +145,13 @@ POST /api/retention/apply      （plan 回傳的 data_class、generated_at、cut
 
 ### 一個批次何時可以刪除
 
-刪除的單位是整個上傳批次：它的 R2 原文、版本與事件索引一起刪除；session、專案、任務與筆記保留。產生計畫時，從收到時間早於 `現在 − keep_days` 的最舊批次開始檢查（每次最多 500 個），計畫最多選 50 個。下列任一情況會擋下：
+刪除的單位是整個上傳批次：它的 R2 原文、版本與事件索引一起刪除；session、專案、任務與筆記保留。產生計畫時，從收到時間早於 `現在 − keep_days` 的最舊批次開始，依（收到時間, ID）往後檢查，計畫最多選 50 個：
+
+- 有筆記引用的批次永遠不能刪除（`context_sources` 不會消失），查詢時就直接略過並計入 `referenced_by_context`，不再逐一評估，所以它們堆在最舊的一端也不會卡住計畫。這類批次只會顯示這一個原因。
+- 其餘批次每頁最多評估 500 個（每頁最多往後走 5,000 個批次），一次請求最多 3 頁，找到足夠的可刪批次就停。跨頁時一起檢查事件版本的封閉性。
+- 還沒走完早於截止時間的批次時，回應的 `scan_limited` 為 `true`，`next_after` 是下一次的起點；把它傳給 `GET /api/retention/plan?after=...` 就從那裡繼續。`scanned` 是走過的批次數，`assessed` 是實際評估的數量。
+
+下列任一情況會擋下：
 
 | 原因 | 意思 |
 | --- | --- |

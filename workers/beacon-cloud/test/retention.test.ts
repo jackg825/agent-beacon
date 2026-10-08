@@ -16,6 +16,7 @@ import { httpSource, restoreCheck, verifyRequest } from '../scripts/restore-chec
 import { createEnvFixture, migrationsExcept, syntheticEvent } from './env-fixture';
 import { revisionsWrite } from '../src/context-revisions';
 import { backupsReviewerRead } from '../src/backup';
+import { encodeCursor } from '../src/operations-shared';
 import { backupTick, completeCheckpoint, createContext, drill, get, later, latestCheckpoint, operationsTokens,
   operationsWorker, post, reviewer, verifiedCheckpoint } from './operations-fixture';
 import { job, setPolicy as setProcessingPolicy, staged, workspace } from './processing-helpers';
@@ -78,7 +79,9 @@ test('raw retention deletes whole closed batch sets only behind a verified, inte
       const plan = await retentionPlan(env, { now });
       assert.equal(plan.plan, null);
       assert.equal((plan.classes[0] as any).scanned, 4);
-      assert.ok(plan.classes[0].blocked.some((item: any) => item.reason === 'no_verified_backup' && item.count === 4));
+      // The note-cited batch is set aside in SQL with its permanent reason; the other three wait for a backup.
+      assert.deepEqual(Object.fromEntries(plan.classes[0].blocked.map((item: any) => [item.reason, item.count])),
+        { no_verified_backup: 3, referenced_by_context: 1, shared_event_versions: 1, within_keep_days: 0 });
       await backupTick(env, later(15));
       const unverified = await retentionPlan(env, { now });
       assert.equal(unverified.plan, null, 'completed but not attested');
@@ -286,6 +289,48 @@ test('a replayed batch deleted again keeps its BACKUP copy until the later run\'
   } finally { await fixture.close(); }
 });
 
+test('batches a note cites never freeze the plan at the old end; the scan pages past them and continues from a cursor', async () => {
+  const fixture = await createEnvFixture({ backup: true });
+  try {
+    const env = fixture.env, pinned = 501;
+    // More permanently blocked batches than one page assesses, all older than the deletable ones.
+    for (let start = 0; start < pinned; start += 25)
+      await Promise.all(Array.from({ length: Math.min(25, pinned - start) }, (_, offset) => fixture.ingest([syntheticEvent('pinned-' + (start + offset), { session: 'pinned' })])));
+    const events = (await env.DB.prepare("SELECT id,payload_hash,project_id FROM events WHERE event_id LIKE 'pinned-%'").all<any>()).results;
+    assert.equal(events.length, pinned);
+    // Pending notes count: context_sources rows never go, so these batches can never be deleted.
+    for (let start = 0; start < events.length; start += 20) await createContext(env, { kind: 'summary', project_id: events[0].project_id,
+      title: 'Synthetic pinned citation', content: 'Synthetic only.', sources: events.slice(start, start + 20).map((event: any) => ({ event_id: event.id, payload_hash: event.payload_hash })) });
+    await fixture.ingest([syntheticEvent('free-1', { session: 'free' })]);
+    await fixture.ingest([syntheticEvent('free-2', { session: 'free' })]);
+    const free = [(await batchOf(env, 'free-1')).id, (await batchOf(env, 'free-2')).id].sort();
+    const checkpoint = await completeCheckpoint(env, later(15));
+    assert.ok(checkpoint.integrity_verified_at);
+    // Attested directly: this test is about the plan's scan, not the drill.
+    await env.DB.prepare(`UPDATE backup_checkpoints SET status='verified',verified_at=?,verified_by=?,verification_result='passed' WHERE id=?`)
+      .bind(new Date().toISOString(), reviewer, checkpoint.id).run();
+    await setPolicy(env, 'raw', 1);
+    const now = later(2 * 24 * 60);
+    const plan = await retentionPlan(env, { now });
+    const raw = plan.classes[0] as any;
+    assert.deepEqual([...plan.plan!.batch_ids].sort(), free);
+    assert.deepEqual([raw.scanned, raw.assessed, raw.scan_limited, raw.next_after], [pinned + 2, 2, false, null]);
+    assert.equal(raw.blocked.find((item: any) => item.reason === 'referenced_by_context').count, pinned);
+    assert.equal(raw.blocked_batches.length, 20);
+    // A later request can start past what an earlier one walked.
+    const last = (await env.DB.prepare("SELECT b.received_at,b.id FROM batches b JOIN events e ON e.batch_id=b.id WHERE e.event_id LIKE 'pinned-%' ORDER BY b.received_at DESC,b.id DESC LIMIT 1").first<any>());
+    const continued = await retentionPlan(env, { now, after: [last.received_at, last.id] });
+    assert.deepEqual([(continued.classes[0] as any).scanned, [...continued.plan!.batch_ids].sort()], [2, free]);
+    // The read route takes the same position as a previous plan's next_after.
+    const response = await retentionRead(get('/api/retention/plan?' + new URLSearchParams({ after: encodeCursor(last.received_at, last.id) })), env);
+    assert.equal(response!.status, 200);
+    const beyond = await retentionPlan(env, { now, after: [now.toISOString(), 'f'.repeat(64)] });
+    assert.deepEqual([(beyond.classes[0] as any).scanned, beyond.plan], [0, null]);
+    for (const query of ['after=x', 'after=' + encodeCursor(last.received_at, 'not-a-batch'), `after=${encodeCursor(last.received_at, last.id)}&after=x`])
+      await assert.rejects(retentionRead(get('/api/retention/plan?' + query), env), status(400), query);
+  } finally { await fixture.close(); }
+});
+
 test('apply re-checks eligibility inside its deleting transaction when a change lands after its earlier checks', async () => {
   const fixture = await createEnvFixture({ backup: true });
   try {
@@ -375,8 +420,9 @@ test('live processing jobs and open flags block the batches they cite; finished 
     const held = await retentionPlan(env, { now });
     assert.deepEqual(held.reference_checks, ['referenced_by_flag', 'referenced_by_processing']);
     assert.equal(held.plan, null);
+    // A batch a note cites is permanently blocked and reported with that reason alone.
     assert.deepEqual(await blockedBy(), { [dismissed.batch_id]: ['referenced_by_processing'], [flagged.batch_id]: ['referenced_by_flag'],
-      [summarized.batch_id]: ['referenced_by_context', 'referenced_by_processing'] });
+      [summarized.batch_id]: ['referenced_by_context'] });
     // Track P's runner: the first job is leased by an invocation that runs out of allotment, then fails
     // every later attempt until it is failed; the second runs to a pending candidate.
     const stage: SelectionStage = async (input) => {

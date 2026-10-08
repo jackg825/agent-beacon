@@ -8,12 +8,16 @@ import { rawCopyKey } from './backup';
 import { stableJSON } from './identity';
 import { Env, HttpError, json } from './types';
 import { readJson } from './workflow';
-import { HASH, SETTLE_MS, backupMaxAgeDays, hex, iso, retentionGraceDays, tableSet } from './operations-shared';
+import { HASH, SETTLE_MS, backupMaxAgeDays, decodeCursor, encodeCursor, hex, iso, retentionGraceDays, tableSet } from './operations-shared';
 
 export const DATA_CLASSES = ['raw', 'summary', 'candidate', 'audit'] as const;
 export type DataClass = typeof DATA_CLASSES[number];
-/** Oldest batches considered by one plan; reports say when more exist. */
+/** Candidates one page of a plan assesses (one D1 batch); reports say when more exist. */
 export const RETENTION_SCAN_LIMIT = 500;
+/** Batches one page walks past the cutoff to find those candidates; batches a note cites are skipped in SQL. */
+export const RETENTION_WALK_WINDOW = 5000;
+/** Pages one plan request may use before it returns a cursor to continue from. */
+export const RETENTION_MAX_PAGES = 3;
 export const MAX_PLAN_BATCHES = 50;
 export const PLAN_TTL_MS = 3600_000;
 const DAY = 86400_000;
@@ -78,8 +82,8 @@ function optionalReferences(tables: Set<string>) {
 }
 
 /** Everything eligibility needs, read in one D1 batch so it is one consistent view. */
-async function assess(env: Env, batches: BatchRow[], now: Date): Promise<Assessment> {
-  const ids = JSON.stringify(batches.map(batch => batch.id)), tables = await tableSet(env.DB);
+async function assess(env: Env, batches: BatchRow[], now: Date, tables: Set<string>): Promise<Assessment> {
+  const ids = JSON.stringify(batches.map(batch => batch.id));
   const optional = optionalReferences(tables);
   let results: D1Result[];
   try {
@@ -135,7 +139,31 @@ function reasonsFor(id: string, ids: Set<string>, blocked: Set<string>, assessme
   return [...reasons].sort();
 }
 
-export async function retentionPlan(env: Env, options: { now?: Date; maxBatches?: number } = {}) {
+/** A note in any status cites one of these versions: context_sources rows never go, so the batch can never be deleted. */
+const CITED = `EXISTS(SELECT 1 FROM event_versions v JOIN context_sources s ON s.event_id=v.event_id AND s.payload_hash=v.payload_hash
+  WHERE v.batch_id=w.id)`;
+
+/**
+ * Walk batches older than the cutoff in (received_at,id) order from `after`, at most `window` per
+ * query. Permanently blocked batches (cited by a note) are flagged in SQL and never assessed, so
+ * they cannot hold the window in place; a page stops after `limit` other candidates.
+ */
+async function walk(env: Env, cutoff: string, after: [string, string] | null, window: number, limit: number) {
+  const rows = await env.DB.prepare(`WITH w AS (SELECT id,r2_key,received_at FROM batches WHERE received_at<?
+      ${after ? 'AND (received_at,id)>(?,?)' : ''} ORDER BY received_at,id LIMIT ?)
+    SELECT w.id,w.r2_key,w.received_at,${CITED} AS cited FROM w ORDER BY w.received_at,w.id`)
+    .bind(cutoff, ...(after ?? []), window).all<BatchRow & { cited: number }>();
+  const candidates: BatchRow[] = [], cited: string[] = [];
+  let position: [string, string] | null = after, walked = 0;
+  for (const row of rows.results) {
+    if (candidates.length >= limit) break;
+    walked++; position = [row.received_at, row.id];
+    if (row.cited) cited.push(row.id); else candidates.push({ id: row.id, r2_key: row.r2_key, received_at: row.received_at });
+  }
+  return { candidates, cited, walked, position, exhausted: walked === rows.results.length && rows.results.length < window };
+}
+
+export async function retentionPlan(env: Env, options: { now?: Date; maxBatches?: number; after?: [string, string] | null } = {}) {
   const now = options.now ?? new Date(), maxBatches = options.maxBatches ?? MAX_PLAN_BATCHES;
   const policies = await retentionPolicies(env), raw = policies[0];
   const reportOnly = policies.slice(1).map(policy => ({ data_class: policy.data_class, keep_days: policy.keep_days, enforced: false,
@@ -144,13 +172,25 @@ export async function retentionPlan(env: Env, options: { now?: Date; maxBatches?
   if (raw.keep_days === null) return { generated_at: iso(now), policies, classes: [{ data_class: 'raw', keep_days: null, enforced: true,
     cutoff: null, scanned: 0, scan_limited: false, eligible: empty, blocked: [{ reason: 'within_keep_days', count: null }] }, ...reportOnly],
     backup_checkpoint: null, plan: null };
-  const cutoff = iso(now.getTime() - raw.keep_days * DAY);
-  const [candidates, newer] = await env.DB.batch([
-    env.DB.prepare('SELECT id,r2_key,received_at FROM batches WHERE received_at<? ORDER BY received_at,id LIMIT ?').bind(cutoff, RETENTION_SCAN_LIMIT + 1),
+  const cutoff = iso(now.getTime() - raw.keep_days * DAY), tables = await tableSet(env.DB);
+  // Page through old batches until enough are eligible, the old range ends or the page budget is spent.
+  const scanned: BatchRow[] = [], cited: string[] = [];
+  let assessment: Assessment | null = null, position = options.after ?? null, walked = 0, exhausted = false;
+  for (let page = 0; page < RETENTION_MAX_PAGES && !exhausted; page++) {
+    const step = await walk(env, cutoff, position, RETENTION_WALK_WINDOW, RETENTION_SCAN_LIMIT);
+    position = step.position; walked += step.walked; exhausted = step.exhausted; cited.push(...step.cited);
+    if (!step.candidates.length) continue;
+    const next = await assess(env, step.candidates, now, tables);
+    scanned.push(...step.candidates);
+    assessment = assessment ? merge(assessment, next) : next;
+    const ids = new Set(scanned.map(batch => batch.id));
+    if (ids.size - blockedWithin(ids, assessment.base, assessment.edges).size >= maxBatches) break;
+  }
+  if (!assessment) assessment = await assess(env, [], now, tables);
+  const [newer] = await env.DB.batch([
     env.DB.prepare('SELECT COUNT(*) AS n FROM (SELECT 1 FROM batches WHERE received_at>=? LIMIT 10001)').bind(cutoff),
   ]);
-  const scanned = (candidates.results as BatchRow[]).slice(0, RETENTION_SCAN_LIMIT);
-  const assessment = await assess(env, scanned, now), ids = new Set(scanned.map(batch => batch.id));
+  const ids = new Set(scanned.map(batch => batch.id));
   const blocked = blockedWithin(ids, assessment.base, assessment.edges);
   const eligible = scanned.filter(batch => !blocked.has(batch.id));
   // The plan itself must be closed: take each eligible batch together with the batches its
@@ -172,19 +212,31 @@ export async function retentionPlan(env: Env, options: { now?: Date; maxBatches?
   const batchIds = scanned.filter(batch => selected.has(batch.id)).map(batch => batch.id);
   const reasonCounts = new Map<string, number>();
   for (const id of blocked) for (const reason of reasonsFor(id, ids, blocked, assessment)) reasonCounts.set(reason, (reasonCounts.get(reason) ?? 0) + 1);
+  if (cited.length) reasonCounts.set('referenced_by_context', (reasonCounts.get('referenced_by_context') ?? 0) + cited.length);
   const newerCount = (newer.results[0] as { n: number }).n;
-  const total = (list: string[]) => ({ batches: list.length, events: list.reduce((sum, id) => sum + (assessment.events.get(id) ?? 0), 0),
-    versions: list.reduce((sum, id) => sum + (assessment.versions.get(id) ?? 0), 0),
-    bytes: list.reduce((sum, id) => sum + (assessment.backup.get(id)?.size ?? 0), 0) });
+  const finalAssessment = assessment;
+  const total = (list: string[]) => ({ batches: list.length, events: list.reduce((sum, id) => sum + (finalAssessment.events.get(id) ?? 0), 0),
+    versions: list.reduce((sum, id) => sum + (finalAssessment.versions.get(id) ?? 0), 0),
+    bytes: list.reduce((sum, id) => sum + (finalAssessment.backup.get(id)?.size ?? 0), 0) });
+  const samples = [...cited.map(id => ({ batch_id: id, reasons: ['referenced_by_context'] })),
+    ...[...blocked].map(id => ({ batch_id: id, reasons: reasonsFor(id, ids, blocked, finalAssessment) }))].slice(0, 20);
   const generatedAt = iso(now);
   return { generated_at: generatedAt, policies, classes: [{ data_class: 'raw', keep_days: raw.keep_days, enforced: true, cutoff,
-    scanned: scanned.length, scan_limited: candidates.results.length > RETENTION_SCAN_LIMIT, eligible: total(eligible.map(batch => batch.id)),
+    scanned: walked, assessed: scanned.length, scan_limited: !exhausted,
+    next_after: !exhausted && position ? encodeCursor(position[0], position[1]) : null, eligible: total(eligible.map(batch => batch.id)),
     blocked: [...[...reasonCounts].sort(([a], [b]) => a < b ? -1 : 1).map(([reason, count]) => ({ reason, count })),
       { reason: 'within_keep_days', count: newerCount > 10000 ? null : newerCount, ...(newerCount > 10000 ? { at_least: 10001 } : {}) }],
-    blocked_batches: [...blocked].slice(0, 20).map(id => ({ batch_id: id, reasons: reasonsFor(id, ids, blocked, assessment) })) }, ...reportOnly],
+    blocked_batches: samples }, ...reportOnly],
     backup_checkpoint: assessment.gate, backup_running: assessment.running, reference_checks: [...assessment.optional].sort(),
     plan: batchIds.length ? { data_class: 'raw' as const, generated_at: generatedAt, cutoff, batch_ids: batchIds,
       plan_sha256: await planHash(generatedAt, cutoff, batchIds), ...total(batchIds) } : null };
+}
+
+/** Union of two pages' assessments; the closure check then runs over every assessed batch at once. */
+function merge(a: Assessment, b: Assessment): Assessment {
+  return { base: new Map([...a.base, ...b.base]), edges: [...a.edges, ...b.edges], gate: a.gate, running: a.running || b.running,
+    events: new Map([...a.events, ...b.events]), versions: new Map([...a.versions, ...b.versions]), backup: new Map([...a.backup, ...b.backup]),
+    optional: new Set([...a.optional, ...b.optional]) };
 }
 
 /** Re-check the exact plan, confirm every BACKUP copy, then delete D1 rows and only then RAW objects. */
@@ -202,7 +254,7 @@ export async function applyRetention(env: Env, input: ApplyInput, actor: string,
   if (rows.results.length !== ids.length) throw new HttpError(409, 'A planned batch no longer exists');
   const batches = ids.map(id => rows.results.find(row => row.id === id)!);
   if (batches.some(batch => batch.received_at >= input.cutoff)) throw new HttpError(409, 'A planned batch is newer than the plan cutoff');
-  const assessment = await assess(env, batches, now);
+  const tables = await tableSet(env.DB), assessment = await assess(env, batches, now, tables);
   if (assessment.running) throw new HttpError(409, 'A backup checkpoint is running; apply after it completes');
   const blocked = blockedWithin(set, assessment.base, assessment.edges);
   if (blocked.size) return json({ error: 'Retention plan is no longer eligible; generate a new plan',
@@ -230,7 +282,7 @@ export async function applyRetention(env: Env, input: ApplyInput, actor: string,
       WHERE v.batch_id IN (${inSet}))`, idJson),
     guard(`NOT EXISTS(SELECT 1 FROM events e JOIN event_versions v ON v.event_id=e.id WHERE e.batch_id IN (${inSet})
       AND v.batch_id NOT IN (${inSet}))`, idJson, idJson),
-    ...optionalReferences(await tableSet(env.DB)).map(query => guard(`NOT EXISTS(${query.sql})`, idJson)),
+    ...optionalReferences(tables).map(query => guard(`NOT EXISTS(${query.sql})`, idJson)),
   ];
   const run = 'EXISTS(SELECT 1 FROM retention_runs WHERE id=?)';
   let results: D1Result[];
@@ -274,10 +326,11 @@ export async function retentionRead(request: Request, env: Env): Promise<Respons
   }
   if (url.pathname === '/api/retention/plan') {
     const params = url.searchParams;
-    for (const key of params.keys()) if (key !== 'max_batches' || params.getAll(key).length !== 1) throw new HttpError(400, 'Invalid retention filter');
+    for (const key of params.keys()) if (!['max_batches', 'after'].includes(key) || params.getAll(key).length !== 1) throw new HttpError(400, 'Invalid retention filter');
     const raw = params.get('max_batches');
     if (raw !== null && (!/^\d{1,2}$/.test(raw) || Number(raw) < 1 || Number(raw) > MAX_PLAN_BATCHES)) throw new HttpError(400, 'max_batches must be 1–50');
-    return json(await retentionPlan(env, { maxBatches: raw === null ? MAX_PLAN_BATCHES : Number(raw) }));
+    // `after` is a previous plan's next_after: continue the scan past the batches it already walked.
+    return json(await retentionPlan(env, { maxBatches: raw === null ? MAX_PLAN_BATCHES : Number(raw), after: decodeCursor(params.get('after'), HASH) }));
   }
   return null;
 }
