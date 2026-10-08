@@ -371,7 +371,7 @@ test('live processing jobs and open flags block the batches they cite; finished 
 
 test('without migration 0004 retention plans and applies with no processing check, and a foreign layout fails closed', async () => {
   // Explicitly the schema of a deployment that applied Track D but never Track P (nor Track R, whose flags build on it).
-  const fixture = await createEnvFixture({ backup: true, migrations: await migrationsExcept('0004', '0007') });
+  const fixture = await createEnvFixture({ backup: true, migrations: await migrationsExcept('0004', '0007', '0009') });
   try {
     const env = fixture.env;
     await fixture.ingest([syntheticEvent('legacy-1')]);

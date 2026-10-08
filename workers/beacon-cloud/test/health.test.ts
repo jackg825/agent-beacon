@@ -252,7 +252,7 @@ test('findings cover devices, backlog, stale notes, flags and backups without co
 
 test('without migration 0004 the processing queue is unavailable, and a foreign table layout degrades to a code', async () => {
   // Explicitly the schema of a deployment that applied Track D but never Track P (nor Track R, whose flags build on it).
-  const fixture = await createEnvFixture({ migrations: await migrationsExcept('0004', '0007') });
+  const fixture = await createEnvFixture({ migrations: await migrationsExcept('0004', '0007', '0009') });
   try {
     const env = fixture.env;
     let health = await dataHealth(env);

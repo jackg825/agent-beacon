@@ -6,7 +6,8 @@ import { Env, HttpError } from './types';
 /** Tables exported in chunks across ticks instead of in the final snapshot. */
 export const CHUNKED_TABLES = ['batches', 'events', 'event_versions'] as const;
 /** Bookkeeping that describes BACKUP itself; restored databases do not need it. */
-export const BACKUP_BOOKKEEPING = new Set(['backup_checkpoints', 'backup_chunks', 'backup_raw_objects', 'backup_audit', 'backup_state', 'health_state']);
+export const BACKUP_BOOKKEEPING = new Set(['backup_checkpoints', 'backup_chunks', 'backup_raw_objects', 'backup_raw_generations', 'backup_audit',
+  'backup_state', 'health_state']);
 export const RAW_KEY = /^batches\/[A-Za-z0-9_-]{1,80}\/(?:runtime|inventory)\/[a-f0-9]{64}\.ndjson$/;
 export const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 export const HASH = /^[a-f0-9]{64}$/;

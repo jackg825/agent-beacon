@@ -24,7 +24,7 @@
 
 以下是待執行的 runbook，本文件沒有替雲端部署提供驗收證據。所有指令都要保留明確的 TEST `--config`，不要改公開的 `wrangler.jsonc`。
 
-1. 照 [CONTEXT-WORKFLOWS.md](CONTEXT-WORKFLOWS.md) 先備份 D1，再在隔離 TEST 套用 `0006_data_operations.sql`（只新增 table、index 與 trigger），然後部署。此時仍不會執行任何背景工作。
+1. 照 [CONTEXT-WORKFLOWS.md](CONTEXT-WORKFLOWS.md) 先備份 D1，再在隔離 TEST 依序套用 `0006_data_operations.sql`（只新增 table、index 與 trigger）、`0008_backup_rounds.sql`（只新增欄位、一個 table 與 index）和 `0009_backup_revision_indexes.sql`（只新增 index，需要先有 `0004` 與 `0007`），然後部署。此時仍不會執行任何背景工作。`backup` 任務需要 `0008`；少了它時回報 `backup_schema_missing`。
 2. 建立一個**獨立的私人** R2 bucket 給備份使用，不要重用 RAW bucket 或其他專案的 bucket，也不要開公開存取。在 `.local/wrangler.test.jsonc` 的 `r2_buckets` 加上 `{"binding":"BACKUP","bucket_name":"REPLACE_WITH_PRIVATE_BACKUP_BUCKET"}`。
 3. 在同一份 TEST config 的 `vars` 設定 `MAINTENANCE_TASKS`，例如 `"health"` 先只做健康檢查；確認結果後再改成 `"backup,health"`。
 4. 依需要調整下列 vars（超出範圍時使用預設值）：
@@ -166,6 +166,6 @@ POST /api/retention/apply      （plan 回傳的 data_class、generated_at、cut
 
 ## 回復與限制
 
-`0006` 只新增 table、index 與 trigger，沒有 down migration。只需要退版程式時，回復上一個 Worker 版本即可，新 table 保留不動；不要 drop table、刪除稽核或清掉 BACKUP 來退版。
+`0006`、`0008`、`0009` 只新增 table、欄位、index 與 trigger，沒有 down migration。只需要退版程式時，回復上一個 Worker 版本即可，新 table 保留不動；不要 drop table、刪除稽核或清掉 BACKUP 來退版。
 
 尚未提供或尚未驗收：雲端上的實際備份與還原演練、摘要／候選／稽核的實際刪除、多人具名審閱、BACKUP bucket 本身的生命週期設定。所有數字與流程都只經過本機合成測試。
