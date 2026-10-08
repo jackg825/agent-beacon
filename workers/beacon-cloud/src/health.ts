@@ -25,8 +25,13 @@ function add(target: Tally, id: string) { target.count++; if (target.sample.leng
  * the same key range from the batches.r2_key index, then diff both ways.
  */
 async function listDiff(env: Env, now: Date, limits: HealthLimits): Promise<Record<string, unknown>> {
-  const state = await env.DB.prepare('SELECT revision,scan,last_pass FROM health_state WHERE id=1')
-    .first<{ revision: number; scan: string | null; last_pass: string | null }>();
+  let state: { revision: number; scan: string | null; last_pass: string | null } | null;
+  try { state = await env.DB.prepare('SELECT revision,scan,last_pass FROM health_state WHERE id=1').first(); }
+  catch (error) {
+    // Code deployed before migration 0006 was applied: report it rather than a generic failure.
+    if (!await env.DB.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='health_state'").first()) state = null;
+    else throw error;
+  }
   if (!state) throw new MaintenanceError('health_schema_missing');
   const scan: Scan = state.scan ? JSON.parse(state.scan) : { started_at: iso(now), start_after: null, ticks: 0, listed: 0, bytes: 0, batches: 0,
     missing: tally(), orphans: tally() };
