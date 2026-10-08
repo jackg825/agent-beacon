@@ -45,7 +45,8 @@ async function fakeWorker(t, device = 'synthetic-mbp') {
       const project = state.projects.get(url.searchParams.get('project_id'));
       if (!project || [...url.searchParams.keys()].length !== 1) return send(403, { error: 'synthetic private body must not be echoed' });
       const snapshot = snapshotOf(url.searchParams.get('project_id'), project.kinds, project.notes);
-      return send(200, { snapshot: state.tamper ? state.tamper(snapshot) : snapshot });
+      // Lets a test act while the tool waits on the network (e.g. another process swapping a folder).
+      return Promise.resolve(state.onSnapshot?.()).then(() => send(200, { snapshot: state.tamper ? state.tamper(snapshot) : snapshot }));
     }
     return send(404, { error: 'Not found' });
   });
@@ -235,6 +236,39 @@ test('an interrupted apply or rollback is reconciled from what the destination a
   await assert.rejects(versions(f.config, '0'), { message: 'CORRUPT_STATE' });
   await fs.writeFile(manifestPath, JSON.stringify({ ...current, pending: { ...legacy.pending, previous: { id: 'x', sha256: null } } }));
   await assert.rejects(versions(f.config, '0'), { message: 'CORRUPT_STATE' });
+});
+
+test('a folder swapped for a symlink while apply or rollback runs is refused right before the write', async (t) => {
+  const f = await fixture(t);
+  const moved = join(f.root, 'moved-alpha');
+  const swap = async () => { await fs.rename(join(f.syncRoot, 'alpha'), moved); await fs.symlink(moved, join(f.syncRoot, 'alpha')); };
+  const unswap = async () => { await fs.rm(join(f.syncRoot, 'alpha')); await fs.rename(moved, join(f.syncRoot, 'alpha')); };
+  // During the snapshot request (another process with write access to sync_root).
+  let plan = (await preview(f.config)).plans[0];
+  f.worker.state.onSnapshot = async () => { f.worker.state.onSnapshot = null; await swap(); };
+  await assert.rejects(apply(f.config, plan.plan_id), { message: 'DESTINATION_SYMLINK_REFUSED' });
+  assert.deepEqual(await fs.readdir(moved), [], 'nothing is written through the swapped folder');
+  await unswap();
+  // After the temp file exists, just before the rename.
+  await assert.rejects(apply(f.config, plan.plan_id, { beforeWrite: swap }), { message: 'DESTINATION_SYMLINK_REFUSED' });
+  assert.deepEqual(await fs.readdir(moved), [], 'the temp file is removed and nothing is renamed into place');
+  await unswap();
+  await apply(f.config, plan.plan_id);
+  const v1 = await read(f.destination);
+  // Rollback re-checks the folder before deleting (restoring absence) or replacing.
+  await assert.rejects(rollback(f.config, '0', { beforeWrite: swap }), { message: 'DESTINATION_SYMLINK_REFUSED' });
+  assert.ok((await read(join(moved, 'notes.beacon.md'))).equals(v1), 'the file behind the swapped folder is not deleted');
+  await unswap();
+  f.worker.add(PROJECT, note('memory', '第二版', '合成第二版內容。'));
+  plan = (await preview(f.config)).plans[0];
+  await apply(f.config, plan.plan_id);
+  const v2 = await read(f.destination);
+  await assert.rejects(rollback(f.config, '0', { beforeWrite: swap }), { message: 'DESTINATION_SYMLINK_REFUSED' });
+  assert.ok((await read(join(moved, 'notes.beacon.md'))).equals(v2));
+  assert.deepEqual((await fs.readdir(moved)).sort(), ['notes.beacon.md']);
+  await unswap();
+  assert.ok((await rollback(f.config, '0')).changed);
+  assert.ok((await read(f.destination)).equals(v1));
 });
 
 test('config confines destinations to an allowlisted root and refuses instruction files', async (t) => {

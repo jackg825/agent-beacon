@@ -105,12 +105,17 @@ async function syncDir(path) {
   const handle = await fs.open(path, 'r');
   try { await handle.sync(); } finally { await handle.close(); }
 }
-/** Unpredictable `wx` temp file in the same directory, fsync, rename, fsync the directory. */
-async function atomicWrite(path, bytes, expectedSha) {
+/**
+ * Unpredictable `wx` temp file in the same directory, fsync, rename, fsync the directory.
+ * `beforeRename` re-checks the destination's folder chain as late as possible, so a folder
+ * swapped for a symlink while the temp file was written is refused instead of followed.
+ */
+async function atomicWrite(path, bytes, expectedSha, beforeRename) {
   const temporary = join(dirname(path), `.beacon-sync-${randomBytes(16).toString('hex')}.tmp`);
   const handle = await fs.open(temporary, 'wx', 0o600);
   try { await handle.writeFile(bytes); await handle.sync(); } finally { await handle.close(); }
   try {
+    if (beforeRename) await beforeRename(temporary);
     // Narrow the window between the last check and the replacement.
     if (expectedSha !== undefined && (await readDestination(path)).sha256 !== expectedSha) throw fail('DESTINATION_CHANGED');
     await fs.rename(temporary, path);
@@ -172,8 +177,8 @@ async function readDestination(path) {
     return { bytes, sha256: hash(bytes) };
   } finally { await handle.close(); }
 }
-/** Re-run on every preview, apply and rollback: realpath root, no symlinks, regular managed file. */
-async function resolveDestination(config, target) {
+/** The destination's folder: realpath root, then lstat every component; no symlink or non-folder anywhere. */
+async function destinationParent(config, target) {
   let root;
   try { root = await fs.realpath(config.sync_root); } catch { throw fail('SYNC_ROOT_MISSING'); }
   checkRoot(root);
@@ -191,7 +196,22 @@ async function resolveDestination(config, target) {
     if (!stat.isDirectory()) throw fail('DESTINATION_PARENT_MISSING');
   }
   if (await fs.realpath(current) !== current) throw fail('DESTINATION_NOT_CANONICAL');
-  const path = join(current, parts.at(-1));
+  return { parent: current, name: parts.at(-1) };
+}
+/**
+ * Re-run immediately before a destination is replaced or removed: the folder chain must
+ * still be the one resolveDestination checked, and the temp file (when there is one) must
+ * really sit in that folder rather than behind a swapped-in symlink.
+ */
+async function recheckParent(config, target, destination, temporary) {
+  const { parent } = await destinationParent(config, target);
+  if (parent !== dirname(destination.path)) throw fail('DESTINATION_SYMLINK_REFUSED');
+  if (temporary && await fs.realpath(dirname(temporary)) !== parent) throw fail('DESTINATION_SYMLINK_REFUSED');
+}
+/** Re-run on every preview, apply and rollback: realpath root, no symlinks, regular managed file. */
+async function resolveDestination(config, target) {
+  const { parent, name } = await destinationParent(config, target);
+  const path = join(parent, name);
   const existing = await readDestination(path);
   if (existing.bytes) {
     // Never take over a file this tool did not write, or one written for another project.
@@ -492,15 +512,17 @@ export async function apply(configOrPath, planId, options = {}) {
     const plan = await readPlan(config, planId);
     const target = config.targets[plan.target];
     if (!target || target.project_id !== plan.project_id || config.worker_url !== plan.worker_url || plan.renderer !== RENDERER) throw fail('PLAN_TARGET_MISMATCH');
-    const destination = await resolveDestination(config, target);
-    if (destination.path !== plan.destination) throw fail('PLAN_TARGET_MISMATCH');
     const rendered = await readPrivate(planPath(config, planId, 'md'));
     if (!rendered || hash(rendered) !== plan.rendered_sha256) throw fail('CORRUPT_PLAN');
+    // Network first: no request (each up to timeout_ms) may sit between the destination
+    // checks below and the write.
     const session = await connect(config, options);
     if (session.deviceId !== plan.device_id) throw fail('DEVICE_NAMESPACE_MISMATCH');
     const snapshot = await fetchSnapshot(session, target);
     if (snapshot.snapshot_sha256 !== plan.snapshot_sha256 || stableJSON(snapshot.kinds) !== stableJSON(plan.kinds)) throw fail('STALE_PLAN');
     if (!renderSnapshot(snapshot).equals(rendered)) throw fail('RENDER_MISMATCH');
+    const destination = await resolveDestination(config, target);
+    if (destination.path !== plan.destination) throw fail('PLAN_TARGET_MISMATCH');
     if (destination.sha256 !== plan.destination_sha256_before) throw fail('DESTINATION_CHANGED');
     // Keep what is about to be replaced, and announce the write together with it, before
     // the destination is touched; both enter the history only once the write has happened.
@@ -509,7 +531,10 @@ export async function apply(configOrPath, planId, options = {}) {
     const applied = versionEntry('applied', await storeObject(config, rendered), { plan_id: planId, snapshot_sha256: plan.snapshot_sha256 });
     manifest.pending = { ...applied, previous };
     await saveManifest(config, target, manifest);
-    await atomicWrite(destination.path, rendered, plan.destination_sha256_before);
+    await atomicWrite(destination.path, rendered, plan.destination_sha256_before, async (temporary) => {
+      await options.beforeWrite?.();
+      await recheckParent(config, target, destination, temporary);
+    });
     settle(manifest);
     await saveManifest(config, target, manifest);
     for (const extension of ['md', 'json']) await fs.rm(planPath(config, planId, extension), { force: true });
@@ -538,13 +563,18 @@ export async function rollback(configOrPath, targetValue, options = {}) {
     manifest.pending = recorded;
     await saveManifest(config, target, manifest);
     if (version.sha256 === null) {
+      await options.beforeWrite?.();
+      await recheckParent(config, target, destination);
       if ((await readDestination(destination.path)).sha256 !== destination.sha256) throw fail('DESTINATION_CHANGED');
       await fs.rm(destination.path);
       await syncDir(dirname(destination.path));
     } else {
       const bytes = await readPrivate(objectPath(config, version.sha256));
       if (!bytes || hash(bytes) !== version.sha256) throw fail('CORRUPT_STATE');
-      await atomicWrite(destination.path, bytes, destination.sha256);
+      await atomicWrite(destination.path, bytes, destination.sha256, async (temporary) => {
+        await options.beforeWrite?.();
+        await recheckParent(config, target, destination, temporary);
+      });
     }
     settle(manifest);
     await saveManifest(config, target, manifest);

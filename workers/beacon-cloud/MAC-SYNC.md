@@ -143,13 +143,13 @@ node forwarder/sync.mjs --config /ABSOLUTE/PRIVATE/PATH/sync.json rollback 0 --v
 | `PLAN_NOT_FOUND` | 計畫不存在，或已經套用過（套用後會刪除） |
 | `INVALID_PLAN_ID` | ID 不是 32–64 位小寫十六進位；使用者輸入不會被拼進路徑 |
 
-寫入時在同一資料夾以不可預測的名稱建立暫存檔（`wx`、`0600`）、fsync、rename，再 fsync 資料夾；rename 前再比對一次目的地雜湊。同步工具以 `state_dir/sync.lock` 避免同時執行；若程序異常結束留下 lock，確認沒有其他同步在跑之後手動刪除。
+`apply` 先完成所有網路請求（驗證裝置、重新取得快照），之後才檢查目的地，所以檢查與寫入之間不會夾著等待網路的時間。寫入時在同一資料夾以不可預測的名稱建立暫存檔（`wx`、`0600`）、fsync、rename，再 fsync 資料夾；rename 前再逐層檢查一次目的地資料夾（並確認暫存檔確實在那個資料夾裡），也再比對一次目的地雜湊。`rollback` 刪除或覆寫檔案前同樣再檢查一次。這把資料夾被換成 symlink 的時間窗縮到 rename 本身；Node.js 沒有 `renameat` 這類以資料夾 handle 操作的 API，所以無法完全消除，能寫入 `sync_root` 的同一使用者程序仍可能在那一瞬間搶先。同步工具以 `state_dir/sync.lock` 避免同時執行；若程序異常結束留下 lock，確認沒有其他同步在跑之後手動刪除。
 
 ## 目的地安全規則
 
 `preview`、`apply`、`rollback` 每次都重新檢查：
 
-- 先把 `sync_root` 解析成實際路徑並重新檢查上層名稱，接著逐層 `lstat`：任何一層是 symlink、上層不是資料夾，或目的地本身是 symlink、資料夾或其他非一般檔案，都拒絕（`DESTINATION_SYMLINK_REFUSED`、`DESTINATION_PARENT_MISSING`、`DESTINATION_NOT_REGULAR_FILE`）。
+- 先把 `sync_root` 解析成實際路徑並重新檢查上層名稱，接著逐層 `lstat`：任何一層是 symlink、上層不是資料夾，或目的地本身是 symlink、資料夾或其他非一般檔案，都拒絕（`DESTINATION_SYMLINK_REFUSED`、`DESTINATION_PARENT_MISSING`、`DESTINATION_NOT_REGULAR_FILE`）。`apply` 與 `rollback` 在真正寫入或刪除前會再做一次資料夾檢查。
 - 相對路徑不能有 `..`、`.`、空白段落、反斜線、控制字元或以 `.` 開頭的段落；也不能經過 `skills`、`rules`、`agents`、`prompts` 等資料夾名稱。
 - 檔名比對前先做 NFC 正規化與大小寫折疊（APFS 預設不分大小寫）。除了必須以 `.beacon.md` 結尾，還拒絕 `AGENTS.md`、`AGENT.md`、`CLAUDE.md`、`GEMINI.md`、`QWEN.md`、`CONVENTIONS.md`、`SKILL.md`、`copilot-instructions.md` 等名稱，以及 `AGENTS.beacon.md` 這類只換副檔名的變形。
 - 已存在的檔案必須以這個工具寫的 managed header 開頭，而且專案相同；否則以 `UNMANAGED_DESTINATION` 或 `DESTINATION_PROJECT_MISMATCH` 拒絕，不會接管使用者自己寫的檔案。
