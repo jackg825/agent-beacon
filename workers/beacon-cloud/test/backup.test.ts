@@ -241,6 +241,8 @@ test('each restore-drill consistency check fails on a backup that is internally 
     const child = rowsOf(pristine).find(({ line }) => line.t === 'context_entries' && line.r.supersedes_id === superseded.id)!.line.r;
     const openFlag = rowsOf(pristine).find(({ line }) => line.t === 'context_flags' && line.r.status === 'open')!.line.r;
     const share = rowsOf(pristine).find(({ line }) => line.t === 'context_shares')!.line.r;
+    const dismissedFlag = rowsOf(pristine).find(({ line }) => line.t === 'context_flags' && line.r.status === 'dismissed')!.line.r;
+    const revokedShare = rowsOf(pristine).find(({ line }) => line.t === 'context_shares' && line.r.revoked_at)!.line.r;
     const version = rowsOf(pristine).find(({ line }) => line.t === 'event_versions')!.line.r;
     const batch = rowsOf(pristine).find(({ line }) => line.t === 'batches' && line.r.id === version.batch_id)!.line.r;
     const editedTriggers = await mkdtemp(join(tmpdir(), 'beacon-migrations-'));
@@ -273,6 +275,11 @@ test('each restore-drill consistency check fails on a backup that is internally 
           const session = rowsOf(f).find(({ line }) => line.t === 'sessions')!.line.r;
           f.lines.get(chunk.key)!.push({ t: 'sessions', r: { ...session, id: 'f'.repeat(64) }, revision: true });
           chunk.revisions = { ...chunk.revisions, sessions: (chunk.revisions?.sessions ?? 0) + 1 };
+        }],
+        // The closing arms on their own: a dismissed flag without its dismiss audit, a revoked share without its revoke audit.
+        [['context_flag_audit_missing', 'context_share_audit_missing'], (f) => {
+          remove(f, 'context_flag_audit', row => row.id === dismissedFlag.id + ':dismiss');
+          remove(f, 'context_share_audit', row => row.id === revokedShare.id + ':revoke');
         }],
         // Count checks on the downloaded objects; the drill stops before loading when one fails.
         [['chunk_row_count_mismatch', 'raw_object_count_mismatch'], (f) => {
