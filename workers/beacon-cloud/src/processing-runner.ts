@@ -1,5 +1,6 @@
 import { digest } from './auth';
 import { insertCandidate } from './context';
+import { contradictionFlagStatements, EvidencePair, flagEvidence } from './context-revisions';
 import { extractiveGenerator, Generator, GeneratorEvent, validateGenerated } from './generator';
 import { stableJSON } from './identity';
 import { defaultStage } from './jev';
@@ -19,9 +20,10 @@ export const MAX_JOBS_PER_TICK = 2;
 /**
  * Platform calls a single job may need: claim, checks, versions, ≤20 verifications and
  * one batch, plus the optional evaluator (prior-call and budget reads, notes,
- * reservation, one outbound fetch and a fenced batch of up to twelve answers).
+ * reservation, one outbound fetch and a fenced batch of up to twelve answers and ten
+ * contradiction flags).
  */
-export const JOB_RESERVE: Allotment = { d1: 110, r2: 260, fetch: 1 };
+export const JOB_RESERVE: Allotment = { d1: 120, r2: 260, fetch: 1 };
 export const MAX_JOB_RAW_READS = 240;
 export const MAX_JOB_RAW_BYTES = 48 * 1024 * 1024;
 const MAX_VERSIONS = 1000;
@@ -70,17 +72,21 @@ const fence = (env: Env, { job, owner }: Lease) =>
 const fenced = 'WHERE id=? AND status=\'running\' AND lease_owner=? AND attempts=?';
 const coverage = (env: Env, { job, now }: Lease, eventIds: string[]) => env.DB.prepare(`INSERT INTO processing_coverage(scope_key,event_id,job_id,created_at)
   SELECT ?,value,?,? FROM json_each(?) WHERE true ON CONFLICT DO NOTHING`).bind(job.scope_key, job.id, now, JSON.stringify(eventIds));
-const signalRows = (env: Env, { job, now }: Lease, signals: StageSignal[]) => signals.map((signal) => env.DB.prepare(`INSERT INTO
+/** Answers a stage returned, then the contradiction flags they raise (context-revisions.ts), in one batch. */
+const signalRows = (env: Env, { job, now }: Lease, signals: StageSignal[], evidence: EvidencePair[] = []) => [
+  ...signals.map((signal) => env.DB.prepare(`INSERT INTO
   processing_signals(job_id,question_id,probability,confidence,evaluator,model,calibrated,created_at) VALUES(?,?,?,?,?,?,0,?)
-  ON CONFLICT DO NOTHING`).bind(job.id, signal.question_id, signal.probability, signal.confidence, signal.evaluator, signal.model, now));
+  ON CONFLICT DO NOTHING`).bind(job.id, signal.question_id, signal.probability, signal.confidence, signal.evaluator, signal.model, now)),
+  ...contradictionFlagStatements(env.DB, { job_id: job.id, signals, evidence, now })];
 
 async function finish(env: Env, lease: Lease, statements: D1PreparedStatement[]): Promise<boolean> {
   try { await env.DB.batch([fence(env, lease), ...statements]); return true; }
   catch (error) { if (/processing_lease_lost/.test(String(error))) return false; throw error; }
 }
 /** Skips that happen before any work leave coverage untouched, so the planner re-plans the scope. */
-async function skip(env: Env, lease: Lease, reason: string, covered: string[], signals: StageSignal[] = [], note: string | null = null) {
-  return finish(env, lease, [...(covered.length ? [coverage(env, lease, covered)] : []), ...signalRows(env, lease, signals),
+async function skip(env: Env, lease: Lease, reason: string, covered: string[], signals: StageSignal[] = [], note: string | null = null,
+  evidence: EvidencePair[] = []) {
+  return finish(env, lease, [...(covered.length ? [coverage(env, lease, covered)] : []), ...signalRows(env, lease, signals, evidence),
     env.DB.prepare(`UPDATE processing_jobs SET status='skipped',skip_reason=?,note=?,last_error=NULL,lease_owner=NULL,lease_until=NULL,
       updated_at=? ${fenced}`).bind(reason, note, lease.now, lease.job.id, lease.owner, lease.job.attempts)]);
 }
@@ -197,10 +203,11 @@ async function runClaimed(env: Env, ctx: MaintenanceContext, lease: Lease, optio
   if (!events.length) return await skip(env, lease, 'no_matching_versions', covered) ? 'skipped' : 'lease_lost';
   const scope: JobScope = { scope_type: job.scope_type, scope_id: job.scope_id, project_id: job.project_id, task_id: job.task_id,
     scope_key: job.scope_key };
+  const evidence = flagEvidence(events);
   const decision = await (options.stage ?? defaultStage)({ env, ctx, job_id: job.id, attempt: job.attempts, lease_owner: lease.owner,
-    scope, policy, projection: projection.events, labels: { task_title: current.task_title, project_name: current.project_name } });
+    scope, policy, projection: projection.events, labels: { task_title: current.task_title, project_name: current.project_name }, evidence });
   if (decision.decision === 'skip')
-    return await skip(env, lease, decision.skip_reason ?? 'stage_skip', covered, decision.signals, decision.note ?? null) ? 'skipped' : 'lease_lost';
+    return await skip(env, lease, decision.skip_reason ?? 'stage_skip', covered, decision.signals, decision.note ?? null, evidence) ? 'skipped' : 'lease_lost';
   const titles = policy.summary_fields.includes('titles');
   const named = job.scope_type === 'task' ? current.task_title : current.project_name;
   const label = titles && named ? cleanLine(named, { secrets }, 120)
@@ -220,7 +227,7 @@ async function runClaimed(env: Env, ctx: MaintenanceContext, lease: Lease, optio
       after: (contextId, createdAt) => [
         env.DB.prepare(`INSERT INTO context_generation(context_id,job_id,processor,scope_key,previous_context_id,created_at)
           VALUES(?,?,?,?,?,?)`).bind(contextId, job.id, generator.processorVersion, job.scope_key, previous?.context_id ?? null, createdAt),
-        coverage(env, lease, covered), ...signalRows(env, lease, decision.signals),
+        coverage(env, lease, covered), ...signalRows(env, lease, decision.signals, evidence),
         env.DB.prepare(`UPDATE processing_jobs SET status='succeeded',result_context_id=?,note=?,last_error=NULL,lease_owner=NULL,
           lease_until=NULL,updated_at=? ${fenced}`).bind(contextId, decision.note ?? null, lease.now, job.id, lease.owner, job.attempts),
       ] });
