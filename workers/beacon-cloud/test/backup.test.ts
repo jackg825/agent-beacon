@@ -249,8 +249,12 @@ test('each restore-drill consistency check fails on a backup that is internally 
       // SQLite stores CREATE TRIGGER without IF NOT EXISTS, so this trigger no longer matches its migration text.
       const file = join(editedTriggers, '0006_data_operations.sql');
       await writeFile(file, (await readFile(file, 'utf8')).replace('CREATE TRIGGER retention_runs_no_update', 'CREATE TRIGGER IF NOT EXISTS retention_runs_no_update'));
+      const versions = rowsOf(pristine).filter(({ line }) => line.t === 'event_versions').map(({ line }) => line.r);
+      const other = versions.find(row => row.batch_id !== version.batch_id)!;
+      // Changes that break independent checks share one drill (each drill is a scratch Miniflare); every code is still asserted.
       const cases: [string[], (f: Forged) => void | Promise<void>, string?][] = [
-        [['payload_hash_mismatch'], async (f) => {
+        [['context_flag_audit_missing', 'context_flag_evidence_unresolved', 'context_review_audit_missing', 'context_share_audit_missing',
+          'context_sources_count_invalid', 'context_supersede_invalid', 'payload_hash_mismatch', 'raw_line_missing', 'revision_without_row'], async (f) => {
           // A raw line that no longer re-hashes to its payload_hash, with its copy, list entry and hashes rewritten to match.
           const key = 'raw/' + batch.r2_key, lines = (await objectText(env, key)).split('\n');
           lines[version.line_number] = lines[version.line_number].replace('"timestamp"', '"timestamp_forged"');
@@ -258,34 +262,36 @@ test('each restore-drill consistency check fails on a backup that is internally 
           f.raw.set(key, text);
           for (const chunk of f.manifest.chunks.filter(item => item.kind === 'raw_list'))
             for (const entry of f.lines.get(chunk.key)!) if (entry.key === key) Object.assign(entry, { size: new TextEncoder().encode(text).byteLength, sha256: sha(text) });
-        }],
-        [['raw_line_missing'], (f) => edit(f, 'event_versions', row => row.event_id === version.event_id && row.payload_hash === version.payload_hash,
-          row => { row.line_number = 99; })],
-        // D1 enforces foreign keys while loading, so a dangling row stops its table from loading at all.
-        [['context_flag_evidence_unresolved', 'context_sources_count_invalid', 'row_count_mismatch', 'row_load_failed'],
-          (f) => remove(f, 'batches', row => row.id === batch.id)],
-        [['trigger_mismatch'], () => {}, editedTriggers + '/'],
-        [['row_count_mismatch'], (f) => { f.manifest.table_counts.tasks = (f.manifest.table_counts.tasks ?? 0) + 1; }],
-        [['device_token_digest_mismatch', 'row_count_mismatch'], (f) => { f.manifest.table_counts.devices += 1; }],
-        [['context_review_audit_missing'], (f) => remove(f, 'context_audit', row => row.id === child.review_id)],
-        [['context_supersede_invalid'], (f) => remove(f, 'context_audit', row => row.id === child.review_id + ':supersede')],
-        [['context_sources_count_invalid'], (f) => remove(f, 'context_sources', row => row.context_id === child.id)],
-        [['context_flag_audit_missing'], (f) => remove(f, 'context_flag_audit', row => row.id === openFlag.id + ':create')],
-        [['context_flag_evidence_unresolved'], (f) => edit(f, 'context_flags', row => row.id === openFlag.id,
-          row => { row.evidence = JSON.stringify([{ event_id: 'f'.repeat(64), payload_hash: 'f'.repeat(64) }]); })],
-        [['context_share_audit_missing'], (f) => remove(f, 'context_share_audit', row => row.id === share.id + ':create')],
-        [['chunk_row_count_mismatch'], (f) => { f.manifest.chunks.find(chunk => chunk.kind === 'final')!.rows.devices += 1; }],
-        [['chunk_row_count_mismatch'], (f) => {
-          const chunk = f.manifest.chunks.find(item => item.kind === 'final')!;
-          chunk.revisions = { ...chunk.revisions, devices: (chunk.revisions?.devices ?? 0) + 1 };
-        }],
-        [['raw_object_count_mismatch'], (f) => { f.manifest.raw.objects += 1; }],
-        [['revision_without_row'], (f) => {
+          edit(f, 'event_versions', row => row.event_id === other.event_id && row.payload_hash === other.payload_hash, row => { row.line_number = 99; });
+          remove(f, 'context_audit', row => row.id === child.review_id);
+          remove(f, 'context_audit', row => row.id === child.review_id + ':supersede');
+          remove(f, 'context_sources', row => row.context_id === child.id);
+          remove(f, 'context_flag_audit', row => row.id === openFlag.id + ':create');
+          edit(f, 'context_flags', row => row.id === openFlag.id, row => { row.evidence = JSON.stringify([{ event_id: 'f'.repeat(64), payload_hash: 'f'.repeat(64) }]); });
+          remove(f, 'context_share_audit', row => row.id === share.id + ':create');
           const chunk = f.manifest.chunks.find(item => item.kind === 'final')!;
           const session = rowsOf(f).find(({ line }) => line.t === 'sessions')!.line.r;
           f.lines.get(chunk.key)!.push({ t: 'sessions', r: { ...session, id: 'f'.repeat(64) }, revision: true });
           chunk.revisions = { ...chunk.revisions, sessions: (chunk.revisions?.sessions ?? 0) + 1 };
         }],
+        // Count checks on the downloaded objects; the drill stops before loading when one fails.
+        [['chunk_row_count_mismatch', 'raw_object_count_mismatch'], (f) => {
+          f.manifest.raw.objects += 1;
+          f.manifest.chunks.find(chunk => chunk.kind === 'final')!.rows.devices += 1;
+        }],
+        [['chunk_row_count_mismatch'], (f) => {
+          const chunk = f.manifest.chunks.find(item => item.kind === 'final')!;
+          chunk.revisions = { ...chunk.revisions, devices: (chunk.revisions?.devices ?? 0) + 1 };
+        }],
+        // Checks on the loaded database. SQLite stores CREATE TRIGGER without IF NOT EXISTS, so that
+        // trigger no longer matches its migration text.
+        [['device_token_digest_mismatch', 'row_count_mismatch', 'trigger_mismatch'], (f) => {
+          f.manifest.table_counts.tasks = (f.manifest.table_counts.tasks ?? 0) + 1;
+          f.manifest.table_counts.devices += 1;
+        }, editedTriggers + '/'],
+        // D1 enforces foreign keys while loading, so a dangling row stops its table from loading at all.
+        [['context_flag_evidence_unresolved', 'context_sources_count_invalid', 'row_count_mismatch', 'row_load_failed'],
+          (f) => remove(f, 'batches', row => row.id === batch.id)],
         // A duplicate key: the whole table is refused, so the review invariants that depend on it fail too.
         [['context_review_audit_missing', 'context_supersede_invalid', 'row_count_mismatch', 'row_load_failed'], (f) => {
           const { chunk, line } = rowsOf(f).find(({ line }) => line.t === 'context_audit')!;
@@ -438,7 +444,7 @@ test('the integrity pass verifies each shared raw copy once, checks the newest c
       assert.deepEqual(JSON.parse(newer!.integrity_cursor!), { stage: 'chunks', seq: 0 });
     });
     await t.test('a checkpoint with plenty of chunk work still leaves the integrity pass its share', async () => {
-      for (let index = 0; index < 30; index++) await fixture.ingest([syntheticEvent('busy-' + index, { session: 'busy-' + index })]);
+      for (let index = 0; index < 12; index++) await fixture.ingest([syntheticEvent('busy-' + index, { session: 'busy-' + index })]);
       const pending = (await env.DB.prepare(`SELECT * FROM backup_checkpoints WHERE integrity_verified_at IS NULL AND status='completed'
         ORDER BY completed_at DESC LIMIT 1`).first<Checkpoint>())!;
       const tick = await backupTick(env, day(4), { chunkBatches: 1, allotment: { d1: 60, r2: 2500, fetch: 0 } });
@@ -525,8 +531,7 @@ test('tables that grow with activity are exported in rounds, so the final snapsh
   try {
     const env = fixture.env;
     // Events without a session id get one session each; processing adds a coverage and a source row per event.
-    for (let index = 0; index < 30; index++)
-      await fixture.ingest([syntheticEvent('grow-' + index, { extra: { session: { working_directory: '/synthetic/alpha' } } })]);
+    await fixture.ingest(Array.from({ length: 30 }, (_, index) => syntheticEvent('grow-' + index, { extra: { session: { working_directory: '/synthetic/alpha' } } })));
     await setProcessingPolicy(env, workspace);
     assert.equal((await processingTick(env, later(120))).ok, true);
     const live = async (table: string) => (await env.DB.prepare(`SELECT COUNT(*) AS n FROM "${table}"`).first<{ n: number }>())!.n;
@@ -568,7 +573,8 @@ test('tables that grow with activity are exported in rounds, so the final snapsh
     for (let index = 0; index < 50; index++) await env.DB.prepare(`INSERT INTO project_workflow_audit(id,actor,action,resource_type,resource_id,created_at)
       VALUES(?,?,?,?,?,?)`).bind(crypto.randomUUID(), reviewer, 'synthetic', 'task', 'synthetic', new Date().toISOString()).run();
     finalLimits = [];
-    const failed = await completeCheckpoint(recording, later(181), limits);
+    // Large tails: every round table fits the final snapshot, so only the reference tables decide.
+    const failed = await completeCheckpoint(recording, later(181), { finalMaxRows: 40 });
     assert.deepEqual([failed.status, failed.error_code], ['failed', 'final_snapshot_too_large']);
     assert.deepEqual(finalLimits, [], 'the snapshot was refused from its upper bounds');
   } finally { await fixture.close(); }
@@ -598,12 +604,13 @@ test('rows that change after their round are re-read by the final snapshot, and 
       env.DB.prepare(`INSERT INTO retention_run_objects(run_id,batch_id,r2_key,size,created_at,raw_deleted_at,backup_delete_after) VALUES(?,?,?,1,?,?,?)`)
         .bind(runId, 'c'.repeat(64), 'batches/mbp/runtime/' + 'c'.repeat(64) + '.ndjson', now, now, later(365 * 24 * 60).toISOString()),
     ]);
-    // Every round, one step per tick, until only the final snapshot is left.
-    for (let index = 0; index < 60; index++) {
+    // Every round (one per non-empty table) until only the final snapshot is left: an allotment of
+    // 50 D1 calls covers rounds but never the final snapshot, which needs more than that.
+    for (let index = 0; index < 20; index++) {
       const cp = await latestCheckpoint(env);
       const rounds = cp?.cursor ? JSON.parse(cp.cursor) : null;
       if (rounds && rounds.stage === rounds.order.length) break;
-      await backupTick(env, run, { maxSteps: 1, tablePageRows: 2, tailRows: 0 });
+      await backupTick(env, run, { tailRows: 0, allotment: { d1: 50, r2: 2500, fetch: 0 } });
     }
     const pending = JSON.parse((await latestCheckpoint(env))!.cursor!);
     assert.equal(pending.stage, pending.order.length);

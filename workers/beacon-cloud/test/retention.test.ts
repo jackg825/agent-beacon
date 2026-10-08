@@ -290,27 +290,49 @@ test('a replayed batch deleted again keeps its BACKUP copy until the later run\'
 });
 
 test('batches a note cites never freeze the plan at the old end; the scan pages past them and continues from a cursor', async () => {
-  const fixture = await createEnvFixture({ backup: true });
+  const fixture = await createEnvFixture();
   try {
-    const env = fixture.env, pinned = 501;
-    // More permanently blocked batches than one page assesses, all older than the deletable ones.
-    for (let start = 0; start < pinned; start += 25)
-      await Promise.all(Array.from({ length: Math.min(25, pinned - start) }, (_, offset) => fixture.ingest([syntheticEvent('pinned-' + (start + offset), { session: 'pinned' })])));
-    const events = (await env.DB.prepare("SELECT id,payload_hash,project_id FROM events WHERE event_id LIKE 'pinned-%'").all<any>()).results;
-    assert.equal(events.length, pinned);
+    const env = fixture.env, pinned = 501, now = new Date(), day = new Date(now.getTime() - 8 * DAY);
+    // Seeded in bulk SQL (no raw objects or real backup needed: this test is about the plan's scan),
+    // so hundreds of batches cost a handful of D1 calls. More permanently blocked batches than one
+    // page assesses, all older than the two deletable ones.
+    const id = (label: string) => sha(new TextEncoder().encode(label));
+    const project = id('pinned-project'), session = id('pinned-session');
+    const batches = Array.from({ length: pinned + 2 }, (_, index) => ({ id: id('batch-' + index), event: id('event-' + index),
+      payload: id('payload-' + index), received_at: new Date(day.getTime() + index * 1000).toISOString() }));
+    const rows = (list: unknown[]) => Array.from({ length: Math.ceil(list.length / 150) }, (_, index) => JSON.stringify(list.slice(index * 150, index * 150 + 150)));
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO projects(id,name,identity,identity_kind) VALUES(?,'pinned','synthetic:pinned','unknown')").bind(project),
+      env.DB.prepare("INSERT INTO sessions(id,device_id,source_session_id,project_id,harness,started_at,last_event_at) VALUES(?,'mbp','pinned',?,'codex_cli',?,?)")
+        .bind(session, project, day.toISOString(), day.toISOString()),
+      ...rows(batches).flatMap(chunk => [
+        env.DB.prepare(`INSERT INTO batches(id,device_id,stream,r2_key,received_at,event_count) SELECT json_extract(value,'$.id'),'mbp','runtime',
+          'batches/mbp/runtime/'||json_extract(value,'$.id')||'.ndjson',json_extract(value,'$.received_at'),1 FROM json_each(?)`).bind(chunk),
+        env.DB.prepare(`INSERT INTO events(id,device_id,stream,event_id,session_id,project_id,timestamp,action,harness,batch_id,line_number,payload_hash)
+          SELECT json_extract(value,'$.event'),'mbp','runtime',json_extract(value,'$.event'),?,?,json_extract(value,'$.received_at'),'command.executed',
+          'codex_cli',json_extract(value,'$.id'),0,json_extract(value,'$.payload') FROM json_each(?)`).bind(session, project, chunk),
+        env.DB.prepare(`INSERT INTO event_versions(event_id,payload_hash,batch_id,line_number) SELECT json_extract(value,'$.event'),json_extract(value,'$.payload'),
+          json_extract(value,'$.id'),0 FROM json_each(?)`).bind(chunk),
+      ]),
+    ]);
     // Pending notes count: context_sources rows never go, so these batches can never be deleted.
-    for (let start = 0; start < events.length; start += 20) await createContext(env, { kind: 'summary', project_id: events[0].project_id,
-      title: 'Synthetic pinned citation', content: 'Synthetic only.', sources: events.slice(start, start + 20).map((event: any) => ({ event_id: event.id, payload_hash: event.payload_hash })) });
-    await fixture.ingest([syntheticEvent('free-1', { session: 'free' })]);
-    await fixture.ingest([syntheticEvent('free-2', { session: 'free' })]);
-    const free = [(await batchOf(env, 'free-1')).id, (await batchOf(env, 'free-2')).id].sort();
-    const checkpoint = await completeCheckpoint(env, later(15));
-    assert.ok(checkpoint.integrity_verified_at);
-    // Attested directly: this test is about the plan's scan, not the drill.
-    await env.DB.prepare(`UPDATE backup_checkpoints SET status='verified',verified_at=?,verified_by=?,verification_result='passed' WHERE id=?`)
-      .bind(new Date().toISOString(), reviewer, checkpoint.id).run();
+    const notes = Array.from({ length: Math.ceil(pinned / 20) }, () => crypto.randomUUID());
+    await env.DB.batch(notes.flatMap((note, index) => [
+      env.DB.prepare(`INSERT INTO context_entries(id,kind,project_id,title,content,created_at) VALUES(?,'summary',?,'Synthetic pinned citation','Synthetic only.',?)`)
+        .bind(note, project, now.toISOString()),
+      env.DB.prepare(`INSERT INTO context_sources(context_id,event_id,payload_hash,ordinal) SELECT ?,json_extract(value,'$.event'),json_extract(value,'$.payload'),key
+        FROM json_each(?)`).bind(note, JSON.stringify(batches.slice(index * 20, Math.min(index * 20 + 20, pinned)))),
+      env.DB.prepare('UPDATE context_entries SET sealed=1 WHERE id=?').bind(note),
+    ]));
+    // A verified, integrity-checked checkpoint whose final snapshot came after every batch, holding the two deletable copies.
+    const free = batches.slice(pinned).map(batch => batch.id).sort(), checkpoint = crypto.randomUUID(), snapshot = new Date(now.getTime() - 3600_000).toISOString();
+    await env.DB.batch([
+      env.DB.prepare(`INSERT INTO backup_checkpoints(id,status,phase,started_at,started_by,final_snapshot_at,integrity_verified_at,verified_at,verified_by,
+        verification_result,updated_at) VALUES(?,'verified','done',?,?,?,?,?,?,'passed',?)`).bind(checkpoint, snapshot, reviewer, snapshot, snapshot, snapshot, reviewer, snapshot),
+      ...free.map(batch => env.DB.prepare(`INSERT INTO backup_raw_objects(batch_id,r2_key,batch_received_at,status,size,sha256,copied_at)
+        SELECT id,r2_key,received_at,'copied',1,?,? FROM batches WHERE id=?`).bind('e'.repeat(64), snapshot, batch)),
+    ]);
     await setPolicy(env, 'raw', 1);
-    const now = later(2 * 24 * 60);
     const plan = await retentionPlan(env, { now });
     const raw = plan.classes[0] as any;
     assert.deepEqual([...plan.plan!.batch_ids].sort(), free);
@@ -318,12 +340,12 @@ test('batches a note cites never freeze the plan at the old end; the scan pages 
     assert.equal(raw.blocked.find((item: any) => item.reason === 'referenced_by_context').count, pinned);
     assert.equal(raw.blocked_batches.length, 20);
     // A later request can start past what an earlier one walked.
-    const last = (await env.DB.prepare("SELECT b.received_at,b.id FROM batches b JOIN events e ON e.batch_id=b.id WHERE e.event_id LIKE 'pinned-%' ORDER BY b.received_at DESC,b.id DESC LIMIT 1").first<any>());
+    const last = batches[pinned - 1];
     const continued = await retentionPlan(env, { now, after: [last.received_at, last.id] });
     assert.deepEqual([(continued.classes[0] as any).scanned, [...continued.plan!.batch_ids].sort()], [2, free]);
     // The read route takes the same position as a previous plan's next_after.
-    const response = await retentionRead(get('/api/retention/plan?' + new URLSearchParams({ after: encodeCursor(last.received_at, last.id) })), env);
-    assert.equal(response!.status, 200);
+    const response = await body(await retentionRead(get('/api/retention/plan?' + new URLSearchParams({ after: encodeCursor(last.received_at, last.id) })), env));
+    assert.deepEqual([...response.plan.batch_ids].sort(), free);
     const beyond = await retentionPlan(env, { now, after: [now.toISOString(), 'f'.repeat(64)] });
     assert.deepEqual([(beyond.classes[0] as any).scanned, beyond.plan], [0, null]);
     for (const query of ['after=x', 'after=' + encodeCursor(last.received_at, 'not-a-batch'), `after=${encodeCursor(last.received_at, last.id)}&after=x`])
