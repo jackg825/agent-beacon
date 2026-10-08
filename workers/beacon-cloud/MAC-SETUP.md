@@ -116,3 +116,32 @@ checkpoint 或 outbox。
 目前須手動保持 forwarder 執行；尚未提供或驗證 launchd 安裝，不會自動改動兩台
 Mac 的服務或 collector 設定。正式或測試雲端驗證不代表兩台實際 collector 都已
 完成安裝驗收。
+
+## 可選：把已核准筆記同步到這台 Mac
+
+這一步與上傳無關，不做也不影響 forwarder。只有在審閱者已在 dashboard「Mac 同步」
+分頁替這台裝置新增某個專案的訂閱後才有內容可讀；裝置不能替自己訂閱。完整規則見
+[MAC-SYNC.md](MAC-SYNC.md)。這些是待操作步驟：目前只在本機以合成資料驗證，尚未在
+兩台真實 Mac 上試行。
+
+1. 在 **repo 外** 的私人目錄另寫一份同步設定（例如 `sync.json`），不要和 forwarder
+   的設定混用。`token_file` 沿用這台 Mac 的上傳金鑰檔（`0600`）；`state_dir` 用另一個
+   `0700` 的新目錄，不要放在 forwarder 的 `stateDir`、`sync_root`、iCloud／Dropbox 或
+   repo 裡；`sync_root` 是一個專用資料夾展開後的絕對路徑，例如
+   `/Users/YOUR_USER/BeaconNotes`；`targets[].destination` 是它底下以 `.beacon.md`
+   結尾的相對路徑，上層資料夾要先自己建立。
+2. 從 `workers/beacon-cloud/` 執行，先看狀態與 diff，確認後才套用：
+
+   ```sh
+   node forwarder/sync.mjs --config /ABSOLUTE/PRIVATE/PATH/sync.json status
+   node forwarder/sync.mjs --config /ABSOLUTE/PRIVATE/PATH/sync.json preview
+   node forwarder/sync.mjs --config /ABSOLUTE/PRIVATE/PATH/sync.json apply REPLACE_WITH_PLAN_ID
+   ```
+
+3. 需要回到前一版時執行 `rollback 0`（`0` 是 `targets` 的索引）；檔案已被人修改時會
+   拒絕。
+
+同步工具不會改 `AGENTS.md`、`CLAUDE.md`、skills、collector 或 forwarder 設定，也沒有
+常駐程式或排程，每次更新都要重新 `preview`／`apply`。要不要讓 agent 讀這份檔案，由
+你自己決定並手動連結；檔案內容是紀錄資料，不是指令或權限授與。審閱者撤銷訂閱後，
+這台 Mac 之後讀不到新內容，但已寫入的檔案不會自動刪除。
