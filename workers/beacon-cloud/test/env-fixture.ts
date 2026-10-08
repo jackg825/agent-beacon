@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { Miniflare, convertV4MiniflareOptions } from 'miniflare';
 import { ingest } from '../src/ingest';
 import { Device, Env } from '../src/types';
+import { migrationFiles } from '../scripts/migration-sql';
 import { applyMigrations } from './migrations';
 
 /** Synthetic device rows; their token digests never match a real credential. */
@@ -22,10 +23,19 @@ export function syntheticEvent(id: string, options: { session?: string; repo?: s
 }
 
 /**
- * Direct module tests: real workerd D1/R2 bindings with every committed migration
- * applied and two enrolled synthetic devices. No network, no installed Beacon data.
+ * An explicit older schema: every committed migration except those whose file name starts
+ * with one of `prefixes` (e.g. '0004' for a deployment that never applied Track P).
  */
-export async function createEnvFixture(options: { backup?: boolean; bindings?: Partial<Record<keyof Env, string>> } = {}) {
+export async function migrationsExcept(...prefixes: string[]) {
+  return (await migrationFiles()).filter(name => !prefixes.some(prefix => name.startsWith(prefix + '_')));
+}
+
+/**
+ * Direct module tests: real workerd D1/R2 bindings with every committed migration
+ * (or exactly `migrations`) applied and two enrolled synthetic devices. No network,
+ * no installed Beacon data.
+ */
+export async function createEnvFixture(options: { backup?: boolean; migrations?: string[]; bindings?: Partial<Record<keyof Env, string>> } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'beacon-env-'));
   const mf = new Miniflare(convertV4MiniflareOptions({ resourcePersistencePath: join(directory, 'storage'), workers: [{
     name: 'env-fixture', modules: true as const, script: 'export default {fetch(){return new Response("synthetic");}}',
@@ -34,7 +44,7 @@ export async function createEnvFixture(options: { backup?: boolean; bindings?: P
   }] }));
   const env = { DB: await mf.getD1Database('DB'), RAW: await mf.getR2Bucket('RAW'),
     ...(options.backup ? { BACKUP: await mf.getR2Bucket('BACKUP') } : {}), ...options.bindings } as unknown as Env;
-  await applyMigrations(env.DB);
+  await applyMigrations(env.DB, options.migrations);
   for (const device of Object.values(fixtureDevices)) {
     await env.DB.prepare('INSERT INTO devices(id,name,token_hash,created_at) VALUES(?,?,?,?)')
       .bind(device.id, device.name, device.token_hash, '2026-10-08T00:00:00Z').run();

@@ -7,11 +7,16 @@ import { Miniflare, convertV4MiniflareOptions } from 'miniflare';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import { HEALTH_ALLOTMENT, createHealthTask, dataHealth, healthRead, healthTask } from '../src/health';
 import { runMaintenance } from '../src/maintenance';
+import { MaintenanceError } from '../src/maintenance-error';
 import { handleMcp } from '../src/mcp';
+import { processingWrite } from '../src/processing';
+import { planRequest } from '../src/processing-planner';
+import { SelectionStage, ruleFilter } from '../src/processing-stage';
 import { Env, HttpError } from '../src/types';
-import { createEnvFixture, syntheticEvent } from './env-fixture';
+import { createEnvFixture, migrationsExcept, syntheticEvent } from './env-fixture';
 import { applyMigrations } from './migrations';
-import { createContext, get, later, verifiedCheckpoint } from './operations-fixture';
+import { createContext, createContextFlagsStandIn, get, later, post, reviewer, verifiedCheckpoint } from './operations-fixture';
+import { job, setPolicy as setProcessingPolicy, staged, workspace } from './processing-helpers';
 
 const HOUR = 3600_000, DAY = 24 * HOUR;
 const codes = (health: Awaited<ReturnType<typeof dataHealth>>) => health.findings.map(finding => finding.code);
@@ -110,7 +115,7 @@ test('overlapping health ticks never double count a page', async () => {
   } finally { await fixture.close(); }
 });
 
-test('findings cover devices, backlog, stale notes, processing, flags and backups without content', async (t) => {
+test('findings cover devices, backlog, stale notes, flags and backups without content', async (t) => {
   const fixture = await createEnvFixture({ backup: true });
   try {
     const env = fixture.env, now = new Date();
@@ -148,25 +153,16 @@ test('findings cover devices, backlog, stale notes, processing, flags and backup
       const text = JSON.stringify(month);
       for (const secret of ['synthetic-secret-marker', 'Synthetic stale', 'Synthetic aging', '/synthetic/']) assert.ok(!text.includes(secret), secret);
     });
-    await t.test('processing queue and open flags appear only when those tables exist', async () => {
+    await t.test("open flags appear only once Track R's table exists (a stand-in until its migration)", async () => {
       let health = await dataHealth(env, { now });
-      assert.deepEqual([health.processing, health.flags], [{ available: false }, { available: false }]);
-      await env.DB.prepare('CREATE TABLE processing_jobs(id TEXT PRIMARY KEY, status TEXT NOT NULL, created_at TEXT NOT NULL)').run();
-      await env.DB.prepare("INSERT INTO processing_jobs VALUES('q1','queued',?),('f1','failed',?),('s1','succeeded',?)")
-        .bind(new Date(now.getTime() - 7 * HOUR).toISOString(), recent, recent).run();
-      await env.DB.prepare('CREATE TABLE context_flags(id TEXT PRIMARY KEY, status TEXT NOT NULL, evidence TEXT NOT NULL, created_at TEXT NOT NULL)').run();
+      assert.deepEqual([health.schema.context_flags, health.flags], [false, { available: false }]);
+      await createContextFlagsStandIn(env);
       await env.DB.prepare("INSERT INTO context_flags VALUES('flag-1','open','[]',?),('flag-2','resolved','[]',?)").bind(recent, recent).run();
       health = await dataHealth(env, { now });
-      assert.deepEqual(health.processing, { available: true, queued: 1, running: 0, failed: 1, oldest_queued_at: new Date(now.getTime() - 7 * HOUR).toISOString() });
       assert.deepEqual(health.flags, { available: true, open: 1 });
-      assert.ok(['processing_failed', 'processing_queue_stale', 'open_flags'].every(code => codes(health).includes(code)));
       assert.deepEqual(finding(health, 'open_flags')!.sample_ids, ['flag-1']);
-      // A different column layout degrades to a code instead of breaking the report.
-      await env.DB.prepare('DROP TABLE processing_jobs').run();
-      await env.DB.prepare('CREATE TABLE processing_jobs(id TEXT PRIMARY KEY, state TEXT)').run();
-      assert.deepEqual((await dataHealth(env, { now })).processing, { available: true, error: 'query_failed' });
-      // These stand-ins have no committed migration, so a restore drill would rightly refuse them.
-      await env.DB.batch([env.DB.prepare('DROP TABLE processing_jobs'), env.DB.prepare('DROP TABLE context_flags')]);
+      // The stand-in has no committed migration, so a restore drill would rightly refuse it.
+      await env.DB.prepare('DROP TABLE context_flags').run();
     });
     await t.test('backup configuration, freshness, verification and raw copy lag', async () => {
       const unbound = await dataHealth({ ...env, BACKUP: undefined } as Env, { now });
@@ -213,6 +209,66 @@ test('findings cover devices, backlog, stale notes, processing, flags and backup
         assert.ok(!JSON.stringify(result).includes('synthetic-secret-marker'));
       } finally { await client.close(); }
     });
+  } finally { await fixture.close(); }
+});
+
+test('without migration 0004 the processing queue is unavailable, and a foreign table layout degrades to a code', async () => {
+  // Explicitly the schema of a deployment that applied Track D but never Track P.
+  const fixture = await createEnvFixture({ migrations: await migrationsExcept('0004') });
+  try {
+    const env = fixture.env;
+    let health = await dataHealth(env);
+    assert.deepEqual(health.schema, { data_operations: true, processing_jobs: false, context_flags: false });
+    assert.deepEqual(health.processing, { available: false });
+    assert.ok(!codes(health).some(code => code.startsWith('processing_')));
+    assert.equal((await healthTick(env, new Date())).ok, true);
+    // A table of that name with another layout is reported as a code; the rest of the report stands.
+    await env.DB.prepare('CREATE TABLE processing_jobs(id TEXT PRIMARY KEY, state TEXT)').run();
+    health = await dataHealth(env);
+    assert.deepEqual(health.processing, { available: true, error: 'query_failed' });
+    assert.equal(health.devices.length, 2);
+  } finally { await fixture.close(); }
+});
+
+test('health counts the real processing queue: planned, leased, failed, retried and dismissed jobs', async () => {
+  const fixture = await createEnvFixture();
+  try {
+    const env = fixture.env, now = new Date(), before = (hours: number) => new Date(now.getTime() - hours * HOUR);
+    const empty = await dataHealth(env, { now });
+    assert.equal(empty.schema.processing_jobs, true);
+    assert.deepEqual(empty.processing, { available: true, queued: 0, running: 0, failed: 0, oldest_queued_at: null, oldest_due_at: null });
+    await setProcessingPolicy(env, workspace);
+    const projects: Record<string, string> = {};
+    for (const name of ['failing', 'leased', 'waiting']) {
+      await fixture.ingest([syntheticEvent('queue-' + name, { repo: 'queue-' + name, session: 'queue-' + name })]);
+      projects[name] = (await fixture.event('queue-' + name))!.project_id;
+    }
+    // Planned by Track P's own planner at fixed past times, as the scheduler would have.
+    const plan = async (name: string, at: Date) => (await planRequest(env, { project_id: projects[name] }, reviewer, at)).scopes[0].job_id!;
+    const failing = await plan('failing', before(9)), leased = await plan('leased', before(8)), waiting = await plan('waiting', before(7));
+    // Track P's runner: every attempt at the failing job errors until backoff ends in failed, and
+    // the invocation that claims the leased job runs out of allotment mid-job, leaving its lease.
+    const stage: SelectionStage = async (input) => {
+      if (input.scope.project_id === projects.leased) throw new MaintenanceError('budget_exhausted:d1');
+      if (input.scope.project_id === projects.failing) throw new Error('synthetic stage failure');
+      return ruleFilter(input);
+    };
+    const tick = (at: Date) => runMaintenance({ ...env, MAINTENANCE_TASKS: 'processing' } as Env, { now: at, schedule: 'frequent', tasks: staged(stage) });
+    for (const minutes of [0, 1, 6, 36]) await tick(new Date(before(9).getTime() + minutes * 60_000));
+    assert.equal((await tick(before(8))).processing.error, 'budget_exhausted:d1');
+    assert.deepEqual([(await job(env, failing)).status, (await job(env, leased)).status, (await job(env, waiting)).status], ['failed', 'running', 'queued']);
+    const health = await dataHealth(env, { now });
+    assert.deepEqual(health.processing, { available: true, queued: 1, running: 1, failed: 1, oldest_queued_at: before(7).toISOString(),
+      oldest_due_at: before(7).toISOString() });
+    assert.deepEqual([finding(health, 'processing_failed')!.count, finding(health, 'processing_queue_stale')!.count], [1, 1]);
+    // A reviewer retries the failed job and dismisses the waiting one through Track P's routes.
+    for (const [id, action] of [[failing, 'retry'], [waiting, 'dismiss']])
+      assert.equal((await processingWrite(post(`/api/processing/jobs/${id}/${action}`, {}), env, reviewer))!.status, 200);
+    const after = await dataHealth(env, { now });
+    const { oldest_due_at: due, ...queue } = after.processing as Record<string, unknown>;
+    assert.deepEqual(queue, { available: true, queued: 1, running: 1, failed: 0, oldest_queued_at: before(9).toISOString() });
+    assert.ok(Date.parse(due as string) >= now.getTime(), 'a retried job is due from the retry, not from its plan time');
+    for (const code of ['processing_failed', 'processing_queue_stale']) assert.equal(finding(after, code), undefined, code);
   } finally { await fixture.close(); }
 });
 

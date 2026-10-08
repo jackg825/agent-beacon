@@ -5,11 +5,17 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ApplyInput, applyRetention, blockedWithin, parseApply, planHash, retentionPlan, retentionRead, retentionWrite } from '../src/retention';
 import { dataHealth } from '../src/health';
+import { runMaintenance } from '../src/maintenance';
+import { MaintenanceError } from '../src/maintenance-error';
+import { processingWrite } from '../src/processing';
+import { planRequest } from '../src/processing-planner';
+import { SelectionStage, ruleFilter } from '../src/processing-stage';
 import { Env, HttpError } from '../src/types';
 import { httpSource, restoreCheck, verifyRequest } from '../scripts/restore-check';
-import { createEnvFixture, syntheticEvent } from './env-fixture';
-import { backupTick, completeCheckpoint, createContext, drill, get, later, latestCheckpoint, operationsTokens, operationsWorker, post, reviewer,
-  verifiedCheckpoint } from './operations-fixture';
+import { createEnvFixture, migrationsExcept, syntheticEvent } from './env-fixture';
+import { backupTick, completeCheckpoint, createContext, createContextFlagsStandIn, drill, get, later, latestCheckpoint, operationsTokens,
+  operationsWorker, post, reviewer, verifiedCheckpoint } from './operations-fixture';
+import { job, setPolicy as setProcessingPolicy, staged, workspace } from './processing-helpers';
 
 const DAY = 86400_000;
 const status = (code: number) => (error: unknown) => error instanceof HttpError && error.status === code;
@@ -221,41 +227,102 @@ test('failed RAW deletes are retried, BACKUP copies leave after grace and resurr
   } finally { await fixture.close(); }
 });
 
-test('references from other tracks block deletion when their tables exist and fail closed when unreadable', async () => {
+test('live processing jobs and open flags block the batches they cite; finished jobs release them; unreadable references fail closed', async () => {
   const fixture = await createEnvFixture({ backup: true });
   try {
     const env = fixture.env;
-    await fixture.ingest([syntheticEvent('ref-1')]);
-    await fixture.ingest([syntheticEvent('ref-2', { session: 'ref-other' })]);
+    const names = ['dismissed', 'flagged', 'summarized'];
+    for (const name of names) await fixture.ingest([syntheticEvent('ref-' + name, { repo: 'ref-' + name, session: 'ref-' + name })]);
     await verifiedCheckpoint(env, later(15));
     await setPolicy(env, 'raw', 1);
     const now = later(2 * 24 * 60);
-    assert.deepEqual((await retentionPlan(env, { now })).reference_checks, []);
-    const [one, two] = [(await fixture.event('ref-1'))!, (await fixture.event('ref-2'))!];
-    // Shapes taken from the Track P and Track R designs; created here only for the test.
-    await env.DB.prepare('CREATE TABLE processing_jobs(id TEXT PRIMARY KEY, status TEXT NOT NULL, created_at TEXT NOT NULL)').run();
-    await env.DB.prepare('CREATE TABLE processing_job_sources(job_id TEXT NOT NULL, event_id TEXT NOT NULL, payload_hash TEXT NOT NULL, ordinal INTEGER NOT NULL)').run();
-    await env.DB.prepare("INSERT INTO processing_jobs VALUES('job-live','queued',?),('job-done','succeeded',?)").bind(now.toISOString(), now.toISOString()).run();
-    await env.DB.prepare("INSERT INTO processing_job_sources VALUES('job-live',?,?,0),('job-done',?,?,0)").bind(one.id, one.payload_hash, two.id, two.payload_hash).run();
-    await env.DB.prepare('CREATE TABLE context_flags(id TEXT PRIMARY KEY, status TEXT NOT NULL, evidence TEXT NOT NULL, created_at TEXT NOT NULL)').run();
+    const [dismissed, flagged, summarized] = await Promise.all(names.map(async name => (await fixture.event('ref-' + name))!));
+    const blockedBy = async () => Object.fromEntries(((await retentionPlan(env, { now })).classes[0] as any).blocked_batches
+      .map((item: any) => [item.batch_id, item.reasons]));
+    // Migration 0004 is applied, so the processing check always runs; with no jobs it holds nothing.
+    const idle = await retentionPlan(env, { now });
+    assert.deepEqual(idle.reference_checks, ['referenced_by_processing']);
+    assert.equal(idle.plan!.batch_ids.length, 3);
+    // Real jobs from Track P's planner. The flagged project opts out, so only the flag cites its batch.
+    await setProcessingPolicy(env, workspace);
+    await setProcessingPolicy(env, { scope_type: 'project', scope_id: flagged.project_id }, { enabled: false });
+    const plan = async (project: string) => {
+      const [scope] = (await planRequest(env, { project_id: project }, reviewer, new Date())).scopes;
+      assert.equal(scope.status, 'planned');
+      return scope;
+    };
+    const first = (await plan(dismissed.project_id)).job_id!, second = (await plan(summarized.project_id)).job_id!;
+    await createContextFlagsStandIn(env);
     await env.DB.prepare("INSERT INTO context_flags VALUES('flag-open','open',?,?),('flag-done','resolved',?,?)")
-      .bind(JSON.stringify([{ event_id: two.id, payload_hash: two.payload_hash }]), now.toISOString(), JSON.stringify([{ event_id: one.id, payload_hash: one.payload_hash }]), now.toISOString()).run();
-    const plan = await retentionPlan(env, { now });
-    assert.deepEqual(plan.reference_checks, ['referenced_by_flag', 'referenced_by_processing']);
-    assert.equal(plan.plan, null);
-    assert.deepEqual(Object.fromEntries((plan.classes[0] as any).blocked_batches.map((item: any) => [item.batch_id, item.reasons])),
-      { [one.batch_id]: ['referenced_by_processing'], [two.batch_id]: ['referenced_by_flag'] });
-    await env.DB.prepare("UPDATE processing_jobs SET status='succeeded'").run();
-    await env.DB.prepare("UPDATE context_flags SET status='dismissed'").run();
+      .bind(JSON.stringify([{ event_id: flagged.id, payload_hash: flagged.payload_hash }]), now.toISOString(),
+        JSON.stringify([{ event_id: dismissed.id, payload_hash: dismissed.payload_hash }]), now.toISOString()).run();
+    const held = await retentionPlan(env, { now });
+    assert.deepEqual(held.reference_checks, ['referenced_by_flag', 'referenced_by_processing']);
+    assert.equal(held.plan, null);
+    assert.deepEqual(await blockedBy(), { [dismissed.batch_id]: ['referenced_by_processing'], [flagged.batch_id]: ['referenced_by_flag'],
+      [summarized.batch_id]: ['referenced_by_processing'] });
+    // Track P's runner: the first job is leased by an invocation that runs out of allotment, then fails
+    // every later attempt until it is failed; the second runs to a pending candidate.
+    const stage: SelectionStage = async (input) => {
+      if (input.scope.project_id !== dismissed.project_id) return ruleFilter(input);
+      if (input.attempt === 1) throw new MaintenanceError('budget_exhausted:d1');
+      throw new Error('synthetic stage failure');
+    };
+    const start = later(60), tick = (minutes: number) => runMaintenance({ ...env, MAINTENANCE_TASKS: 'processing' } as Env,
+      { now: new Date(start.getTime() + minutes * 60_000), schedule: 'frequent', tasks: staged(stage) });
+    const states = async () => [(await job(env, first)).status, (await job(env, second)).status];
+    assert.equal((await tick(0)).processing.error, 'budget_exhausted:d1');
+    assert.deepEqual(await states(), ['running', 'queued']);
+    assert.deepEqual((await blockedBy())[dismissed.batch_id], ['referenced_by_processing']);
+    // After the lease expires: the second job succeeds and the first fails its second attempt.
+    await tick(11);
+    assert.deepEqual(await states(), ['queued', 'succeeded']);
+    // A succeeded job releases its hold; the generated candidate's own citation now protects the batch.
+    assert.deepEqual(await blockedBy(), { [dismissed.batch_id]: ['referenced_by_processing'], [flagged.batch_id]: ['referenced_by_flag'],
+      [summarized.batch_id]: ['referenced_by_context'] });
+    for (const minutes of [16, 46]) await tick(minutes);
+    assert.deepEqual(await states(), ['failed', 'succeeded']);
+    assert.deepEqual((await blockedBy())[dismissed.batch_id], ['referenced_by_processing'], 'a failed job still holds its sources');
+    // A reviewer dismisses the failed job through Track P's route and resolves the flag.
+    assert.equal((await processingWrite(post(`/api/processing/jobs/${first}/dismiss`, { reason: 'Synthetic dismissal' }), env, reviewer))!.status, 200);
+    await env.DB.prepare("UPDATE context_flags SET status='resolved' WHERE id='flag-open'").run();
     const open = (await retentionPlan(env, { now })).plan!;
-    assert.equal(open.batch_ids.length, 2);
-    // A reference that becomes live after planning blocks apply.
-    await env.DB.prepare("UPDATE processing_jobs SET status='running' WHERE id='job-live'").run();
+    assert.deepEqual(new Set(open.batch_ids), new Set([dismissed.batch_id, flagged.batch_id]));
+    assert.deepEqual(await blockedBy(), { [summarized.batch_id]: ['referenced_by_context'] });
+    // New evidence after planning plans a new job that still cites the dismissed job's event: apply refuses.
+    await fixture.ingest([syntheticEvent('ref-dismissed-2', { repo: 'ref-dismissed', session: 'ref-dismissed' })]);
+    assert.equal((await plan(dismissed.project_id)).source_count, 2);
     const refused = await applyRetention(env, applyBody(open), reviewer, now);
     assert.equal(refused.status, 409);
+    assert.deepEqual((await refused.json() as any).blocked, [{ batch_id: dismissed.batch_id, reasons: ['referenced_by_processing'] }]);
+    // An unreadable reference must never read as "no references".
     await env.DB.prepare("INSERT INTO context_flags VALUES('flag-bad','open','not json',?)").bind(now.toISOString()).run();
     await assert.rejects(retentionPlan(env, { now }), status(503));
-    assert.equal(await count(env, 'SELECT COUNT(*) AS n FROM batches'), 2);
+    assert.equal(await count(env, 'SELECT COUNT(*) AS n FROM batches'), 4);
+  } finally { await fixture.close(); }
+});
+
+test('without migration 0004 retention plans and applies with no processing check, and a foreign layout fails closed', async () => {
+  // Explicitly the schema of a deployment that applied Track D but never Track P.
+  const fixture = await createEnvFixture({ backup: true, migrations: await migrationsExcept('0004') });
+  try {
+    const env = fixture.env;
+    await fixture.ingest([syntheticEvent('legacy-1')]);
+    await verifiedCheckpoint(env, later(15));
+    await setPolicy(env, 'raw', 1);
+    const now = later(2 * 24 * 60);
+    const planned = await retentionPlan(env, { now });
+    assert.deepEqual(planned.reference_checks, []);
+    assert.equal(planned.plan!.batch_ids.length, 1);
+    // Tables of those names with another layout fail closed instead of reading as "no references".
+    await env.DB.batch([env.DB.prepare('CREATE TABLE processing_jobs(id TEXT PRIMARY KEY, state TEXT)'),
+      env.DB.prepare('CREATE TABLE processing_job_sources(job_id TEXT, event_id TEXT)')]);
+    await assert.rejects(retentionPlan(env, { now }), status(503));
+    await assert.rejects(applyRetention(env, applyBody(planned.plan), reviewer, now), status(503));
+    await env.DB.batch([env.DB.prepare('DROP TABLE processing_job_sources'), env.DB.prepare('DROP TABLE processing_jobs')]);
+    const applied = await applyRetention(env, applyBody(planned.plan), reviewer, now);
+    assert.equal(applied.status, 201, await applied.clone().text());
+    assert.equal(await count(env, 'SELECT COUNT(*) AS n FROM batches'), 0);
   } finally { await fixture.close(); }
 });
 

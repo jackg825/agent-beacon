@@ -86,6 +86,16 @@ export async function addTrackMigration(env: Env) {
   return directory + '/';
 }
 
+/**
+ * STAND-IN for Track R's `context_flags`: its migration (0007) is not written yet, so this
+ * holds only the columns health and retention read. It has no committed migration, so drop
+ * it before a restore drill (which rightly refuses unknown tables). Replace it with the real
+ * migration when Track R lands.
+ */
+export async function createContextFlagsStandIn(env: Env) {
+  await env.DB.prepare('CREATE TABLE context_flags(id TEXT PRIMARY KEY, status TEXT NOT NULL, evidence TEXT NOT NULL, created_at TEXT NOT NULL)').run();
+}
+
 export const operationsTokens = { read: 'synthetic-operations-read-key-0000000000', review: 'synthetic-operations-review-key-000000000',
   mcp: 'synthetic-operations-mcp-key-00000000000', mbp: 'synthetic-operations-mbp-key-00000000000' };
 const sha = (value: string) => createHash('sha256').update(value).digest('hex');
