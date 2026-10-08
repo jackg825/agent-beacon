@@ -26,9 +26,15 @@ const labelled: RegExp[] = [
   /sk-(?:ant-|proj-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}/g,
 ];
 const assignedPattern = new RegExp(keys + String.raw`["']?\s*[:=]\s*["'\x60]?([^"'\x60,\s]+)`, 'gi');
+// Secrets spanning several tokens are removed before any label rule: a label takes only
+// the first token after it (`private_key":"-----BEGIN`), which would also remove the
+// anchor this pattern needs and leave the key body behind. A block cut short (no END
+// line) runs to the end of the string; `[\s\S]` also covers JSON-escaped `\n`.
+const blocks: RegExp[] = [
+  /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/g,
+];
 // Credential shapes common in agent telemetry, including this Worker's own device keys.
 const shaped: RegExp[] = [
-  /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/g,
   /bcn_cf_[A-Za-z0-9_-]{20,}/g,
   /bcn_device_[A-Za-z0-9_-]{8,}/g,
   /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g,
@@ -59,10 +65,15 @@ export function workerSecrets(env: Partial<Env>): string[] {
     .filter((value): value is string => typeof value === 'string' && value.length >= 8);
 }
 
+function removeBlocks(value: string): string {
+  for (const pattern of blocks) value = value.replace(pattern, MARK);
+  return value;
+}
+
 /** Values assigned to secret-like keys (≥ 8 characters), so bare copies can be removed too. */
 export function assignedValues(value: string): string[] {
   const found: string[] = [];
-  for (const match of value.slice(0, MAX_SCAN_CHARS).matchAll(assignedPattern)) {
+  for (const match of removeBlocks(value.slice(0, MAX_SCAN_CHARS)).matchAll(assignedPattern)) {
     if (match[1] && match[1].length >= 8 && match[1] !== MARK) found.push(match[1]);
   }
   return found;
@@ -73,6 +84,7 @@ export function assignedValues(value: string): string[] {
  * complete string; callers truncate afterwards and redact again after any cut.
  */
 export function redact(value: string, options: RedactOptions = {}): string {
+  value = removeBlocks(value);
   const assigned = new Set([...assignedValues(value), ...(options.assigned ?? [])]);
   for (const pattern of labelled) {
     value = value.replace(pattern, (match) => {
