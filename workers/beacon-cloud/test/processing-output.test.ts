@@ -7,7 +7,7 @@ import { PROCESSING_ALLOTMENT, processingMaintenance, processingRead, processing
 import { getEventVersion } from '../src/queries';
 import { Env } from '../src/types';
 import { createEnvFixture, syntheticEvent } from './env-fixture';
-import { at, command, count, jobs, later, newTask, post, rejects, review, reviewer, run, setPolicy, tick, workspace } from './processing-helpers';
+import { at, command, count, jobs, later, newTask, post, rejects, review, reviewer, run, setBudget, setPolicy, tick, workspace } from './processing-helpers';
 
 test('extractive citations resolve to persisted exact versions; non-matching captures are excluded and counted', async () => {
   const f = await createEnvFixture();
@@ -218,17 +218,19 @@ test('job reads list identifiers, codes and counts only, with filters and keyset
     // A task without linked sessions has no scope to plan.
     assert.deepEqual(await run(f.env, { task_id: await newTask(f.env, 'Synthetic empty task') }), { scopes: [] });
     await rejects(processingWrite(post('/api/processing/run', { project_id: 'e'.repeat(64) }), f.env, reviewer), 404);
-    // Budget and usage routes belong to part B; until then they are not served.
-    assert.equal(await processingWrite(post('/api/processing/budget', {}), f.env, reviewer), null);
-    assert.equal(await processingRead(new Request('http://localhost/api/processing/usage'), f.env), null);
+    // Unknown processing paths are left to the router's 404.
+    assert.equal(await processingWrite(post('/api/processing/unknown', {}), f.env, reviewer), null);
+    assert.equal(await processingRead(new Request('http://localhost/api/processing/unknown'), f.env), null);
     assert.equal(await processingWrite(post('/api/context', {}), f.env, reviewer), null);
   } finally { await f.close(); }
 });
 
-test('acceptance: a labelled two-Mac task cites every failure, fix, verification, decision and open risk', async () => {
-  const f = await createEnvFixture();
+test('acceptance: a labelled two-Mac task cites every failure, fix, verification, decision and open risk; Jev flags the right note', async () => {
+  const f = await createEnvFixture({ bindings: { EXTERNAL_PROCESSING_PROJECTS: '*', JEV_API_KEY: 'synthetic-acceptance-jev-key-000000' } });
   try {
-    await setPolicy(f.env, workspace, { summary_fields: ['command_text', 'file_path', 'tool_name', 'titles'] });
+    await setPolicy(f.env, workspace, { summary_fields: ['command_text', 'file_path', 'tool_name', 'titles', 'approved_note_text'],
+      external_allowed: true, jev_enabled: true, external_fields: ['command_text', 'titles', 'approved_note_text'] });
+    await setBudget(f.env, { daily_call_limit: 2 });
     const labelled = {
       failure: command('acc-mbp-fail', 'npm test -- login', 1, { session: 'mbp-login', timestamp: at(10) }),
       fix: syntheticEvent('acc-mbp-fix', { action: 'file.modified', session: 'mbp-login', timestamp: at(20),
@@ -245,9 +247,35 @@ test('acceptance: a labelled two-Mac task cites every failure, fix, verification
     await f.ingest([labelled.verification, labelled.risk], 'mini');
     const sessions = [(await f.event('acc-mbp-fail'))!.session_id, (await f.event('acc-mini-verify'))!.session_id];
     const taskId = await newTask(f.env, '合成：修復登入並跨機驗證', sessions);
+    // Two approved notes the new activity is checked against: the task's note claims the
+    // callback needs no change (the fix contradicts it); the project's lint rule does not conflict.
+    const note = async (eventId: string, title: string, content: string, task?: string) => {
+      const event = (await f.event(eventId))!;
+      const id = await insertCandidate(f.env, { kind: 'memory', project_id: event.project_id, ...(task ? { task_id: task } : {}), title, content,
+        sources: [{ event_id: event.id, payload_hash: event.payload_hash }] }, reviewer);
+      await review(f.env, id, 'approve');
+      return id;
+    };
+    const stale = await note('acc-mbp-fail', '登入失敗原因', '登入失敗與 callback 無關，不需要修改 src/auth/callback.ts。', taskId);
+    const lint = await note('acc-mini-lint', 'Lint 規則', '合併前必須執行 npm run lint。');
+    // A synthetic evaluator: each contradiction question names one note id; it answers from that
+    // note's content in state and the activity, so the answer is only right if ids map to entries.
+    const asked: string[][] = [];
+    const fetcher = (async (_input: RequestInfo | URL, init: RequestInit = {}) => {
+      const body = JSON.parse(String(init.body));
+      asked.push(Object.keys(body.questions));
+      const commands = body.state.events.map((event: any) => event.command_text ?? '').join('\n');
+      const answers = Object.fromEntries(Object.keys(body.questions).map((id) => {
+        if (!id.startsWith('contradiction:')) return [id, { noul: id === 'new_information' ? 0.8 : 0.9, confidence: 0.7 }];
+        const target = body.state.approved_notes.find((entry: any) => entry.id === id.slice('contradiction:'.length));
+        const contradicted = /callback 無關/.test(target.content) && /npm test -- login/.test(commands);
+        return [id, { noul: contradicted ? 0.92 : 0.05, confidence: 0.6 }];
+      }));
+      return Response.json({ answers, usage: { input_tokens: 1500, output_tokens: 20 } });
+    }) as typeof fetch;
     const planned = await run(f.env, { task_id: taskId });
     assert.deepEqual(planned.scopes.map((scope: any) => scope.status), ['planned']);
-    await tick(f.env);
+    await tick(f.env, later(), { fetcher });
     const [done] = await jobs(f.env);
     assert.equal(done.status, 'succeeded'); assert.equal(done.task_id, taskId);
     const context: any = (await getContext(f.env, done.result_context_id)).context;
@@ -275,10 +303,23 @@ test('acceptance: a labelled two-Mac task cites every failure, fix, verification
     assert.match(section('## 待辦與風險'), /「npm run lint」失敗（結束碼 2）/);
     assert.match(section('## 待辦與風險'), /任務仍為進行中/);
     assert.equal(validateGenerated({ title: context.title, content: context.content, sources: context.sources }), null);
+    // The contradiction answer lands on the task note it was about, and on no other entry.
+    assert.deepEqual(asked, [['new_information', 'task_related', `contradiction:${lint}`, `contradiction:${stale}`]]);
+    const detail = (await (await processingRead(new Request('http://localhost/api/processing/jobs/' + done.id), f.env))!.json() as any).job;
+    const signal = (id: string) => detail.signals.find((row: any) => row.question_id === 'contradiction:' + id);
+    assert.deepEqual([signal(stale).probability, signal(stale).context_id, signal(stale).label], [0.92, stale, 'uncalibrated']);
+    assert.deepEqual([signal(lint).probability, signal(lint).context_id], [0.05, lint]);
+    assert.equal(detail.note, null);
+    assert.deepEqual(detail.calls.map((call: any) => [call.provider, call.status]), [['jev', 'succeeded']]);
+    // Advisory only: both notes stay approved and the candidate still waits for review.
+    for (const id of [stale, lint]) assert.equal((await getContext(f.env, id)).context.status, 'approved');
+    assert.equal(context.status, 'pending');
     // Counts recorded for VALIDATION.md.
     const cited = new Set([...context.content.matchAll(/\[(\d+)\]/g)].map((match) => match[1]));
     console.log(JSON.stringify({ acceptance: { events: done.event_count, sources: context.source_count, cited: cited.size,
-      labelled: Object.keys(labelled).length, labelled_cited: Object.keys(found).length, content_chars: context.content.length } }));
+      labelled: Object.keys(labelled).length, labelled_cited: Object.keys(found).length, content_chars: context.content.length,
+      jev_questions: asked[0].length, jev_signals: detail.signals.length, contradiction_flagged: detail.signals
+        .filter((row: any) => row.question_id.startsWith('contradiction:') && row.probability >= 0.5).map((row: any) => row.context_id === stale ? 'task_note' : 'other') } }));
     assert.equal(Object.keys(found).length, 5);
   } finally { await f.close(); }
 });

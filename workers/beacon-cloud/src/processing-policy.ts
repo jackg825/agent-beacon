@@ -1,4 +1,5 @@
 import { digest } from './auth';
+import { externalEndpoint } from './external-fetch';
 import { stableJSON } from './identity';
 import { FIELD_CLASSES, FieldClass } from './privacy';
 import { Env, HttpError, json } from './types';
@@ -86,17 +87,29 @@ export async function effectivePolicy(env: Env, projectId: string): Promise<Effe
   return resolvePolicy(rows.workspace, rows.project);
 }
 
+export const DEFAULT_JEV_ENDPOINT = 'https://api.typesafe.ai/v1/systemone';
+export const DEFAULT_JEV_MODEL = 'jev-latest';
+const modelPattern = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
+/** Operator configuration for the evaluator; an invalid endpoint or model disables it. */
+export function jevConfig(env: Env): { endpoint: string | null; model: string | null } {
+  const model = (env.JEV_MODEL ?? '').trim() || DEFAULT_JEV_MODEL;
+  return { endpoint: externalEndpoint(env.JEV_ENDPOINT, DEFAULT_JEV_ENDPOINT, env.PUBLIC_URL), model: modelPattern.test(model) ? model : null };
+}
+
 /**
  * Deploy-time gate for outbound evaluator calls. The operator var must list the
- * project (or `*`), the effective policy must allow external use and Jev, and the key
- * must exist. A budget reservation (part B) is still required before every call.
+ * project (or `*`), the effective policy must allow external use and Jev, the key
+ * must exist and the configured endpoint/model must be valid. A budget reservation
+ * is still required before every call.
  */
 export function externalGate(env: Env, projectId: string, policy: PolicyValues) {
   const listed = (env.EXTERNAL_PROCESSING_PROJECTS || '').split(',').map((item) => item.trim()).filter(Boolean);
   const deploy_allowed = listed.includes('*') || listed.includes(projectId);
   const key_configured = !!env.JEV_API_KEY;
+  const config = jevConfig(env), endpoint_valid = !!config.endpoint && !!config.model;
   const policy_allowed = policy.enabled && policy.external_allowed && policy.jev_enabled;
-  return { deploy_allowed, key_configured, policy_allowed, eligible: deploy_allowed && key_configured && policy_allowed };
+  return { deploy_allowed, key_configured, endpoint_valid, policy_allowed,
+    eligible: deploy_allowed && key_configured && endpoint_valid && policy_allowed };
 }
 
 const policyKeys = ['scope_type','scope_id','enabled','external_allowed','jev_enabled','summary_fields','external_fields',

@@ -26,8 +26,8 @@ test('processing is inert by default: open tasks with linked sessions plan nothi
       assert.equal(report.ok, true);
       assert.equal(report.result!.workspace_enabled, false);
       assert.equal(report.result!.planned, 0);
-      // Lease sweep, workspace policy lookup and one claim attempt; no scope or raw reads.
-      assert.deepEqual(report.usage, { d1: 3, r2: 0, fetch: 0 });
+      // Lease and stale-reservation sweeps, workspace policy lookup and one claim attempt; no scope or raw reads.
+      assert.deepEqual(report.usage, { d1: 4, r2: 0, fetch: 0 });
     }
     // A project row cannot enable anything without the workspace ceiling.
     await setPolicy(f.env, { scope_type: 'project', scope_id: project });

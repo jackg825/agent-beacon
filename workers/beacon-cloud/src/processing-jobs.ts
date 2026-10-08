@@ -68,8 +68,10 @@ export async function getJob(env: Env, id: string) {
   if (!job.results.length) throw new HttpError(404, 'Processing job not found');
   return { job: { ...job.results[0] as Record<string, unknown>,
     sources: (sources.results as { covered: number }[]).map((row) => ({ ...row, covered: !!row.covered })),
-    // Evaluator probabilities are uncalibrated scores, never accuracy claims.
-    signals: (signals.results as { calibrated: number }[]).map((row) => ({ ...row, calibrated: !!row.calibrated, label: 'uncalibrated' })),
+    // Evaluator probabilities are uncalibrated scores, never accuracy claims. A
+    // contradiction signal names the one approved note it was asked about.
+    signals: (signals.results as { question_id: string; calibrated: number }[]).map((row) => ({ ...row, calibrated: !!row.calibrated,
+      label: 'uncalibrated', context_id: row.question_id.startsWith('contradiction:') ? row.question_id.slice(14) : null })),
     calls: calls.results, audit: audit.results } };
 }
 

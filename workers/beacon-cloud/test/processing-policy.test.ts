@@ -59,12 +59,19 @@ test('the workspace row is a ceiling: AND for flags, intersection for fields, mi
   assert.match(effective.policy_hash, /^[a-f0-9]{64}$/);
 });
 
-test('the deploy-time gate needs the operator var, the effective policy and the key; budget comes later', () => {
+test('the deploy-time gate needs the operator var, the effective policy, the key and a valid endpoint; budget comes later', () => {
   const project = 'a'.repeat(64), allowed = values({ enabled: true, external_allowed: true, jev_enabled: true });
   assert.equal(externalGate({} as Env, project, allowed).eligible, false);
   assert.equal(externalGate({ EXTERNAL_PROCESSING_PROJECTS: '*' } as Env, project, allowed).eligible, false);
   assert.deepEqual(externalGate({ EXTERNAL_PROCESSING_PROJECTS: ` ${'b'.repeat(64)}, ${project} `, JEV_API_KEY: 'synthetic-key-0000' } as Env, project, allowed),
-    { deploy_allowed: true, key_configured: true, policy_allowed: true, eligible: true });
+    { deploy_allowed: true, key_configured: true, endpoint_valid: true, policy_allowed: true, eligible: true });
+  // An endpoint or model the operator mistyped disables the evaluator instead of guessing.
+  const configured = { EXTERNAL_PROCESSING_PROJECTS: '*', JEV_API_KEY: 'k'.repeat(16), PUBLIC_URL: 'https://beacon.example.invalid' };
+  for (const bad of [{ JEV_ENDPOINT: 'http://jev.example.invalid/v1' }, { JEV_ENDPOINT: 'https://beacon.example.invalid/v1/systemone' },
+    { JEV_MODEL: 'jev latest' }, { JEV_ENDPOINT: 'https://user:pass@jev.example.invalid/' }])
+    assert.equal(externalGate({ ...configured, ...bad } as Env, project, allowed).endpoint_valid, false, JSON.stringify(bad));
+  assert.equal(externalGate({ ...configured, JEV_ENDPOINT: 'https://jev.example.invalid/v1/systemone', JEV_MODEL: 'jev-2026.10' } as Env,
+    project, allowed).eligible, true);
   assert.equal(externalGate({ EXTERNAL_PROCESSING_PROJECTS: 'b'.repeat(64), JEV_API_KEY: 'k'.repeat(16) } as Env, project, allowed).eligible, false);
   for (const flag of ['enabled', 'external_allowed', 'jev_enabled'] as const)
     assert.equal(externalGate({ EXTERNAL_PROCESSING_PROJECTS: '*', JEV_API_KEY: 'k'.repeat(16) } as Env, project, { ...allowed, [flag]: false }).eligible, false);

@@ -21,6 +21,13 @@ export async function setPolicy(env: Env, scope: { scope_type: 'workspace' | 'pr
   return response!.json() as Promise<any>;
 }
 export const workspace = { scope_type: 'workspace' as const, scope_id: '*' };
+export const budget = { daily_call_limit: 5, daily_token_limit: 100_000, daily_usd_ceiling: null as number | null, max_input_chars: 20_000,
+  max_output_tokens: 256, timeout_ms: 5000 };
+export async function setBudget(env: Env, overrides: Partial<typeof budget> = {}) {
+  const response = await processingWrite(post('/api/processing/budget', { ...budget, ...overrides }), env, reviewer);
+  assert.equal(response!.status, 200);
+  return response!.json() as Promise<any>;
+}
 /** Far enough after any real ingest time that quiet_minutes and the settle lag have passed. */
 export const later = (minutes = 120) => new Date(Date.now() + minutes * 60_000);
 
