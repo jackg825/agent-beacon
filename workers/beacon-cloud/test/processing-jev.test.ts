@@ -8,9 +8,9 @@ import { runMaintenance } from '../src/maintenance';
 import { processingMaintenance, processingRead, processingTick } from '../src/processing';
 import { effectivePolicy, EffectivePolicy } from '../src/processing-policy';
 import { makeScope } from '../src/processing-planner';
-import type { StageResult } from '../src/processing-stage';
+import type { SelectionStage, StageResult } from '../src/processing-stage';
 import { projectEvents } from '../src/privacy';
-import { jevStage } from '../src/jev';
+import { defaultStage, jevStage } from '../src/jev';
 import { Env } from '../src/types';
 import { createEnvFixture, syntheticEvent } from './env-fixture';
 import { command, count, job, jobs, newTask, review, reviewer, run, setBudget, setPolicy, tick, workspace } from './processing-helpers';
@@ -316,6 +316,53 @@ test('a Jev skip needs the policy threshold and is overridden by failures or a c
     const again = (await run(f.env, { project_id: quiet.project_id })).scopes[0];
     await tick(gated(f.env), new Date(start.getTime() + 120_000), { fetcher: jev.fetcher });
     assert.deepEqual([(await job(f.env, again.job_id)).status, (await job(f.env, again.job_id)).note], ['succeeded', null]);
+  } finally { await f.close(); }
+});
+
+test('a retry after a successful call decides from the stored answers: a skip stays a skip, an override stays an override', async () => {
+  const f = await createEnvFixture();
+  try {
+    const fields = ['command_text', 'approved_note_text'];
+    await setPolicy(f.env, workspace, { ...external, summary_fields: fields, external_fields: fields, jev_skip_threshold: 0.3 });
+    await setBudget(f.env, { daily_call_limit: 10 });
+    // Both answer new_information below the threshold; only 'contra' contradicts its note.
+    const jev = fakeJev((body) => {
+      const contradicted = body.state.events.some((event: any) => event.command_text === 'echo contra');
+      return Response.json({ answers: Object.fromEntries(Object.keys(body.questions).map((id) =>
+        [id, { noul: id.startsWith('contradiction:') && contradicted ? 0.9 : 0.1 }])) });
+    });
+    const planned: Record<string, string> = {};
+    for (const name of ['quiet', 'contra']) {
+      await f.ingest(command(`${name}-1`, 'echo ' + name, 0, { repo: name, session: `${name}-s` }));
+      await approvedNote(f, `${name}-1`, `${name} note`, `Synthetic note for ${name}.`);
+      planned[name] = (await run(f.env, { project_id: (await f.event(`${name}-1`))!.project_id })).scopes[0].job_id;
+    }
+    // Each job's attempt fails once after its Jev call committed: 'quiet' just after the
+    // stage decided to skip, 'contra' in the generator.
+    let skipFailures = 0, generated = 0;
+    const stage: SelectionStage = async (input) => {
+      const decision = await defaultStage(input);
+      if (decision.decision === 'skip' && skipFailures++ === 0) throw new Error('synthetic failure after the Jev call');
+      return decision;
+    };
+    const generator: Generator = { ...extractiveGenerator, async generate(input) {
+      if (generated++ === 0) throw new Error('synthetic generator failure');
+      return extractiveGenerator.generate(input);
+    } };
+    const tasks = [{ ...processingMaintenance[0], run: (env: Env, ctx: any) => processingTick(env, ctx, { stage, generator }) }];
+    const start = noon();
+    const first = await runMaintenance({ ...gated(f.env), MAINTENANCE_TASKS: 'processing' } as Env, { now: start, tasks, fetcher: jev.fetcher });
+    assert.deepEqual(first.processing.result!.run_outcomes, { retry: 2 });
+    assert.equal(jev.calls.length, 2);
+    // One minute later each retry reads its stored answers instead of asking again.
+    const retried = await runMaintenance({ ...gated(f.env), MAINTENANCE_TASKS: 'processing' } as Env,
+      { now: new Date(start.getTime() + 60_000), tasks, fetcher: jev.fetcher });
+    assert.deepEqual(retried.processing.result!.run_outcomes, { skipped: 1, succeeded: 1 });
+    assert.deepEqual([jev.calls.length, retried.processing.usage.fetch], [2, 0]);
+    const quiet = await job(f.env, planned.quiet), contra = await job(f.env, planned.contra);
+    assert.deepEqual([quiet.status, quiet.attempts, quiet.skip_reason, quiet.result_context_id], ['skipped', 2, 'jev_no_new_information', null]);
+    assert.deepEqual([contra.status, contra.attempts, contra.note], ['succeeded', 2, 'jev_skip_overridden']);
+    for (const id of [quiet.id, contra.id]) assert.equal(await count(f.env, 'processing_calls WHERE job_id=?', id), 1);
   } finally { await f.close(); }
 });
 
