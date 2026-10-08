@@ -28,6 +28,9 @@ const cases: { name: string; input: string; secret: string; expected?: string }[
   { name: 'PEM private key block', input: '-----BEGIN RSA PRIVATE KEY-----\nMIISYNTHETIC\nLINE2\n-----END RSA PRIVATE KEY-----\nafter',
     secret: 'MIISYNTHETIC', expected: '[REDACTED]\nafter' },
   { name: 'unterminated PEM block', input: 'key:\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAA', secret: 'b3BlbnNzaC1rZXktdjEAAAA' },
+  { name: 'PGP private key block', input: '-----BEGIN PGP PRIVATE KEY BLOCK-----\n\nlQOYBSYNTHETICPGPBODY\n=ab12\n-----END PGP PRIVATE KEY BLOCK-----\nafter',
+    secret: 'lQOYBSYNTHETICPGPBODY', expected: '[REDACTED]\nafter' },
+  { name: 'unterminated PGP block', input: '-----BEGIN PGP PRIVATE KEY BLOCK-----\nlQOYBSYNTHETICPGPTAIL', secret: 'lQOYBSYNTHETICPGPTAIL' },
   { name: 'JWT', input: 'jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzeW50aCJ9.c2lnbmF0dXJlLXN5bnRo', secret: 'eyJzdWIiOiJzeW50aCJ9' },
   { name: 'Google API key', input: `AIza${'S'.repeat(35)}`, secret: 'S'.repeat(35) },
   { name: 'URL userinfo', input: 'psql postgres://synthuser:synthpass@db.internal/app', secret: 'synthpass', expected: 'psql postgres://[REDACTED]@db.internal/app' },
@@ -112,6 +115,17 @@ test('repeated bare copies are removed in one string and across a projection', (
   ], ['command_text', 'command_output']);
   assert.ok(!JSON.stringify(projection).includes('crossEvent98765'));
   assert.equal(projection.events[1].command_output, 'value is [REDACTED]');
+});
+
+test('an assigned value ends at CJK or full-width punctuation, so its bare copies are still removed', () => {
+  assert.equal(redact('api_key=cjkSecret12345；之後再用 cjkSecret12345。'), 'api_key=[REDACTED]；之後再用 [REDACTED]。');
+  assert.equal(redact('password=fullwidth9876，然後 fullwidth9876'), 'password=[REDACTED]，然後 [REDACTED]');
+  assert.deepEqual(assignedValues('token=ideographic5555、說明'), ['ideographic5555']);
+  const projection = projectEvents([
+    { payload: { event: { action: 'command.executed' }, command: { command: 'export API_KEY=crossCjk24680（測試）' } } },
+    { payload: { event: { action: 'command.executed' }, command: { command: 'echo done', output: '值是 crossCjk24680' } } },
+  ], ['command_text', 'command_output']);
+  assert.ok(!JSON.stringify(projection).includes('crossCjk24680'));
 });
 
 test('the Worker own secrets are removed by exact value when at least 8 characters', () => {

@@ -93,7 +93,7 @@
 每個放進投影或摘要的字串都經過遮蔽：
 
 - 移植上游 `pkg/asymptoteobserve/privacy.go` 的規則（指定值、`Authorization: Bearer`、bearer、`sk-`），並擴充 key 名稱（`passwd`、`pwd`、`credential(s)`、`private_key`、`access_key`、`secret_access_key`、`AWS_SECRET_ACCESS_KEY`、`client_secret`、`cookie`、`session`）與 JSON 寫法（`"api_key": "…"`）。
-- 另外移除：本服務的裝置金鑰 `bcn_cf_…`、`bcn_device_…`、`sk-ant-`／`sk-proj-`／`sk-svcacct-`／`sk-admin-`、AWS `AKIA`／`ASIA`、GitHub `gh[pousr]_`／`github_pat_`、Slack `xox[abprs]-`、PEM private key 區塊（包含被截斷的；前面有 `private_key=`、`"private_key": "…"` 等標籤時也整塊移除，標籤規則之前就先處理）、JWT、Google `AIza…`、網址中的帳密，以及本 Worker 自己的 `READ_TOKEN`、`MCP_TOKEN`、`REVIEW_TOKEN`、`JEV_API_KEY`（8 字元以上）。
+- 另外移除：本服務的裝置金鑰 `bcn_cf_…`、`bcn_device_…`、`sk-ant-`／`sk-proj-`／`sk-svcacct-`／`sk-admin-`、AWS `AKIA`／`ASIA`、GitHub `gh[pousr]_`／`github_pat_`、Slack `xox[abprs]-`、PEM 與 PGP private key 區塊（包含被截斷的；前面有 `private_key=`、`"private_key": "…"` 等標籤時也整塊移除，標籤規則之前就先處理）、JWT、Google `AIza…`、網址中的帳密，以及本 Worker 自己的 `READ_TOKEN`、`MCP_TOKEN`、`REVIEW_TOKEN`、`JEV_API_KEY`（8 字元以上）。指定給機密 key 的值在引號、逗號、空白或中日韓／全形標點處結束，所以 `api_key=X；說明` 只把 X 當成機密，其他地方出現的 X 也會一起移除。
 - 先遮蔽整個字串再截斷（每個字串最多 1,200 字元），截斷後再遮蔽一次，不會留下金鑰前綴。
 - 在整份投影中收集「被指定給機密 key 的值」，之後在任何事件、任何欄位裸露出現時也一併移除。
 - `/Users/<名稱>/`、`/home/<名稱>/`、`C:\Users\<名稱>\` 換成 `~/`（JSON 文字中加倍的反斜線也一樣）；位在 session 工作目錄下的檔案路徑改成相對路徑。

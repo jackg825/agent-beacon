@@ -18,20 +18,23 @@ const MARK = '[REDACTED]';
 
 // Ported from pkg/asymptoteobserve/privacy.go RedactString, with the key vocabulary
 // widened, an optional closing quote for JSON keys, and the sk- prefix variants.
+// A value ends at a quote, comma, whitespace or CJK/full-width punctuation, so text such as
+// `api_key=X；後續說明` captures only X and bare copies of X are still found elsewhere.
+const valueChars = String.raw`[^"'\x60,\s\u3000-\u303f\uff00-\uffef]`;
 const keys = String.raw`(?:aws_secret_access_key|secret[_-]?access[_-]?key|access[_-]?key(?:[_-]?id)?|client[_-]?secret|private[_-]?key|api[_-]?key|auth[_-]?token|token|secret|passwd|password|pwd|credentials?|authorization|cookie|session)`;
 const labelled: RegExp[] = [
-  /authorization\s*[:=]\s*bearer\s+[^"',\s]+/gi,
-  new RegExp(keys + String.raw`["']?\s*[:=]\s*["'\x60]?[^"'\x60,\s]+`, 'gi'),
+  new RegExp(String.raw`authorization\s*[:=]\s*bearer\s+` + valueChars + '+', 'gi'),
+  new RegExp(keys + String.raw`["']?\s*[:=]\s*["'\x60]?` + valueChars + '+', 'gi'),
   /bearer\s+[a-z0-9._~+/=-]+/gi,
   /sk-(?:ant-|proj-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}/g,
 ];
-const assignedPattern = new RegExp(keys + String.raw`["']?\s*[:=]\s*["'\x60]?([^"'\x60,\s]+)`, 'gi');
+const assignedPattern = new RegExp(keys + String.raw`["']?\s*[:=]\s*["'\x60]?(` + valueChars + '+)', 'gi');
 // Secrets spanning several tokens are removed before any label rule: a label takes only
 // the first token after it (`private_key":"-----BEGIN`), which would also remove the
 // anchor this pattern needs and leave the key body behind. A block cut short (no END
 // line) runs to the end of the string; `[\s\S]` also covers JSON-escaped `\n`.
 const blocks: RegExp[] = [
-  /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/g,
+  /-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----|$)/g,
 ];
 // Credential shapes common in agent telemetry, including this Worker's own device keys.
 const shaped: RegExp[] = [
