@@ -55,7 +55,8 @@ test('bundled Worker: Jev runs only through workerd fetch with redirects refused
     await post('/api/processing/budget', { daily_call_limit: 5, daily_token_limit: 50_000, daily_usd_ceiling: 1, max_input_chars: 8000,
       max_output_tokens: 128, timeout_ms: 1000 });
     const worker = await mf.getWorker();
-    const at = new Date(Date.now() + 3 * 3_600_000);
+    // A fixed future UTC noon: the three calls (at, +1 and +2 minutes) always share one ledger day.
+    const at = new Date(Math.ceil((Date.now() + 3 * 3_600_000) / 86_400_000) * 86_400_000 + 12 * 3_600_000);
     const day = at.toISOString().slice(0, 10);
     const runOnce = async (minutes: number) => {
       const planned = (await post('/api/processing/run', { task_id: taskId })).scopes[0];

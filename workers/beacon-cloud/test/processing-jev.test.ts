@@ -20,7 +20,7 @@ const reviewToken = 'synthetic-review-token-value-00000000';
 const external = { external_allowed: true, jev_enabled: true, summary_fields: ['command_text', 'titles'], external_fields: ['titles'],
   min_new_events: 1000 };
 const gated = (env: Env, extra: Partial<Env> = {}) => ({ ...env, EXTERNAL_PROCESSING_PROJECTS: '*', JEV_API_KEY: key, ...extra }) as Env;
-/** A fixed future UTC noon, so every reservation in one test lands on the same ledger day. */
+/** A fixed future UTC noon, so every reservation in one test lands on the same ledger day; read it once per test. */
 const noon = () => new Date(Math.ceil((Date.now() + 3 * 3_600_000) / 86_400_000) * 86_400_000 + 12 * 3_600_000);
 const sha = (text: string) => createHash('sha256').update(text).digest('hex');
 type Fixture = Awaited<ReturnType<typeof createEnvFixture>>;
@@ -295,8 +295,9 @@ test('a Jev skip needs the policy threshold and is overridden by failures or a c
       await approvedNote(f, `${name}-1`, `${name} note`, `Synthetic note for ${name}.`);
       planned[name] = (await run(f.env, { project_id: (await f.event(`${name}-1`))!.project_id })).scopes[0].job_id;
     }
-    const report = await tick(gated(f.env), noon(), { fetcher: jev.fetcher });
-    await tick(gated(f.env), new Date(noon().getTime() + 60_000), { fetcher: jev.fetcher });
+    const start = noon();
+    const report = await tick(gated(f.env), start, { fetcher: jev.fetcher });
+    await tick(gated(f.env), new Date(start.getTime() + 60_000), { fetcher: jev.fetcher });
     assert.equal(report.ok, true);
     assert.equal(jev.calls.length, 3);
     const quiet = await job(f.env, planned.quiet);
@@ -313,7 +314,7 @@ test('a Jev skip needs the policy threshold and is overridden by failures or a c
       external_fields: ['command_text', 'approved_note_text'], jev_skip_threshold: null });
     await f.ingest(command('quiet-3', 'echo quiet', 0, { repo: 'quiet', session: 'quiet-s' }));
     const again = (await run(f.env, { project_id: quiet.project_id })).scopes[0];
-    await tick(gated(f.env), new Date(noon().getTime() + 120_000), { fetcher: jev.fetcher });
+    await tick(gated(f.env), new Date(start.getTime() + 120_000), { fetcher: jev.fetcher });
     assert.deepEqual([(await job(f.env, again.job_id)).status, (await job(f.env, again.job_id)).note], ['succeeded', null]);
   } finally { await f.close(); }
 });
