@@ -237,6 +237,53 @@ test('failed RAW deletes are retried, BACKUP copies leave after grace and resurr
   } finally { await fixture.close(); }
 });
 
+test('apply re-checks eligibility inside its deleting transaction when a change lands after its earlier checks', async () => {
+  const fixture = await createEnvFixture({ backup: true });
+  try {
+    const env = fixture.env;
+    await fixture.ingest([syntheticEvent('race-1', { repo: 'race', session: 'race' })]);
+    const event = (await fixture.event('race-1'))!, batch = await batchOf(env, 'race-1');
+    const { checkpoint } = await verifiedCheckpoint(env, later(15));
+    await setPolicy(env, 'raw', 1);
+    await setProcessingPolicy(env, workspace);
+    const now = later(2 * 24 * 60);
+    let job = '';
+    // Each change lands after assess() and the BACKUP checks passed, just before the deleting batch.
+    const races: [string, () => Promise<unknown>, () => Promise<unknown>][] = [
+      ['a backup checkpoint starts', () => env.DB.prepare(`INSERT INTO backup_checkpoints(id,status,phase,started_at,started_by,updated_at)
+        VALUES(?,'running','chunks',?,?,?)`).bind(crypto.randomUUID(), now.toISOString(), reviewer, now.toISOString()).run(),
+      () => env.DB.prepare("UPDATE backup_checkpoints SET status='failed' WHERE status='running'").run()],
+      ['the gate checkpoint loses raw coverage', () => env.DB.prepare('UPDATE backup_checkpoints SET raw_pruned_at=? WHERE id=?').bind(now.toISOString(), checkpoint.id).run(),
+        () => env.DB.prepare('UPDATE backup_checkpoints SET raw_pruned_at=NULL WHERE id=?').bind(checkpoint.id).run()],
+      ['a processing job is planned that cites the batch', async () => {
+        const [scope] = (await planRequest(env, { project_id: event.project_id }, reviewer, new Date())).scopes;
+        assert.equal(scope.status, 'planned');
+        job = scope.job_id!;
+      }, async () => assert.equal((await processingWrite(post(`/api/processing/jobs/${job}/dismiss`, {}), env, reviewer))!.status, 200)],
+      ['a note cites the batch', () => createContext(env, { kind: 'summary', project_id: event.project_id, title: 'Synthetic race citation',
+        content: 'Synthetic only.', sources: [{ event_id: event.id, payload_hash: event.payload_hash }] }), async () => {}],
+    ];
+    for (const [label, race, undo] of races) {
+      const plan = (await retentionPlan(env, { now })).plan!;
+      assert.deepEqual(plan.batch_ids, [batch.id], label);
+      let raced = false;
+      const racing = { ...env, BACKUP: new Proxy(env.BACKUP!, { get(target, property) {
+        const value = Reflect.get(target, property, target);
+        if (property !== 'head') return typeof value === 'function' ? value.bind(target) : value;
+        return async (...args: unknown[]) => { if (!raced) { raced = true; await race(); } return (value as (...values: unknown[]) => unknown).apply(target, args); };
+      } }) } as Env;
+      await assert.rejects(applyRetention(racing, applyBody(plan), reviewer, now),
+        (error: unknown) => error instanceof HttpError && error.status === 409 && /conflicts with current data/.test(error.message), label);
+      assert.ok(raced, label);
+      assert.equal(await count(env, 'SELECT COUNT(*) AS n FROM batches WHERE id=?', batch.id), 1, label);
+      assert.equal(await count(env, 'SELECT COUNT(*) AS n FROM event_versions WHERE batch_id=?', batch.id), 1, label);
+      assert.equal(await count(env, 'SELECT COUNT(*) AS n FROM retention_runs'), 0, label);
+      assert.ok(await env.RAW.head(batch.r2_key), label);
+      await undo();
+    }
+  } finally { await fixture.close(); }
+});
+
 test('live processing jobs and open flags block the batches they cite; finished jobs and closed flags release them; unreadable references fail closed', async () => {
   const fixture = await createEnvFixture({ backup: true });
   try {
