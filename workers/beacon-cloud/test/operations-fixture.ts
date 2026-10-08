@@ -9,6 +9,7 @@ import { contextWrite } from '../src/context';
 import { runMaintenance } from '../src/maintenance';
 import { Env } from '../src/types';
 import { restoreCheck, bucketSource, verifyRequest, RestoreReport } from '../scripts/restore-check';
+import { disposeOnFailure } from './env-fixture';
 import { applyMigrations } from './migrations';
 import { migrationFiles, migrationsDirectory, splitMigration } from '../scripts/migration-sql';
 
@@ -107,11 +108,14 @@ export async function operationsWorker(bindings: Record<string, string> = {}) {
     name: 'beacon-operations', modules: true as const, scriptPath: resolve('dist/worker.mjs'), compatibilityDate: '2026-10-01',
     d1Databases: { DB: 'operations-index' }, r2Buckets: { RAW: 'operations-raw', BACKUP: 'operations-backup' },
     bindings: { READ_TOKEN: operationsTokens.read, REVIEW_TOKEN: operationsTokens.review, MCP_TOKEN: operationsTokens.mcp, ...bindings } }] }));
-  const db = await mf.getD1Database('DB');
-  await applyMigrations(db);
-  await db.prepare('INSERT INTO devices(id,name,token_hash,created_at) VALUES(?,?,?,?)').bind('mbp', 'Synthetic MBP', sha(operationsTokens.mbp), '2026-10-08T00:00:00Z').run();
+  const close = async () => { await mf.dispose(); await rm(directory, { recursive: true, force: true }); };
+  const env = await disposeOnFailure(close, async () => {
+    const db = await mf.getD1Database('DB');
+    await applyMigrations(db);
+    await db.prepare('INSERT INTO devices(id,name,token_hash,created_at) VALUES(?,?,?,?)').bind('mbp', 'Synthetic MBP', sha(operationsTokens.mbp), '2026-10-08T00:00:00Z').run();
+    return { DB: db, RAW: await mf.getR2Bucket('RAW'), BACKUP: await mf.getR2Bucket('BACKUP') } as unknown as Env;
+  });
   const request = (path: string, init: Parameters<typeof mf.dispatchFetch>[1] = {}) => mf.dispatchFetch('http://localhost' + path, init);
-  const env = { DB: db, RAW: await mf.getR2Bucket('RAW'), BACKUP: await mf.getR2Bucket('BACKUP') } as unknown as Env;
   return {
     mf, env, request,
     bearer: (path: string, token: string) => request(path, { headers: { Authorization: 'Bearer ' + token } }),
@@ -119,6 +123,6 @@ export async function operationsWorker(bindings: Record<string, string> = {}) {
       headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
     upload: (records: unknown[]) => request('/v1/ingest/runtime', { method: 'POST', headers: { Authorization: 'Bearer ' + operationsTokens.mbp,
       'Content-Type': 'application/x-ndjson' }, body: records.map(record => JSON.stringify(record)).join('\n') + '\n' }),
-    async close() { await mf.dispose(); await rm(directory, { recursive: true, force: true }); },
+    close,
   };
 }

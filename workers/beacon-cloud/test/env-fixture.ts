@@ -23,6 +23,16 @@ export function syntheticEvent(id: string, options: { session?: string; repo?: s
 }
 
 /**
+ * Run a fixture's setup after its Miniflare exists, and dispose it if setup throws. A leaked
+ * instance keeps workerd and the loopback server alive, so the test file's process never
+ * exits and `node --test` waits on it indefinitely instead of reporting the failure.
+ */
+export async function disposeOnFailure<T>(close: () => Promise<void>, setup: () => Promise<T>): Promise<T> {
+  try { return await setup(); }
+  catch (error) { await close().catch(() => {}); throw error; }
+}
+
+/**
  * An explicit older schema: every committed migration except those whose file name starts
  * with one of `prefixes` (e.g. '0004' for a deployment that never applied Track P).
  */
@@ -42,13 +52,15 @@ export async function createEnvFixture(options: { backup?: boolean; migrations?:
     compatibilityDate: '2026-10-01', d1Databases: { DB: 'fixture-index' },
     r2Buckets: options.backup ? { RAW: 'fixture-raw', BACKUP: 'fixture-backup' } : { RAW: 'fixture-raw' },
   }] }));
-  const env = { DB: await mf.getD1Database('DB'), RAW: await mf.getR2Bucket('RAW'),
-    ...(options.backup ? { BACKUP: await mf.getR2Bucket('BACKUP') } : {}), ...options.bindings } as unknown as Env;
-  await applyMigrations(env.DB, options.migrations);
-  for (const device of Object.values(fixtureDevices)) {
-    await env.DB.prepare('INSERT INTO devices(id,name,token_hash,created_at) VALUES(?,?,?,?)')
-      .bind(device.id, device.name, device.token_hash, '2026-10-08T00:00:00Z').run();
-  }
+  const close = async () => { await mf.dispose(); await rm(directory, { recursive: true, force: true }); };
+  const env = await disposeOnFailure(close, async () => {
+    const env = { DB: await mf.getD1Database('DB'), RAW: await mf.getR2Bucket('RAW'),
+      ...(options.backup ? { BACKUP: await mf.getR2Bucket('BACKUP') } : {}), ...options.bindings } as unknown as Env;
+    await applyMigrations(env.DB, options.migrations);
+    await env.DB.batch(Object.values(fixtureDevices).map(device => env.DB.prepare('INSERT INTO devices(id,name,token_hash,created_at) VALUES(?,?,?,?)')
+      .bind(device.id, device.name, device.token_hash, '2026-10-08T00:00:00Z')));
+    return env;
+  });
   return {
     env, mf, directory,
     /** Ingest records exactly like the HTTP route would, returning its acknowledgement. */
@@ -62,6 +74,6 @@ export async function createEnvFixture(options: { backup?: boolean; migrations?:
     event(eventId: string) {
       return env.DB.prepare('SELECT * FROM events WHERE event_id=?').bind(eventId).first<Record<string, any>>();
     },
-    async close() { await mf.dispose(); await rm(directory, { recursive: true, force: true }); },
+    close,
   };
 }
