@@ -70,3 +70,61 @@ test('every registered panel renders a tab, a hidden tabpanel and a loader', asy
     assert.match(script, new RegExp(`panelLoaders(?:\\.${panel.tab}|\\[['"]${panel.tab}['"]\\])\\s*=`));
   }
 });
+
+test('the Mac sync preview asks for exactly what the device receives, shared memories included, and the card and form show the grant', async () => {
+  const script = await dashboardScriptResponse().text();
+  const extract = (name: string) => {
+    const start = script.search(new RegExp(`\\n  (?:async )?function ${name}\\(`)) + 1;
+    return script.slice(start, script.indexOf('\n  }\n', start) + 4).trim();
+  };
+  type Node = { tag: string; text: string; children: Node[]; append(...items: Node[]): void; replaceChildren(...items: Node[]): void; textContent?: string };
+  const node = (tag = 'div', text = ''): Node => ({ tag, text, children: [], append(...items) { this.children.push(...items); },
+    replaceChildren(...items) { this.children = items; } });
+  const all = (root: Node): string[] => [root.text, root.textContent ?? '', ...root.children.flatMap(all)].filter(Boolean);
+  const elements: Record<string, any> = { 'sync-preview': node(), 'sync-preview-heading': node(), 'sync-list': node(), 'sync-count': node(),
+    'more-sync': { hidden: false }, 'sync-device': { value: 'mbp' }, 'sync-project': { value: 'b'.repeat(64) },
+    'sync-kind-memory': { checked: true }, 'sync-kind-summary': { checked: false }, 'sync-include-shared': { checked: true } };
+  const requests: string[] = [];
+  const snapshot = { kinds: ['memory'], entry_count: 2, snapshot_sha256: 'f'.repeat(64), entries: [
+    { id: 'own', kind: 'memory', title: 'Synthetic own', content: 'own', content_sha256: '1'.repeat(64), reviewed_at: '2026-10-09T00:00:00.000Z' },
+    { id: 'shared', kind: 'memory', title: 'Synthetic shared', content: 'shared', content_sha256: '2'.repeat(64), reviewed_at: '2026-10-09T00:00:01.000Z',
+      shared_from_project_id: 'a'.repeat(64), share_id: 'share-1' }] };
+  const context: Record<string, unknown> = {
+    URLSearchParams, byId: (id: string) => elements[id], text: (tag: string, value: string) => node(tag, value), button: (value: string) => node('button', value),
+    date: (value: string) => 'DATE(' + value + ')', document: { createElement: (tag: string) => node(tag) },
+    api: async (path: string) => { requests.push(path); return { snapshot }; },
+    syncState: { items: [], cursor: null, previewVersion: 0, projectNames: { ['a'.repeat(64)]: 'synthetic/alpha' } },
+    syncKindLabels: { memory: '長期記憶', summary: '交接摘要' }, syncKindText: (kinds: string[]) => kinds.join('、'), syncSharedText: '含其他專案共享的長期記憶',
+  };
+  const load = (name: string) => new Script(`(${extract(name).replace(new RegExp(`^(async )?function ${name}`), '$1function')})`).runInNewContext(context);
+  if (script.includes('function syncPreviewQuery(')) context.syncPreviewQuery = load('syncPreviewQuery');
+  context.previewSyncSubscription = load('previewSyncSubscription');
+  const item = { id: 's', project_id: 'b'.repeat(64), project_name: 'synthetic/beta', device_id: 'mbp', kinds: ['memory'], status: 'active',
+    include_shared: true, created_at: '2026-10-09T00:00:00.000Z' };
+  await (context.previewSyncSubscription as (value: unknown) => Promise<void>)(item);
+  assert.deepEqual(requests, ['/api/context/snapshot?project_id=' + 'b'.repeat(64) + '&kind=memory&include_shared=1']);
+  const preview = all(elements['sync-preview']).join('\n'), heading = elements['sync-preview-heading'].textContent;
+  assert.match(heading, /含其他專案共享的長期記憶/);
+  assert.match(heading, /其中 1 份來自其他專案/);
+  assert.match(preview, /共享自 synthetic\/alpha/);
+  assert.match(preview, /共享 share-1/);
+  // A plain grant previews without shared entries, exactly as its device reads.
+  requests.length = 0;
+  await (context.previewSyncSubscription as (value: unknown) => Promise<void>)({ ...item, include_shared: false, kinds: ['memory', 'summary'] });
+  assert.deepEqual(requests, ['/api/context/snapshot?project_id=' + 'b'.repeat(64) + '&include_shared=0']);
+  // The card names the setting, so grants that carry other projects' memories stand out.
+  context.renderSyncSubscriptions = load('renderSyncSubscriptions');
+  (context.syncState as any).items = [item, { ...item, id: 't', include_shared: false }];
+  (context.renderSyncSubscriptions as () => void)();
+  const cards = elements['sync-list'].children.map((card: Node) => all(card).join(' '));
+  assert.match(cards[0], /memory · 含其他專案共享的長期記憶/);
+  assert.doesNotMatch(cards[1], /共享/);
+  // The create form can grant it, and only together with long-term memories.
+  const created = load('syncCreateBody') as () => Record<string, unknown>, body = () => JSON.parse(JSON.stringify(created()));
+  assert.deepEqual(body(), { device_id: 'mbp', project_id: 'b'.repeat(64), kinds: ['memory'], include_shared: true });
+  elements['sync-kind-memory'].checked = false; elements['sync-kind-summary'].checked = true;
+  assert.throws(() => body(), /長期記憶/);
+  elements['sync-include-shared'].checked = false;
+  assert.deepEqual(body().include_shared, false);
+  assert.match(await dashboardResponse().text(), /id="sync-include-shared"/);
+});
