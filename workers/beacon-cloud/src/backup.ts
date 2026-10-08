@@ -31,7 +31,7 @@ export interface BackupLimits {
   /** Rows the final snapshot may read in total, counting every statement's upper bound. */
   finalMaxRows: number;
   finalMaxBytes: number;
-  /** Largest single final-snapshot object. */
+  /** Largest single exported object. */
   objectMaxBytes: number;
   rawListPage: number;
   rawCopyPerTick: number;
@@ -394,7 +394,21 @@ async function batchRound(env: Env, ctx: MaintenanceContext, cp: Checkpoint, lim
 /** One page of a ledger or revised table by rowid: rows are never deleted, so every later row lands past the position. */
 async function tableRound(env: Env, ctx: MaintenanceContext, cp: Checkpoint, limits: BackupLimits, owner: string, rounds: Rounds,
   table: string): Promise<Checkpoint | Stop> {
-  if (!room(ctx, limits.allotment, { d1: 4, r2: 1 })) return 'budget';
+  if (!room(ctx, limits.allotment, { d1: 5, r2: 1 })) return 'budget';
+  if (rounds.rowids[table] === undefined) {
+    // A table with no more rows past its position than a final-snapshot tail may carry needs no
+    // round: the final snapshot reads those rows itself. One statement sizes the tables ahead.
+    const ahead = rounds.order.slice(rounds.stage, rounds.stage + 20);
+    const sizes = await env.DB.prepare('SELECT ' + ahead.map((name, index) => `(SELECT MAX(rowid) FROM ${quoted(name)}) AS c${index}`).join(','))
+      .first<Record<string, number | null>>();
+    let small = 0;
+    while (small < ahead.length && (sizes?.[`c${small}`] ?? 0) - (rounds.rowids[ahead[small]] ?? 0) <= limits.tailRows) small++;
+    if (small) {
+      const next = rounds.stage + small >= rounds.order.length || rounds.revisit ? { ...rounds, stage: rounds.order.length, revisit: false }
+        : { ...rounds, stage: rounds.stage + small };
+      return commitRound(env, ctx, cp, owner, next, [], cp.batches_through);
+    }
+  }
   const page = Math.min(REVISED_TABLES[table]?.page ?? limits.tablePageRows, limits.tablePageRows);
   let next: Rounds = { ...rounds, rowids: { ...rounds.rowids }, since: { ...rounds.since } };
   if (REVISED_TABLES[table] && !next.since[table]) next.since[table] = iso(ctx.now);

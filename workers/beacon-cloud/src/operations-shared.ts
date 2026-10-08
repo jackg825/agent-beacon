@@ -10,8 +10,6 @@ import { Env, HttpError } from './types';
 
 /** Batches with their own events and versions, exported together by (received_at,id) once settled. */
 export const BATCH_TABLES = ['batches', 'events', 'event_versions'] as const;
-/** @deprecated The batch tables; kept for existing imports. */
-export const CHUNKED_TABLES = BATCH_TABLES;
 /**
  * Append-only ledgers: unconditional triggers forbid every update and delete, so the rows a round
  * exports by rowid are exactly the rows at the final snapshot, which reads only the tail after them.

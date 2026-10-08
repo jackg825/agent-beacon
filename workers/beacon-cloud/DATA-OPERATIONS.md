@@ -78,7 +78,7 @@ D1 用量的量級：`health` 每小時最多讀 50 頁 R2 清單（每頁最多
    - **帳本**：會隨活動增長、而且 trigger 禁止任何修改與刪除的 table（`context_sources`、`context_audit`、`context_generation`、`context_flag_audit`、`context_share_audit`、`processing_job_sources`、`processing_coverage`、`processing_signals`、`processing_job_audit`、`retention_runs`，以及 policy、budget、訂閱的稽核表），依 rowid 每輪最多 1,000 列。
    - **會改變的 table**：會隨活動增長、資料列之後還會改變的 `sessions`、`processing_jobs`、`processing_calls`、`context_entries`（每輪 200 列）、`context_flags`（每輪 500 列）、`retention_run_objects`，同樣依 rowid 分輪匯出。
 
-   分類寫在 `src/operations-shared.ts`，每個 migration 建立的 table 都要分類，否則測試失敗；帳本必須真的有禁止修改與刪除的 trigger。
+   還沒匯出的資料列不超過 1,000 列（最終快照的尾端上限）的 table 不另做分輪，直接由最終快照讀取；判斷只用 `MAX(rowid)`，一個查詢就涵蓋後面所有 table。分類寫在 `src/operations-shared.ts`，每個 migration 建立的 table 都要分類，否則測試失敗；帳本必須真的有禁止修改與刪除的 trigger。
 3. **最終快照**：在**同一個 D1 transaction** 裡讀取：小型參照表（裝置、專案、任務與連結、群組與關係、policy 與 budget、訂閱、共享）全部；每個分輪 table 在最後一輪之後新增的尾端；以及會改變的 table 中，可能在它那一輪之後改變的資料列（**重讀**）。其他階段新增、尚未分類的 table 也整個放在這裡。備份自身的帳務 table（`backup_*`、`health_state`）不放進快照，它們描述的是 BACKUP 本身。
 4. **原文清單**：原文複製追上這次匯出的所有批次後，寫出這個 checkpoint 涵蓋的原文清單 `checkpoints/<id>/raw/<序號>.ndjson`。
 5. **manifest**：`checkpoints/<id>/manifest.json` 列出每個分塊的 key、SHA-256、大小與各 table 列數。

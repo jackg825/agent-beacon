@@ -603,7 +603,7 @@ test('rows that change after their round are re-read by the final snapshot, and 
       const cp = await latestCheckpoint(env);
       const rounds = cp?.cursor ? JSON.parse(cp.cursor) : null;
       if (rounds && rounds.stage === rounds.order.length) break;
-      await backupTick(env, run, { maxSteps: 1, tablePageRows: 2 });
+      await backupTick(env, run, { maxSteps: 1, tablePageRows: 2, tailRows: 0 });
     }
     const pending = JSON.parse((await latestCheckpoint(env))!.cursor!);
     assert.equal(pending.stage, pending.order.length);
