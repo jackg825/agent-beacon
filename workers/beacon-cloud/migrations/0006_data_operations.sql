@@ -120,6 +120,7 @@ CREATE TABLE backup_raw_objects (
   CHECK(status!='copied' OR (size IS NOT NULL AND length(sha256)=64))
 );
 CREATE INDEX backup_raw_received ON backup_raw_objects(batch_received_at,batch_id);
+CREATE INDEX backup_raw_source_missing ON backup_raw_objects(batch_received_at) WHERE status='source_missing';
 CREATE TABLE backup_state (
   id INTEGER PRIMARY KEY CHECK(id=1),
   raw_cursor TEXT,

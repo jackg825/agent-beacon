@@ -192,8 +192,8 @@ export async function dataHealth(env: Env, options: { now?: Date; exact?: boolea
     const cursor = (results[offset + 6].results[0] as { raw_cursor: string | null } | undefined)?.raw_cursor;
     const parsed = cursor ? JSON.parse(cursor) as [string, string] : null;
     const lag = await env.DB.prepare(`SELECT COUNT(*) AS n,MIN(received_at) AS oldest FROM (SELECT received_at FROM batches WHERE received_at<?
-      ${parsed ? 'AND (received_at>? OR (received_at=? AND id>?))' : ''} LIMIT 10001)`)
-      .bind(iso(now.getTime() - 2 * HOUR), ...(parsed ? [parsed[0], parsed[0], parsed[1]] : [])).first<{ n: number; oldest: string | null }>();
+      ${parsed ? 'AND (received_at,id)>(?,?)' : ''} LIMIT 10001)`)
+      .bind(iso(now.getTime() - 2 * HOUR), ...(parsed ?? [])).first<{ n: number; oldest: string | null }>();
     backup = { ...backup, latest: latest ? { id: latest.id, status: latest.status, started_at: latest.started_at, error_code: latest.error_code } : null,
       latest_completed: completed ?? null, retention_ready: ready ?? null, raw_copy: { pending_over_2h: lag?.n ?? 0, oldest_pending_at: lag?.oldest ?? null } };
     if (env.BACKUP) {

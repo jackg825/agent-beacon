@@ -60,8 +60,9 @@ export const chunkKey = (id: string, kind: 'd1' | 'raw', seq: number) => `checkp
 export const manifestKey = (id: string) => `checkpoints/${id}/manifest.json`;
 export const rawCopyKey = (r2Key: string) => 'raw/' + r2Key;
 const latest = (a: string | null, b: string | null) => !a ? b : !b ? a : a > b ? a : b;
+/** Keyset position after a cursor; the row-value form walks the (time,id) index without sorting the remaining range. */
 function after(cursor: [string, string] | null, time = 'received_at', id = 'id') {
-  return cursor ? { sql: `(${time}>? OR (${time}=? AND ${id}>?))`, args: [cursor[0], cursor[0], cursor[1]] } : { sql: '1=1', args: [] as unknown[] };
+  return cursor ? { sql: `(${time},${id})>(?,?)`, args: [cursor[0], cursor[1]] } : { sql: '1=1', args: [] as unknown[] };
 }
 function parsePair(value: string | null): [string, string] | null { return value ? JSON.parse(value) as [string, string] : null; }
 async function put(bucket: R2Bucket, key: string, body: Uint8Array) {
