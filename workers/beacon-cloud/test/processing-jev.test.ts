@@ -6,6 +6,7 @@ import { extractiveGenerator, Generator } from '../src/generator';
 import worker from '../src/index';
 import { runMaintenance } from '../src/maintenance';
 import { processingMaintenance, processingRead, processingTick } from '../src/processing';
+import { sweepStaleReservations } from '../src/processing-budget';
 import { effectivePolicy, EffectivePolicy } from '../src/processing-policy';
 import { makeScope } from '../src/processing-planner';
 import type { SelectionStage, StageResult } from '../src/processing-stage';
@@ -162,6 +163,39 @@ test('each gate condition alone keeps the stage from reserving budget or sending
     assert.deepEqual(Object.keys(jev.calls[0].body.questions), ['task_related']);
     assert.deepEqual(await attempt(gated(f.env)), { decision: 'continue', signals: [] });
     assert.deepEqual([jev.calls.length, await count(f.env, 'processing_calls'), await count(f.env, 'processing_signals')], [1, 1, 1]);
+  } finally { await f.close(); }
+});
+
+test('an answer that arrives after the lease moved commits nothing; the sweep later records the call as outcome_unknown', async () => {
+  const f = await createEnvFixture();
+  try {
+    await setPolicy(f.env, workspace, external);
+    await setBudget(f.env, { daily_call_limit: 5 });
+    const record = command('fence-1', 'npm test', 0, { repo: 'fence', session: 'fence-s' });
+    await f.ingest(record);
+    const event = (await f.event('fence-1'))!;
+    const taskId = await newTask(f.env, '合成任務 fence', [event.session_id]);
+    const planned = (await run(f.env, { task_id: taskId })).scopes[0];
+    const now = noon();
+    await f.env.DB.prepare(`UPDATE processing_jobs SET status='running',attempts=1,lease_owner='fence-owner',lease_until=? WHERE id=?`)
+      .bind(new Date(now.getTime() + 600_000).toISOString(), planned.job_id).run();
+    // Another invocation reclaims the job while the request is in flight.
+    const jev = fakeJev(async () => {
+      await f.env.DB.prepare(`UPDATE processing_jobs SET lease_owner='other-invocation',attempts=2 WHERE id=?`).bind(planned.job_id).run();
+      return Response.json({ answers: { task_related: { noul: 0.9 } }, usage: { input_tokens: 10, output_tokens: 1 } });
+    });
+    const policy = await effectivePolicy(f.env, event.project_id), sources = [{ payload: record }];
+    await assert.rejects(jevStage({ env: gated(f.env), ctx: { now, remaining: () => 20_000, usage: () => ({ d1: 0, r2: 0, fetch: 0 }), fetch: jev.fetcher },
+      job_id: planned.job_id, attempt: 1, lease_owner: 'fence-owner', scope: await makeScope('task', taskId, event.project_id), policy,
+      projection: projectEvents(sources, policy.summary_fields).events, reproject: (fields, assigned) => projectEvents(sources, fields, { assigned }),
+      labels: { task_title: '合成任務 fence', project_name: 'fence' } }), /processing_lease_lost/);
+    assert.equal(jev.calls.length, 1);
+    assert.equal(await count(f.env, 'processing_signals'), 0);
+    const call = () => f.env.DB.prepare('SELECT status,error_code,input_tokens FROM processing_calls WHERE job_id=?').bind(planned.job_id).first<any>();
+    assert.deepEqual(await call(), { status: 'reserved', error_code: null, input_tokens: null });
+    // Older than the longest timeout plus a minute, with no live lease for its attempt: the sweep records it, still counted.
+    assert.equal(await sweepStaleReservations(f.env, new Date(now.getTime() + 91_000)), 1);
+    assert.deepEqual(await call(), { status: 'outcome_unknown', error_code: 'stale_reservation', input_tokens: null });
   } finally { await f.close(); }
 });
 
