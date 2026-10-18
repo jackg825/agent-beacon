@@ -12,7 +12,8 @@ test('dashboard shell keeps data private and constrains script and network origi
   assert.match(policy, /connect-src 'self'/);
   assert.match(policy, /frame-ancestors 'none'/);
   assert.match(html, /lang="zh-Hant"/);
-  assert.match(html, /Memory 候選、審閱與核准尚未提供/);
+  assert.match(html, /AI 自動 compact 尚未提供/);
+  assert.match(html, /原始事件維持保存/);
 });
 
 test('dashboard delivers valid JavaScript separately from its HTML', async () => {

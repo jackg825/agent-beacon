@@ -9,6 +9,7 @@ import { Miniflare, convertV4MiniflareOptions } from 'miniflare';
 import { verifyMcp } from './mcp-client';
 import { ingest } from '../src/ingest';
 import { Env } from '../src/types';
+import { applyMigrations } from './migrations';
 
 // Deliberately synthetic credentials and records; no installed Beacon paths are read.
 const tokens={mbp:'synthetic-device-mbp-credential-00000000000',mini:'synthetic-device-mini-credential-0000000000',
@@ -35,10 +36,7 @@ test('workerd D1/R2 pipeline, isolation, persistence and official MCP clients',a
       body:records.map(r=>JSON.stringify(r)).join('\n')+'\n'});
   try {
     let db=await mf.getD1Database('DB');
-    const migration=await readFile('migrations/0001_initial.sql','utf8');
-    const [tables, trigger] = migration.split('CREATE TRIGGER');
-    for (const statement of tables.replace(/--[^\n]*/g,'').split(';').filter(s=>s.trim())) await db.prepare(statement).run();
-    await db.prepare('CREATE TRIGGER'+trigger).run();
+    await applyMigrations(db);
     for (const [id,name,token] of [['mbp','Synthetic MBP',tokens.mbp],['mini','Synthetic Mac mini',tokens.mini]])
       await db.prepare('INSERT INTO devices(id,name,token_hash,created_at) VALUES(?,?,?,?)').bind(id,name,hash(token),'2026-10-04T00:00:00Z').run();
     await t.test('denies anonymous, forged device and cross-role credentials',async()=> {

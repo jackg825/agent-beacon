@@ -120,7 +120,8 @@ listener or local dashboard behavior is changed. It forwards content already
 retained by Beacon; it does not implement a new redaction or metadata-only
 policy. Review collection policy before pointing it at real logs.
 
-Central memory candidate generation, memory review/approval, memory promotion,
-and machine-to-machine memory synchronization are separate workflows and are
-not implemented by this ingest contract. Raw JSONL uploaded to R2 does not
-create them.
+Central context is a separate workflow: the 0.2 feature branch adds manually
+authored candidates, exact event-version sources and explicit reviewer approval.
+See [CONTEXT-WORKFLOWS.md](CONTEXT-WORKFLOWS.md). Raw JSONL ingestion does not
+generate or approve a candidate. AI generation, file publication and
+machine-to-machine memory synchronization remain unimplemented.

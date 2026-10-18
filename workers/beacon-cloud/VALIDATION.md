@@ -1,5 +1,55 @@
 # Review evidence
 
+## 0.2 project/task/context milestone — local review
+
+Validated on **2026-10-07 (Asia/Taipei)** in the isolated
+`codex/context-workflows` worktree, based on merged main
+`192d6ca1434c0e2f7e604c384bf1119e3caab3f7`. This milestone has **not** been
+migrated, deployed or accepted on Cloudflare. The prior cloud evidence below
+belongs to 0.1. No installed collector settings or real transcripts were used.
+
+| Check | Current result |
+| --- | --- |
+| `npm run check` | TypeScript passes |
+| `npm test` | **79/79 pass**, zero skipped: forwarding/auth/MCP regression plus project/task/context suites using real workerd/D1/R2 |
+| `npm run test:collector` | **1/1 passes**: unchanged shipping hook → synthetic JSONL → forwarder → Worker → D1/R2 → query survives runtime recreation |
+| `npm run test:workflow-browser` | **1/1 passes** against the actual Worker/D1/R2; create group/relation, link MBP and mini sessions to one task, cite exact source, approve and replace a note, inspect 1280px/375px layouts |
+| `npm run test:browser` | **2/2 pass** against deterministic read/write fixtures, including filters, pagination, text rendering, reviewer errors and mobile interaction |
+| Official MCP clients | Current and legacy clients discover **13 read-only tools**, query tasks/approved notes/exact source versions and reject an absent approval tool |
+| Local D1 migrations | `0001`, `0002`, `0003` pass via Wrangler with **14/18/23 statements**; integration and browser fixtures also upgrade a populated initial database |
+| `npm run deploy:dry-run` | Passes; Worker **1358.20 KiB / gzip 245.39 KiB**, direct `DB`/`RAW` bindings; no upload |
+| Dependency audit | `npm audit --json` reports **0 vulnerabilities**; pinned dev-toolchain `sharp` override `0.35.5` fixes [GHSA-wq5f-xc86-pv6w](https://github.com/advisories/GHSA-wq5f-xc86-pv6w) |
+| Independent review | Exact raw variant scope, invalid-scope default recall, D1 trigger/CAS behavior, role separation and docs reviewed; identified issues corrected and regression checked |
+
+Acceptance covers missing/short/reused reviewer credentials, denied read/device/MCP
+writes, same-origin protection, bounded fatal-UTF-8 JSON, immutable sources/content,
+cross-project/task source rejection, missing/corrupt R2 rejection, alternate captures
+claiming another repo/session/harness, competing approval/revision races and atomic
+audit failure rollback. Groups and tasks preserve project/device/session namespaces.
+A pending revision keeps its approved parent active; approval supersedes it atomically.
+Changed source scope marks a note non-authoritative and excludes it from default recall.
+
+The browser also verifies anonymous denial, stored HTML rendered as text, no page
+script errors, no horizontal overflow, empty browser storage and reviewer key removal
+on reload. Local synthetic logs and screenshots stay in ignored `.qa-runs/` storage.
+The earlier request-size regression was corrected from 32 to **64 KiB**, including
+a 12,000-character Chinese content test; the final full suite has no failures.
+
+New cloud migration, private backup/restore drill, cloud rollback, real Mac sleep/wake
+and network-loss acceptance, named-user review, Jev/AI compact, background jobs,
+retention and memory file publication/sync are **not verified or implemented here**.
+The reviewer audit identifies a shared role credential, not a named human.
+`sources_valid` describes D1 scope only; it is not permanent R2 availability or proof
+that authored prose is true. See [CONTEXT-WORKFLOWS.md](CONTEXT-WORKFLOWS.md)
+and [ROADMAP.md](ROADMAP.md) for the operating boundaries and staged work.
+
+No paid upstream sandbox scenario ran. The free doctor is not ready because Modal
+and Anthropic credentials and Linux binaries are absent. Unchanged upstream CLI,
+packaging and plugin suites were not broadly rerun. New remote CI evidence is
+separate from the prior merged release's CI evidence below.
+
+## Historical 0.1 base-service evidence
+
 Validated on **2026-10-05 (Asia/Taipei)** in the fork checkout, based on upstream
 `5937da1cd812660d256c367374b9752316f51cbc`, branch
 `feat/cloudflare-backend`. The reviewed change is merged and the isolated TEST
@@ -62,8 +112,9 @@ WRANGLER_WRITE_LOGS=false npx wrangler d1 migrations apply agent-beacon-cloud-db
 
 The optional browser tests require an installed Playwright package and browser.
 Set `BEACON_PLAYWRIGHT_MODULE` to its module path and, when needed,
-`BEACON_CHROMIUM_EXECUTABLE` to the browser binary, then run `npm test` for the
-real Worker-backed helper or `npm run test:browser` for fixture interaction
+`BEACON_CHROMIUM_EXECUTABLE` to the browser binary, then run
+`npm run test:workflow-browser` for the real Worker workflow helper or
+`npm run test:browser` for fixture interaction
 coverage. The normal Node suite deliberately does not require browser downloads.
 The CI workflow runs only local tests/dry run and the isolated shipping-hook
 acceptance; it contains no deployment credentials or deployment step. Both new
@@ -86,9 +137,9 @@ in [TEST-DEPLOYMENT.md](TEST-DEPLOYMENT.md).
   real OAuth login/discovery, provider signing-key rollover, Access login and
   client-specific SSO remain untested. Manual bearer clients work locally;
   clients requiring OAuth need a configured compatible external issuer.
-- **Memory:** candidate generation, human review/approval, promotion, publication
-  and cross-machine synchronization are not implemented. The README defines
-  their future evidence/approval boundary only.
+- **Memory at the 0.1 release:** candidate creation/review was absent. The local
+  0.2 milestone above adds manual candidates and reviewer approval. AI generation,
+  publication and cross-machine synchronization remain unimplemented.
 - **Operational extensions:** no retention/deletion UI, automated R2 orphan
   cleanup/reindex, variant browser, inventory UI, multi-tenant accounts, durable
   jobs or automatic service installation. Forwarder retention is bounded; abrupt

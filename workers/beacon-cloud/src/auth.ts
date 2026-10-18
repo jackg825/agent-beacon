@@ -64,6 +64,21 @@ export async function readAuth(request: Request, env: Env, mcp = false): Promise
   throw new HttpError(401, 'Read credential required');
 }
 
+/** Explicit central-workspace review authority; read, device and MCP roles cannot write. */
+export async function reviewAuth(request: Request, env: Env): Promise<string> {
+  const token = bearer(request);
+  if (!await equalSecret(token, env.REVIEW_TOKEN)) throw new HttpError(403, 'Review credential required');
+  // Fail closed when an operator accidentally reuses a credential across roles.
+  if (await equalSecret(token, env.READ_TOKEN) || await equalSecret(token, env.MCP_TOKEN)) {
+    throw new HttpError(403, 'Review credential must be independent');
+  }
+  const hash = await digest(token!);
+  if (await env.DB.prepare('SELECT id FROM devices WHERE token_hash=?').bind(hash).first()) {
+    throw new HttpError(403, 'Review credential must be independent');
+  }
+  return 'reviewer:' + hash.slice(0, 16);
+}
+
 export function checkOrigin(request: Request, env: Env): void {
   const origin = request.headers.get('Origin');
   const expected = new URL(env.PUBLIC_URL || request.url).origin;

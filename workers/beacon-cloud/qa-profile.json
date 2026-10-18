@@ -1,0 +1,194 @@
+{
+  "schema_version": 1,
+  "project": "agent-beacon-cloud",
+  "contract_refs": [
+    "AGENTS.md",
+    "CONTRIBUTING.md",
+    "CLAUDE.md",
+    "workers/beacon-cloud/README.md"
+  ],
+  "checks": {
+    "types": {
+      "label": "Worker type check",
+      "kind": "command",
+      "cwd": "workers/beacon-cloud",
+      "argv": [
+        "npm",
+        "run",
+        "check"
+      ],
+      "evidence": "static-analysis",
+      "expects_tests": false,
+      "resources": [
+        "static"
+      ],
+      "side_effects": "local",
+      "instructions": "Run with synthetic data only; record actual exit/counts and do not access remote Cloudflare. Browser checks use installed Playwright/Chrome."
+    },
+    "tests": {
+      "label": "Worker/auth/MCP/forwarder/workflow regression",
+      "kind": "command",
+      "cwd": "workers/beacon-cloud",
+      "argv": [
+        "npm",
+        "test"
+      ],
+      "evidence": "automated-test",
+      "expects_tests": true,
+      "resources": [
+        "local-worker"
+      ],
+      "side_effects": "local",
+      "instructions": "Run with synthetic data only; record actual exit/counts and do not access remote Cloudflare. Browser checks use installed Playwright/Chrome."
+    },
+    "collector": {
+      "label": "Unchanged shipping hook to Worker synthetic acceptance",
+      "kind": "command",
+      "cwd": "workers/beacon-cloud",
+      "argv": [
+        "npm",
+        "run",
+        "test:collector"
+      ],
+      "evidence": "automated-test",
+      "expects_tests": true,
+      "resources": [
+        "local-worker"
+      ],
+      "side_effects": "local",
+      "instructions": "Run with synthetic data only; record actual exit/counts and do not access remote Cloudflare. Browser checks use installed Playwright/Chrome."
+    },
+    "browser": {
+      "label": "Real Worker workflow browser acceptance",
+      "kind": "command",
+      "cwd": "workers/beacon-cloud",
+      "argv": [
+        "npm",
+        "run",
+        "test:workflow-browser"
+      ],
+      "evidence": "browser",
+      "expects_tests": true,
+      "resources": [
+        "local-worker"
+      ],
+      "side_effects": "local",
+      "instructions": "Run with synthetic data only; record actual exit/counts and do not access remote Cloudflare. Browser checks use installed Playwright/Chrome."
+    },
+    "browser-fixture": {
+      "label": "Dashboard interaction fixture",
+      "kind": "command",
+      "cwd": "workers/beacon-cloud",
+      "argv": [
+        "npm",
+        "run",
+        "test:browser"
+      ],
+      "evidence": "browser",
+      "expects_tests": true,
+      "resources": [
+        "local-worker"
+      ],
+      "side_effects": "local",
+      "instructions": "Run with synthetic data only; record actual exit/counts and do not access remote Cloudflare. Browser checks use installed Playwright/Chrome."
+    },
+    "dry-run": {
+      "label": "No-upload Worker deploy preparation",
+      "kind": "command",
+      "cwd": "workers/beacon-cloud",
+      "argv": [
+        "npm",
+        "run",
+        "deploy:dry-run"
+      ],
+      "evidence": "build",
+      "expects_tests": false,
+      "resources": [
+        "local-worker"
+      ],
+      "side_effects": "local",
+      "instructions": "Run with synthetic data only; record actual exit/counts and do not access remote Cloudflare. Browser checks use installed Playwright/Chrome."
+    },
+    "migrations": {
+      "label": "Additive migrations only in local D1",
+      "kind": "command",
+      "cwd": "workers/beacon-cloud",
+      "argv": [
+        "npx",
+        "wrangler",
+        "d1",
+        "migrations",
+        "apply",
+        "agent-beacon-cloud-db",
+        "--local",
+        "--persist-to",
+        ".test-state/context-migrations"
+      ],
+      "evidence": "emulator-test",
+      "expects_tests": false,
+      "resources": [
+        "local-worker"
+      ],
+      "side_effects": "local",
+      "instructions": "Run with synthetic data only; record actual exit/counts and do not access remote Cloudflare. Browser checks use installed Playwright/Chrome."
+    },
+    "impact": {
+      "label": "Behavior, scope and sensitive-data review",
+      "kind": "review",
+      "cwd": ".",
+      "evidence": "review",
+      "resources": [],
+      "side_effects": "local",
+      "instructions": "Inspect exact diff, authorization/source/role/CAS/privacy paths, docs limits, unrelated work preservation and all staged additions. Include independent semantic review findings and their fixes."
+    }
+  },
+  "areas": {
+    "cloud-workflows": {
+      "paths": [
+        "workers/beacon-cloud/*",
+        ".gitignore",
+        ".github/workflows/beacon-cloud.yml"
+      ],
+      "risk": "R2",
+      "checks": [
+        "types",
+        "tests",
+        "collector",
+        "browser",
+        "browser-fixture",
+        "dry-run",
+        "migrations",
+        "impact"
+      ],
+      "refs": [
+        "workers/beacon-cloud/VALIDATION.md"
+      ],
+      "review_roles": [
+        "security/data-integrity",
+        "UI/UX"
+      ]
+    }
+  },
+  "rules": [],
+  "modes": {
+    "quick": {
+      "checks": []
+    },
+    "standard": {
+      "checks": []
+    },
+    "release": {
+      "checks": []
+    },
+    "audit": {
+      "checks": []
+    }
+  },
+  "risk_checks": {
+    "R0": [],
+    "R1": [],
+    "R2": [],
+    "R3": []
+  },
+  "unknown_check": "impact"
+}

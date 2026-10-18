@@ -1,4 +1,6 @@
 import { Env, HttpError } from './types';
+import { digest } from './auth';
+import { field, projectIdentity, stableJSON } from './identity';
 
 export function pageLimit(params: URLSearchParams): number {
   const raw = params.get('limit');
@@ -24,6 +26,16 @@ export async function listSessions(env: Env, params: URLSearchParams) {
   const limit = pageLimit(params), where = [], args: unknown[] = [];
   for (const [param,column] of [['device_id','s.device_id'],['project_id','s.project_id'],['harness','s.harness']]) {
     const value=params.get(param); if (value) { where.push(`${column}=?`); args.push(value); }
+  }
+  for (const [param, table, column] of [
+    ['project_group_id', 'project_group_members', 'project_id=s.project_id AND group_id'],
+    ['task_id', 'task_sessions', 'session_id=s.id AND task_id'],
+  ]) {
+    const value=params.get(param);
+    if (value) {
+      if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(value)) throw new HttpError(400,'Invalid workflow identifier');
+      where.push(`EXISTS(SELECT 1 FROM ${table} WHERE ${column}=?)`); args.push(value);
+    }
   }
   if (params.get('before')) {
     const [time,id] = decodeCursor(params.get('before')!);
@@ -76,4 +88,55 @@ export async function listProjects(env: Env) {
 export async function listDevices(env: Env) {
   const result=await env.DB.prepare('SELECT id,name,revoked,created_at,last_seen FROM devices ORDER BY name,id LIMIT 1000').all();
   return {devices:result.results};
+}
+
+/** Fetch a referenced immutable variant rather than substituting the first indexed payload. */
+export async function getEventVersion(env: Env, eventId: string, params: URLSearchParams) {
+  const hash=params.get('payload_hash');
+  if (!hash || !/^[a-f0-9]{64}$/.test(hash)) throw new HttpError(400,'Exact payload_hash required');
+  const row=await env.DB.prepare(`SELECT e.*,s.source_session_id,p.identity_kind,
+    v.payload_hash AS selected_hash,v.batch_id AS selected_batch_id,v.line_number AS selected_line_number,b.r2_key
+    FROM events e JOIN projects p ON p.id=e.project_id LEFT JOIN sessions s ON s.id=e.session_id
+    JOIN event_versions v ON v.event_id=e.id JOIN batches b ON b.id=v.batch_id
+    WHERE e.id=? AND v.payload_hash=?`).bind(eventId,hash).first<{
+      selected_hash:string;selected_batch_id:string;selected_line_number:number;r2_key:string;
+    } & Record<string,unknown>>();
+  if (!row) throw new HttpError(404,'Event version not found');
+  const object=await env.RAW.get(row.r2_key);
+  if (!object) throw new HttpError(503,'Raw batch unavailable');
+  const line=(await object.text()).split('\n')[row.selected_line_number];
+  let payload: unknown;
+  try {
+    payload=JSON.parse(line);
+    if (await digest(stableJSON(payload))!==hash) throw new Error();
+  } catch { throw new HttpError(503,'Raw event version unavailable'); }
+  const sourceProject=await projectIdentity(payload as Record<string,unknown>,String(row.device_id));
+  const nativeSession=field(payload,'session','id');
+  const expectedSession=row.stream==='runtime' ? await digest(stableJSON([row.device_id,
+    field(payload,'harness','name')||'unknown',nativeSession?'native':'unscoped',nativeSession||`unscoped-event:${row.event_id}`])) : null;
+  // Weak path/unknown evidence may be upgraded by the same session, but an
+  // alternate capture claiming another remote/session cannot support a memory.
+  const strength=(kind:unknown)=>kind==='remote'?2:kind==='device_path'?1:0;
+  const scopeMatches=field(payload,'event','id')===row.event_id &&
+    (field(payload,'harness','name')||'unknown')===row.harness && expectedSession===row.session_id && (sourceProject.id===row.project_id ||
+    (!!nativeSession && strength(sourceProject.kind)<strength(row.identity_kind)));
+  const {selected_hash,selected_batch_id,selected_line_number,r2_key,line_number,identity_kind,source_session_id,...index}=row;
+  return {event:{...index,payload_hash:selected_hash,batch_id:selected_batch_id,
+    action:field(payload,'event','action'),timestamp:field(payload,'timestamp'),
+    scope_matches_index:scopeMatches,source_project:sourceProject,source_session_id:expectedSession,payload}};
+}
+
+export async function listEventVersions(env: Env, eventId: string, params: URLSearchParams) {
+  const limit=pageLimit(params);
+  if (!await env.DB.prepare('SELECT id FROM events WHERE id=?').bind(eventId).first()) throw new HttpError(404,'Event not found');
+  const args:unknown[]=[eventId]; let where='v.event_id=?';
+  if (params.get('before')) {
+    const [time,hash]=decodeCursor(params.get('before')!);
+    where+=' AND (b.received_at<? OR (b.received_at=? AND v.payload_hash<?))'; args.push(time,time,hash);
+  }
+  const rows=await env.DB.prepare(`SELECT v.payload_hash,v.batch_id,b.received_at
+    FROM event_versions v JOIN batches b ON b.id=v.batch_id WHERE ${where}
+    ORDER BY b.received_at DESC,v.payload_hash DESC LIMIT ?`).bind(...args,limit+1).all<{payload_hash:string;batch_id:string;received_at:string}>();
+  const versions=rows.results.slice(0,limit), last=versions.at(-1);
+  return {event_id:eventId,versions,next_cursor:rows.results.length>limit && last ? encodeCursor([last.received_at,last.payload_hash]) : null};
 }
